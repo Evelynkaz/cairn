@@ -25,6 +25,14 @@
     "typescript": "^5.8.0",
     "@types/node": "^22.13.0"
   },
+  "peerDependencies": {
+    "@huggingface/transformers": "^3"
+  },
+  "peerDependenciesMeta": {
+    "@huggingface/transformers": {
+      "optional": true
+    }
+  },
   "keywords": [
     "mcp",
     "memory",

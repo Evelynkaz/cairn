@@ -242,3 +242,21 @@ export function memorySeqsMissingVectors(db: CairnDb, space: VectorSpaceRef, lim
     .all(clamped)
     .map((row) => Number(row["seq"]));
 }
+
+// Same anti-join as memorySeqsMissingVectors, but a count(*) instead of
+// materialising rows: memorySeqsMissingVectors clamps to
+// MISSING_VECTORS_MAX_LIMIT internally, so it cannot report a true backlog
+// size once the backlog exceeds that clamp -- exactly the number a progress
+// readout (IndexerProgress.remaining) needs.
+export function countMemoriesMissingVectors(db: CairnDb, space: VectorSpaceRef): number {
+  assertVectorsEnabled(db);
+  const tableName = assertTableName(space.tableName);
+  const sql = `
+    select count(*) as c
+    from memories_live m
+    left join ${tableName} v on v.memory_seq = m.seq
+    where v.memory_seq is null
+  `;
+  const row = db.q(sql).get();
+  return Number(row?.["c"] ?? 0);
+}

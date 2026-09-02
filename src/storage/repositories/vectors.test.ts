@@ -11,6 +11,7 @@ import {
   deleteVector,
   knn,
   memorySeqsMissingVectors,
+  countMemoriesMissingVectors,
 } from "./vectors.js";
 import type { VectorSpaceRef } from "./vectors.js";
 
@@ -399,6 +400,69 @@ test("memorySeqsMissingVectors returns an empty array when nothing is missing, a
       db.close();
     }
   });
+});
+
+test("countMemoriesMissingVectors reports the true backlog size beyond memorySeqsMissingVectors's 500-row clamp", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      const space = ensureVectorSpace(db, "count-missing-model", 2);
+      const total = 600;
+      db.tx(() => {
+        for (let i = 0; i < total; i++) {
+          insertMemoryRow(db, { id: `count-${i}` });
+        }
+      });
+
+      assert.equal(countMemoriesMissingVectors(db, space), total);
+      assert.equal(memorySeqsMissingVectors(db, space, 500).length, 500, "sanity: the row-materialising query does clamp at 500");
+
+      const seq1 = db.q("select seq from memories where id = ?").get("count-0");
+      upsertVector(db, space, Number(seq1?.["seq"]), vec(1, 0), { scope: "default", live: true, createdAt: Date.now() });
+
+      assert.equal(countMemoriesMissingVectors(db, space), total - 1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("countMemoriesMissingVectors excludes soft-deleted and superseded memories, like memorySeqsMissingVectors", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      const space = ensureVectorSpace(db, "count-missing-excl-model", 2);
+      insertMemoryRow(db, { id: "live" });
+      insertMemoryRow(db, { id: "deleted", deletedAt: Date.now() });
+      insertMemoryRow(db, { id: "superseded", validUntil: Date.now() });
+
+      assert.equal(countMemoriesMissingVectors(db, space), 1);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("with CAIRN_NO_VECTORS=1, countMemoriesMissingVectors throws mentioning the disabled reason", () => {
+  const previous = process.env["CAIRN_NO_VECTORS"];
+  process.env["CAIRN_NO_VECTORS"] = "1";
+  try {
+    withTempDir((dir) => {
+      const db = openDb({ path: tempDbPath(dir) });
+      try {
+        const fakeSpace: VectorSpaceRef = { id: 1, modelId: "fake", dim: 4, tableName: "vec_fake_4" };
+        assert.throws(() => countMemoriesMissingVectors(db, fakeSpace), /CAIRN_NO_VECTORS/);
+      } finally {
+        db.close();
+      }
+    });
+  } finally {
+    if (previous === undefined) {
+      delete process.env["CAIRN_NO_VECTORS"];
+    } else {
+      process.env["CAIRN_NO_VECTORS"] = previous;
+    }
+  }
 });
 
 test("listVectorSpaces respects a limit and clamps to a sane default when omitted or invalid", () => {
