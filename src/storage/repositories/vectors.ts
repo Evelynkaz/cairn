@@ -44,7 +44,7 @@ function assertVectorsEnabled(db: CairnDb): void {
 // interpolated into raw SQL below. `ensureVectorSpace` is currently the
 // only writer of `vector_spaces` and already validates on the way in, but
 // every function that interpolates a table name re-checks it here anyway.
-function assertTableName(name: string): string {
+export function assertTableName(name: string): string {
   if (!TABLE_NAME_PATTERN.test(name)) {
     throw new Error(`vector table name "${name}" is invalid`);
   }
@@ -94,6 +94,21 @@ function toBlob(space: VectorSpaceRef, embedding: Float32Array): Uint8Array {
   }
   return new Uint8Array(embedding.buffer, embedding.byteOffset, embedding.byteLength);
 }
+
+// Reinterprets a stored BLOB's bytes as a Float32Array. ArrayBuffer#slice
+// copies into a fresh, zero-offset buffer, so the result is always
+// correctly aligned regardless of where the driver's Uint8Array started.
+function blobToVector(blob: Uint8Array): Float32Array {
+  const buffer = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength);
+  return new Float32Array(buffer);
+}
+
+// getVectorsBySeq is used both for MMR's diversity pass over a whole fused
+// candidate page and for search.ts's exact tag-filtered ranking path (see
+// module docs there), so its cap has to cover the sum of a two-branch
+// candidate pool at MAX_K each, plus the tag pre-resolve cap — comfortably
+// above any of those individually, nowhere near "the whole store".
+const GET_VECTORS_MAX_SEQS = 1000;
 
 function clampSpacesLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit) || limit < 1) {
@@ -219,6 +234,34 @@ export function knn(
     .q(sql)
     .all(...params)
     .map((row) => ({ memorySeq: Number(row["memory_seq"]), distance: Number(row["distance"]) }));
+}
+
+// Batch-fetches the raw stored embedding for every given seq that has one.
+// A seq with no row (not yet indexed) is simply absent from the result map
+// -- callers treat that as "no vector for this candidate", not an error.
+// This is the sanctioned way to read stored vectors back out by seq: it is
+// the only function in this module that both validates the table name and
+// hands back the decoded Float32Array, so callers (search.ts) never need
+// their own copy of the table-name guard or the BLOB-decoding logic.
+export function getVectorsBySeq(db: CairnDb, space: VectorSpaceRef, seqs: number[]): Map<number, Float32Array> {
+  assertVectorsEnabled(db);
+  const result = new Map<number, Float32Array>();
+  if (seqs.length === 0) return result;
+  if (seqs.length > GET_VECTORS_MAX_SEQS) {
+    throw new Error(`getVectorsBySeq: ${seqs.length} seqs exceeds the ${GET_VECTORS_MAX_SEQS} cap`);
+  }
+  const tableName = assertTableName(space.tableName);
+  const placeholders = seqs.map(() => "?").join(", ");
+  const rows = db
+    .q(`select memory_seq, embedding from ${tableName} where memory_seq in (${placeholders})`)
+    .all(...seqs);
+  for (const row of rows) {
+    const blob = row["embedding"];
+    if (blob instanceof Uint8Array) {
+      result.set(Number(row["memory_seq"]), blobToVector(blob));
+    }
+  }
+  return result;
 }
 
 // Feeds the background re-embed migration required by BUILD_BRIEF §3 when

@@ -10,6 +10,7 @@ import {
   setVectorLive,
   deleteVector,
   knn,
+  getVectorsBySeq,
   memorySeqsMissingVectors,
   countMemoriesMissingVectors,
 } from "./vectors.js";
@@ -245,6 +246,90 @@ test("cosine distance: an identical vector has distance ~0 and an orthogonal one
       db.close();
     }
   });
+});
+
+test("getVectorsBySeq returns stored vectors keyed by seq, and omits seqs with no row", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      const space = ensureVectorSpace(db, "get-by-seq-model", 3);
+      const now = Date.now();
+      upsertVector(db, space, 1, vec(1, 0, 0), { scope: "default", live: true, createdAt: now });
+      upsertVector(db, space, 2, vec(0, 1, 0), { scope: "default", live: true, createdAt: now });
+
+      const result = getVectorsBySeq(db, space, [1, 2, 999]);
+      assert.equal(result.size, 2);
+      assert.deepEqual(Array.from(result.get(1) ?? []), [1, 0, 0]);
+      assert.deepEqual(Array.from(result.get(2) ?? []), [0, 1, 0]);
+      assert.equal(result.has(999), false);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("getVectorsBySeq returns an empty map for an empty seq list without querying", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      const space = ensureVectorSpace(db, "get-by-seq-empty-model", 2);
+      assert.deepEqual(getVectorsBySeq(db, space, []), new Map());
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("getVectorsBySeq rejects a hand-built VectorSpaceRef with a malformed table name", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      const maliciousSpace: VectorSpaceRef = {
+        id: 1,
+        modelId: "evil",
+        dim: 3,
+        tableName: "evil; DROP TABLE memories;--",
+      };
+      assert.throws(() => getVectorsBySeq(db, maliciousSpace, [1]), /vector table name .* is invalid/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("getVectorsBySeq throws once the requested seq count exceeds its cap", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      const space = ensureVectorSpace(db, "get-by-seq-cap-model", 2);
+      const tooMany = Array.from({ length: 1001 }, (_, i) => i + 1);
+      assert.throws(() => getVectorsBySeq(db, space, tooMany), /exceeds the .* cap/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("with CAIRN_NO_VECTORS=1, getVectorsBySeq throws mentioning the disabled reason", () => {
+  const previous = process.env["CAIRN_NO_VECTORS"];
+  process.env["CAIRN_NO_VECTORS"] = "1";
+  try {
+    withTempDir((dir) => {
+      const db = openDb({ path: tempDbPath(dir) });
+      try {
+        const fakeSpace: VectorSpaceRef = { id: 1, modelId: "fake", dim: 4, tableName: "vec_fake_4" };
+        assert.throws(() => getVectorsBySeq(db, fakeSpace, [1]), /CAIRN_NO_VECTORS/);
+      } finally {
+        db.close();
+      }
+    });
+  } finally {
+    if (previous === undefined) {
+      delete process.env["CAIRN_NO_VECTORS"];
+    } else {
+      process.env["CAIRN_NO_VECTORS"] = previous;
+    }
+  }
 });
 
 test("with CAIRN_NO_VECTORS=1, every exported function throws mentioning the disabled reason, and openDb still succeeds", () => {
