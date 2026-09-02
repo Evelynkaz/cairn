@@ -173,10 +173,16 @@ CREATE TABLE audit_log (
   source_client TEXT,
   query         TEXT,
   result_count  INTEGER,
-  details       TEXT
+  details       TEXT,
+  -- A refused call (e.g. a paused client) is logged under the action it
+  -- attempted, so this column is what lets the dashboard and
+  -- countAuditByClient tell a refusal apart from work the app actually did.
+  refused       INTEGER NOT NULL DEFAULT 0,
+  CHECK (refused IN (0, 1))
 );
-CREATE INDEX idx_audit_ts ON audit_log(ts DESC);
-CREATE INDEX idx_audit_client_ts ON audit_log(source_client, ts DESC);
+CREATE INDEX idx_audit_ts ON audit_log(ts DESC, id DESC);
+CREATE INDEX idx_audit_client_ts ON audit_log(source_client, ts DESC, id DESC);
+CREATE INDEX idx_audit_action_ts ON audit_log(action, ts DESC, id DESC);
 CREATE INDEX idx_audit_memory ON audit_log(memory_id);
 
 CREATE TABLE settings (

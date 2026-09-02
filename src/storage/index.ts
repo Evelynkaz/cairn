@@ -1,0 +1,37 @@
+// Public storage API barrel. Internal helpers (row.ts, paging.ts, and driver
+// internals) are deliberately not re-exported here. Memories/episodes
+// mutation and audit recording go through `Store`; the vectors and audit
+// read/type surface below is re-exported directly because milestones 2 and
+// 4 need to name and call it without reaching past the barrel.
+
+export { openStore } from "./store.js";
+export type { Store, StoreOptions, CallContext } from "./store.js";
+
+export type { CairnDb, DbCapabilities } from "./db.js";
+
+export {
+  DEFAULT_SCOPE,
+} from "./types.js";
+export type {
+  Scope,
+  MemoryId,
+  EpisodeId,
+  Episode,
+  Memory,
+  AuditEvent,
+  ClientRecord,
+} from "./types.js";
+
+export type { AuditAction, ListAuditOptions, ListAuditResult, ClientAuditCounts } from "./repositories/audit.js";
+
+export {
+  ensureVectorSpace,
+  getVectorSpace,
+  listVectorSpaces,
+  upsertVector,
+  setVectorLive,
+  deleteVector,
+  knn,
+  memorySeqsMissingVectors,
+} from "./repositories/vectors.js";
+export type { VectorSpaceRef } from "./repositories/vectors.js";

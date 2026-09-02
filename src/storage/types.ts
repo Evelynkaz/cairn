@@ -19,6 +19,7 @@ export interface Episode {
 
 export interface Memory {
   id: MemoryId;
+  seq: number;
   text: string;
   scope: Scope;
   sourceClient: string | null;
@@ -47,6 +48,7 @@ export interface AuditEvent {
   query: string | null;
   resultCount: number | null;
   details: Record<string, unknown> | null;
+  refused: boolean;
 }
 
 export interface ClientRecord {
@@ -55,12 +57,4 @@ export interface ClientRecord {
   firstSeen: number;
   lastSeen: number;
   enabled: boolean;
-}
-
-export interface VectorSpace {
-  id: number;
-  modelId: string;
-  dim: number;
-  tableName: string;
-  createdAt: number;
 }

@@ -305,6 +305,33 @@ test("keyset pagination over (created_at, id) returns every row exactly once whe
   });
 });
 
+test("the audit_log action-filtered and plain listing orderings are served by an index, not a temp b-tree sort", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        db.q(`INSERT INTO audit_log (ts, action) VALUES (?, ?)`).run(Date.now(), "recall");
+      }
+
+      const actionPlan = db
+        .q(
+          "EXPLAIN QUERY PLAN SELECT id FROM audit_log WHERE action = ? ORDER BY ts DESC, id DESC LIMIT 20",
+        )
+        .all("recall");
+      const actionDetail = actionPlan.map((r) => r["detail"]).join(" | ");
+      assert.doesNotMatch(String(actionDetail), /USE TEMP B-TREE/);
+
+      const plainPlan = db
+        .q("EXPLAIN QUERY PLAN SELECT id FROM audit_log ORDER BY ts DESC, id DESC LIMIT 20")
+        .all();
+      const plainDetail = plainPlan.map((r) => r["detail"]).join(" | ");
+      assert.doesNotMatch(String(plainDetail), /USE TEMP B-TREE/);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 test("audit_log rows survive a hard delete of the memory they reference", () => {
   withTempDir((dir) => {
     const db = openDb({ path: tempDbPath(dir) });
@@ -397,6 +424,7 @@ test("sqlite_master reflects the exact expected schema shape (drift guard for mi
       const actual = rows.map((r) => `${r["type"]} ${r["name"]}`);
 
       const expected = [
+        "index idx_audit_action_ts",
         "index idx_audit_client_ts",
         "index idx_audit_memory",
         "index idx_audit_ts",
