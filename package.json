@@ -1,0 +1,32 @@
+{
+  "name": "cairn",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent memory for your AI that you actually own — local-first, shared across every MCP client, one command to install, a dashboard to see and edit everything. No cloud, no account, no API key.",
+  "license": "MIT",
+  "author": "Evelynkaz",
+  "bin": {
+    "cairn": "dist/cli/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "echo \"(build not implemented yet)\"",
+    "test": "echo \"(no tests yet)\"",
+    "dev": "echo \"(dev not implemented yet)\""
+  },
+  "keywords": [
+    "mcp",
+    "memory",
+    "local-first",
+    "ai",
+    "agents",
+    "model-context-protocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "github:Evelynkaz/cairn"
+  }
+}

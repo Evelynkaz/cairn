@@ -1,0 +1,9 @@
+{
+  "_comment": "Planned/example config — not yet functional. See examples/README.md.",
+  "mcpServers": {
+    "cairn": {
+      "command": "npx",
+      "args": ["-y", "cairn@latest"]
+    }
+  }
+}
