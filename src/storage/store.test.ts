@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withTempDir, tempDbPath } from "../testing/tmp.js";
+import { rmSync } from "node:fs";
+import { withTempDir, makeTempDir, tempDbPath } from "../testing/tmp.js";
 import { openStore } from "./store.js";
 import type { CallContext, Store } from "./store.js";
 
@@ -13,6 +14,25 @@ function withStore<T>(fn: (store: Store, dir: string) => T): T {
       store.close();
     }
   });
+}
+
+// withTempDir's try/finally does not await a Promise `fn` returns before
+// running its cleanup, so an async body (needed now that recall()/context()
+// are async) would have its temp dir removed and its store closed while
+// still in flight. This variant awaits `fn` itself before cleaning up.
+async function withStoreAsync<T>(fn: (store: Store) => Promise<T>): Promise<T> {
+  const dir = makeTempDir();
+  const store = openStore({ path: tempDbPath(dir) });
+  try {
+    return await fn(store);
+  } finally {
+    store.close();
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch {
+      // Best-effort: never mask the real failure from fn() with a cleanup error.
+    }
+  }
 }
 
 function countRows(store: Store, table: string): number {
@@ -114,8 +134,11 @@ const GATED_METHODS: Record<string, GatedInvoke> = {
   remember: (store, _id, ctx) => store.remember({ content: "gate probe" }, ctx),
   get: (store, id, ctx) => store.get(id, {}, ctx),
   list: (store, _id, ctx) => store.list({}, ctx),
+  recall: (store, _id, ctx) => store.recall("gate probe", {}, ctx),
+  context: (store, _id, ctx) => store.context("gate probe", {}, ctx),
   update: (store, id, ctx) => store.update(id, { text: "gate probe" }, ctx),
   forget: (store, id, ctx) => store.forget(id, ctx),
+  forgetWhere: (store, _id, ctx) => store.forgetWhere("gate probe", {}, ctx),
   restore: (store, id, ctx) => store.restore(id, ctx),
   supersede: (store, id, ctx) => store.supersede(id, { text: "gate probe" }, ctx),
   asOf: (store, _id, ctx) => store.asOf(Date.now(), {}, ctx),
@@ -132,6 +155,9 @@ const GATED_METHODS: Record<string, GatedInvoke> = {
 //   setClientEnabled - the pause/unpause control itself, not client traffic
 //   auditLog         - the dashboard's access-log view
 //   clientStats      - the dashboard's per-client activity view
+//   countMemories    - the daemon's unauthenticated /health probe (server.ts);
+//                      it never receives a ctx.sourceClient to gate on, by
+//                      design (see /health's own no-auth comment)
 // Adding a name here is a conscious call that the member is not client
 // traffic; it is not a place to silently exempt a new read/write method.
 const DELIBERATELY_UNGATED = new Set([
@@ -142,6 +168,7 @@ const DELIBERATELY_UNGATED = new Set([
   "setClientEnabled",
   "auditLog",
   "clientStats",
+  "countMemories",
 ]);
 
 test("the gated-method table matches the store's actual surface exactly", () => {
@@ -152,17 +179,24 @@ test("the gated-method table matches the store's actual surface exactly", () => 
   });
 });
 
-test("every gated method refuses a disabled client and records the refusal in the audit log", () => {
+test("every gated method refuses a disabled client and records the refusal in the audit log", async () => {
   for (const [name, invoke] of Object.entries(GATED_METHODS)) {
-    withStore((store) => {
+    await withStoreAsync(async (store) => {
       const clientId = `paused-${name}`;
       // Register the client first via a harmless read.
       store.list({}, { sourceClient: clientId });
       store.setClientEnabled(clientId, false);
 
       const before = store.clientStats().find((s) => s.sourceClient === clientId);
-      assert.throws(
-        () => invoke(store, "does-not-exist", { sourceClient: clientId }),
+      // assert.rejects (not assert.throws) because two of these methods
+      // (recall, context) are async: gate() still throws synchronously
+      // inside them, but an async function turns that into a rejected
+      // Promise rather than a synchronous throw, so a uniform check needs
+      // to await either shape.
+      await assert.rejects(
+        async () => {
+          await invoke(store, "does-not-exist", { sourceClient: clientId });
+        },
         new RegExp(clientId),
         `${name}() did not refuse a disabled client`,
       );
@@ -265,6 +299,85 @@ test("a read-only store refuses mutating methods and still serves get/list", () 
   });
 });
 
+test("a disabled client is refused on recall and get_context; the refusal is recorded with refused: true", async () => {
+  await withStoreAsync(async (store) => {
+    store.remember({ content: "gated retrieval fact" });
+    // Register the client first via a harmless read.
+    store.list({}, { sourceClient: "paused-retrieval" });
+    store.setClientEnabled("paused-retrieval", false);
+    const before = store.clientStats().find((s) => s.sourceClient === "paused-retrieval");
+
+    await assert.rejects(
+      () => store.recall("gated retrieval fact", {}, { sourceClient: "paused-retrieval" }),
+      /paused-retrieval/,
+    );
+    await assert.rejects(
+      () => store.context("gated retrieval fact", {}, { sourceClient: "paused-retrieval" }),
+      /paused-retrieval/,
+    );
+
+    const refusals = store.auditLog({ refused: true, sourceClient: "paused-retrieval" });
+    assert.equal(refusals.items.length, 2);
+    assert.ok(refusals.items.every((e) => e.refused === true));
+
+    // A refusal is not activity: it must not show up in clientStats.
+    const after = store.clientStats().find((s) => s.sourceClient === "paused-retrieval");
+    assert.deepEqual(after, before);
+  });
+});
+
+test("store.recall audits as \"recall\" with resultCount; store.context audits as \"get_context\"", async () => {
+  await withStoreAsync(async (store) => {
+    store.remember({ content: "hybrid retrieval fact about kubernetes deployment" });
+
+    const result = await store.recall("kubernetes deployment");
+    assert.ok(result.hits.length > 0);
+    const recallEvents = store.auditLog({ action: "recall" });
+    assert.equal(recallEvents.items.length, 1);
+    assert.equal(recallEvents.items[0]?.resultCount, result.hits.length);
+
+    const block = await store.context("kubernetes deployment");
+    const contextEvents = store.auditLog({ action: "get_context" });
+    assert.equal(contextEvents.items.length, 1);
+    assert.equal(contextEvents.items[0]?.resultCount, block.memories.length);
+  });
+});
+
+test("a read-only store serves recall and context without gating, and records no audit for them", async () => {
+  const dir = makeTempDir();
+  const path = tempDbPath(dir);
+  try {
+    const writable = openStore({ path });
+    writable.remember({ content: "read-only recall target" });
+    writable.close();
+
+    const readOnlyStore = openStore({ path, readOnly: true });
+    try {
+      const recalled = await readOnlyStore.recall("read-only recall target");
+      assert.ok(recalled.hits.some((h) => h.text === "read-only recall target"));
+
+      const block = await readOnlyStore.context("read-only recall target");
+      assert.ok(block.memories.length > 0);
+
+      // recordAudit is itself a write; a read-only connection cannot
+      // perform one, so -- exactly like every other read on this store
+      // (get/list/asOf/episodes/episode) -- recall/context silently skip
+      // auditing here rather than throwing. This is a deliberate choice,
+      // not an oversight: see the matching comment in store.ts.
+      assert.equal(readOnlyStore.auditLog({ action: "recall" }).items.length, 0);
+      assert.equal(readOnlyStore.auditLog({ action: "get_context" }).items.length, 0);
+    } finally {
+      readOnlyStore.close();
+    }
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch {
+      // Best-effort: never mask the real failure from fn() with a cleanup error.
+    }
+  }
+});
+
 test("update is atomic: a poisoned audit insert leaves the mutation and log both untouched", () => {
   withStore((store) => {
     const { memory } = store.remember({ content: "before" });
@@ -353,6 +466,56 @@ test("forget then get: undefined by default, the row with includeDeleted, no acc
   });
 });
 
+test("forgetWhere: without confirm deletes nothing and returns matches; confirm: true deletes them", async () => {
+  await withStoreAsync(async (store) => {
+    store.remember({ content: "forgetWhere target about the old job at Acme" });
+    store.remember({ content: "another note about the old job at Acme" });
+    store.remember({ content: "unrelated fact about pizza" });
+
+    const preview = await store.forgetWhere("old job at Acme", {});
+    assert.equal(preview.deleted, false);
+    assert.equal(preview.count, 0);
+    assert.ok(preview.matches.length >= 2);
+    assert.equal(countRows(store, "memories"), 3);
+
+    const confirmed = await store.forgetWhere("old job at Acme", { confirm: true });
+    assert.equal(confirmed.deleted, true);
+    assert.equal(confirmed.count, preview.matches.length);
+    assert.equal(confirmed.matches.length, confirmed.count);
+    for (const match of confirmed.matches) {
+      assert.equal(store.get(match.id), undefined);
+    }
+    assert.equal(countRows(store, "memories"), 3);
+    assert.equal(store.list({ limit: 200 }).items.length, 3 - confirmed.count);
+  });
+});
+
+test("forgetWhere refuses a disabled client on both the preview and the confirmed form; the refusal is audited as refused: true and not counted in clientStats", async () => {
+  await withStoreAsync(async (store) => {
+    store.remember({ content: "gated forgetWhere fact" });
+    store.list({}, { sourceClient: "paused-forget-where" });
+    store.setClientEnabled("paused-forget-where", false);
+    const before = store.clientStats().find((s) => s.sourceClient === "paused-forget-where");
+
+    await assert.rejects(
+      () => store.forgetWhere("gated forgetWhere fact", {}, { sourceClient: "paused-forget-where" }),
+      /paused-forget-where/,
+    );
+    await assert.rejects(
+      () => store.forgetWhere("gated forgetWhere fact", { confirm: true }, { sourceClient: "paused-forget-where" }),
+      /paused-forget-where/,
+    );
+
+    const refusals = store.auditLog({ refused: true, sourceClient: "paused-forget-where" });
+    assert.equal(refusals.items.length, 2);
+    assert.ok(refusals.items.every((e) => e.refused === true));
+
+    const after = store.clientStats().find((s) => s.sourceClient === "paused-forget-where");
+    assert.deepEqual(after, before);
+    assert.equal(countRows(store, "memories"), 1);
+  });
+});
+
 test("refused calls do not count as activity in clientStats but remain in auditLog({ refused: true })", () => {
   withStore((store) => {
     store.list({}, { sourceClient: "n-refused" });
@@ -400,6 +563,28 @@ test("episodes() and episode(id) return what remember appended", () => {
 
     const { items } = store.episodes({ scope: "default" });
     assert.ok(items.some((e) => e.id === episodeId));
+  });
+});
+
+test("countMemories: matches list()'s default live predicate and respects scope", () => {
+  withStore((store) => {
+    assert.equal(store.countMemories(), 0);
+
+    const a = store.remember({ content: "counted memory one", scope: "work" });
+    store.remember({ content: "counted memory two", scope: "personal" });
+    assert.equal(store.countMemories(), 2);
+    assert.equal(store.countMemories({ scope: "work" }), 1);
+    assert.equal(store.countMemories({ scope: "personal" }), 1);
+
+    store.forget(a.memory.id);
+    assert.equal(store.countMemories(), 1);
+    assert.equal(store.countMemories({ scope: "work" }), 0);
+
+    const { memory: b } = store.remember({ content: "will be superseded" });
+    store.supersede(b.id, { text: "superseded replacement" });
+    // supersede adds a replacement row, so the net live count only drops
+    // for the one just-forgotten memory above, not for b.
+    assert.equal(store.countMemories(), 2);
   });
 });
 

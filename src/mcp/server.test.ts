@@ -1,0 +1,545 @@
+// Exercises the MCP tool surface through a real client, over
+// InMemoryTransport.createLinkedPair() -- calling handlers directly would
+// skip schema validation, alias normalisation, and the SDK's own
+// serialisation, which is exactly where this layer's bugs live. No test
+// here configures an embedding provider, so every test also doubles as
+// coverage of the §2 FTS-only default.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { rmSync } from "node:fs";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ResourceListChangedNotificationSchema, ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { makeTempDir, tempDbPath } from "../testing/tmp.js";
+import { openStore } from "../storage/index.js";
+import type { Store } from "../storage/index.js";
+import { createMcpServer } from "./server.js";
+
+interface RememberResult {
+  id: string;
+  deduped: boolean;
+  episodeId: string;
+}
+
+interface RecallHit {
+  id: string;
+  text: string;
+  score: number;
+  scope: string;
+  tags: string[];
+  importance: number;
+  createdAt: number;
+}
+
+interface RecallResult {
+  hits: RecallHit[];
+  degraded: boolean;
+  degradedReason: string | null;
+}
+
+interface ContextResult {
+  text: string;
+  memories: RecallHit[];
+  tokensEstimated: number;
+  truncated: boolean;
+  degraded: boolean;
+  degradedReason: string | null;
+}
+
+interface ListedMemory {
+  id: string;
+  text: string;
+  scope: string;
+  tags: string[];
+  importance: number;
+  createdAt: number;
+}
+
+interface ListResult {
+  items: ListedMemory[];
+  nextCursor: string | null;
+}
+
+interface UpdateResult {
+  id: string;
+  text: string;
+  importance: number;
+}
+
+interface ForgetByIdResult {
+  deleted: boolean;
+  id: string;
+}
+
+interface ForgetPreviewResult {
+  deleted: boolean;
+  count: number;
+  ids: string[];
+  wouldDelete: Array<{ id: string; text: string; scope: string }>;
+  message: string;
+}
+
+interface ForgetConfirmedResult {
+  deleted: boolean;
+  count: number;
+  ids: string[];
+}
+
+interface TestEnv {
+  client: Client;
+  store: Store;
+}
+
+async function withServer<T>(fn: (env: TestEnv) => Promise<T>, clientName = "test-client"): Promise<T> {
+  const dir = makeTempDir();
+  const store = openStore({ path: tempDbPath(dir) });
+  const server = createMcpServer({ store });
+  const client = new Client({ name: clientName, version: "1.0.0" });
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    return await fn({ client, store });
+  } finally {
+    await client.close();
+    await server.close();
+    store.close();
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch {
+      // Best-effort: never mask the real failure from fn() with a cleanup error.
+    }
+  }
+}
+
+async function callTool(
+  client: Client,
+  name: string,
+  args: Record<string, unknown> = {},
+): Promise<{ text: string; isError: boolean }> {
+  const result = await client.callTool({ name, arguments: args });
+  if (!("content" in result) || !Array.isArray(result.content)) {
+    throw new Error(`tool ${name} returned no content array`);
+  }
+  const first = result.content[0];
+  if (!first || first.type !== "text") {
+    throw new Error(`tool ${name} returned no text content`);
+  }
+  return { text: first.text, isError: result.isError === true };
+}
+
+async function callJson<T>(client: Client, name: string, args: Record<string, unknown> = {}): Promise<T> {
+  const { text, isError } = await callTool(client, name, args);
+  if (isError) {
+    throw new Error(`tool ${name} returned an error: ${text}`);
+  }
+  return JSON.parse(text) as T;
+}
+
+function firstResourceText(contents: Array<{ uri: string; text: string } | { uri: string; blob: string }>): string {
+  const first = contents[0];
+  if (!first || !("text" in first)) {
+    throw new Error("resource returned no text content");
+  }
+  return first.text;
+}
+
+test("tools/list returns exactly the six §6 tools, by exact name", async () => {
+  await withServer(async ({ client }) => {
+    const { tools } = await client.listTools();
+    assert.equal(tools.length, 6);
+    const names = tools.map((t) => t.name).sort();
+    assert.deepEqual(names, ["forget", "get_context", "list_memories", "recall", "remember", "update_memory"]);
+  });
+});
+
+const DESCRIPTION_KEYWORDS = ["call", "example"];
+
+// The tool's own primary parameter, as it must literally appear in an
+// example invocation in the description (e.g. `recall(query:`) -- a
+// placeholder description satisfying only length + "call"/"example" would
+// pass the old, weaker version of this test.
+const TOOL_PRIMARY_PARAM: Record<string, string> = {
+  remember: "content",
+  recall: "query",
+  get_context: "query",
+  list_memories: "scope",
+  update_memory: "id",
+  forget: "query",
+};
+
+test("every tool description says WHEN to call it and gives an example invocation of its own primary parameter", async () => {
+  await withServer(async ({ client }) => {
+    const { tools } = await client.listTools();
+    assert.equal(tools.length, 6);
+    for (const tool of tools) {
+      const description = tool.description ?? "";
+      assert.ok(description.trim().length > 40, `${tool.name} has a real description`);
+      const lower = description.toLowerCase();
+      for (const keyword of DESCRIPTION_KEYWORDS) {
+        assert.ok(lower.includes(keyword), `${tool.name} description mentions "${keyword}"`);
+      }
+      const param = TOOL_PRIMARY_PARAM[tool.name];
+      assert.ok(param, `${tool.name} has a primary-param expectation configured in this test`);
+      const exampleCall = `${tool.name}(${param}:`;
+      assert.ok(
+        description.includes(exampleCall),
+        `${tool.name} description must contain an example invocation like \`${exampleCall}\`, got: ${description}`,
+      );
+    }
+  });
+});
+
+test("remember then recall round-trips; re-remembering the same text dedupes", async () => {
+  await withServer(async ({ client, store }) => {
+    const first = await callJson<RememberResult>(client, "remember", { content: "The user prefers dark mode." });
+    assert.equal(first.deduped, false);
+    assert.ok(first.id);
+    assert.ok(first.episodeId);
+
+    const again = await callJson<RememberResult>(client, "remember", { content: "The user prefers dark mode." });
+    assert.equal(again.deduped, true);
+    assert.equal(again.id, first.id);
+
+    const stored = store.list().items.filter((m) => m.id === first.id);
+    assert.equal(stored.length, 1);
+
+    const recalled = await callJson<RecallResult>(client, "recall", { query: "dark mode" });
+    assert.ok(recalled.hits.some((h) => h.id === first.id));
+    assert.equal(recalled.degraded, false);
+  });
+});
+
+test("recall accepts q/text as aliases for query; remember accepts text as an alias for content", async () => {
+  await withServer(async ({ client }) => {
+    const remembered = await callJson<RememberResult>(client, "remember", { text: "Favorite editor is Neovim." });
+    assert.ok(remembered.id);
+
+    const byQ = await callJson<RecallResult>(client, "recall", { q: "favorite editor" });
+    assert.ok(byQ.hits.some((h) => h.id === remembered.id));
+
+    const byText = await callJson<RecallResult>(client, "recall", { text: "Neovim" });
+    assert.ok(byText.hits.some((h) => h.id === remembered.id));
+  });
+});
+
+test("get_context respects token_budget", async () => {
+  await withServer(async ({ client }) => {
+    for (let i = 0; i < 5; i++) {
+      await callJson(client, "remember", {
+        content: `Fact number ${i} about the deployment pipeline and its configuration details.`,
+        importance: 0.9,
+      });
+    }
+    const block = await callJson<ContextResult>(client, "get_context", { query: "deployment pipeline", token_budget: 20 });
+    assert.ok(block.tokensEstimated <= 20, `tokensEstimated (${block.tokensEstimated}) must stay within the 20-token budget`);
+    assert.equal(block.truncated, true);
+  });
+});
+
+test("list_memories paginates through a cursor", async () => {
+  await withServer(async ({ client }) => {
+    for (let i = 0; i < 5; i++) {
+      await callJson(client, "remember", { content: `Paginated memory number ${i}` });
+    }
+    const page1 = await callJson<ListResult>(client, "list_memories", { limit: 2 });
+    assert.equal(page1.items.length, 2);
+    assert.ok(page1.nextCursor);
+
+    const page2 = await callJson<ListResult>(client, "list_memories", { limit: 2, cursor: page1.nextCursor });
+    assert.equal(page2.items.length, 2);
+
+    const ids1 = new Set(page1.items.map((m) => m.id));
+    for (const item of page2.items) {
+      assert.ok(!ids1.has(item.id), "page 2 must not repeat a page 1 item");
+    }
+  });
+});
+
+// An out-of-range or wrong-typed number is an ordinary model mistake, not a
+// malformed call -- BUILD_BRIEF §6's forgiving-parameter principle applies
+// to a mis-VALUED param the same as a mis-NAMED one. None of these must
+// return isError.
+test("out-of-range or numeric-string limits are clamped, not rejected", async () => {
+  await withServer(async ({ client }) => {
+    for (let i = 0; i < 3; i++) {
+      await callJson(client, "remember", { content: `Clamp probe memory number ${i} about oversized limits.` });
+    }
+
+    const recallOver = await callTool(client, "recall", { query: "oversized limits", limit: 100 });
+    assert.equal(recallOver.isError, false, "recall(limit: 100) must not be rejected");
+    assert.ok((JSON.parse(recallOver.text) as RecallResult).hits.length <= 50, "recall(limit: 100) must clamp to the documented cap of 50");
+
+    const listOver = await callTool(client, "list_memories", { limit: 1000 });
+    assert.equal(listOver.isError, false, "list_memories(limit: 1000) must not be rejected");
+    assert.ok(
+      (JSON.parse(listOver.text) as ListResult).items.length <= 200,
+      "list_memories(limit: 1000) must clamp to the documented cap of 200",
+    );
+
+    const stringLimit = await callJson<RecallResult>(client, "recall", { query: "oversized limits", limit: "10" });
+    assert.ok(stringLimit.hits.length <= 10, 'recall(limit: "10") must be coerced from a numeric string, not rejected');
+
+    const nonsenseLimit = await callTool(client, "recall", { query: "oversized limits", limit: "not-a-number" });
+    assert.equal(nonsenseLimit.isError, false, "a non-numeric limit string must fall back to the default, not error");
+  });
+});
+
+test("out-of-range importance is clamped, not rejected", async () => {
+  await withServer(async ({ client, store }) => {
+    const { isError, text } = await callTool(client, "remember", { content: "Importance clamp probe.", importance: 5 });
+    assert.equal(isError, false, "remember(importance: 5) must not be rejected");
+    const remembered = JSON.parse(text) as RememberResult;
+    const stored = store.list({ limit: 200 }).items.find((m) => m.id === remembered.id);
+    assert.ok(stored, "remembered memory must exist");
+    assert.ok(stored.importance <= 1, `remember(importance: 5) must clamp to 1, got ${stored.importance}`);
+
+    const updated = await callJson<UpdateResult>(client, "update_memory", { id: remembered.id, importance: -3 });
+    assert.ok(updated.importance >= 0, `update_memory(importance: -3) must clamp to 0, got ${updated.importance}`);
+  });
+});
+
+test("get_context token_budget rejects nothing: 0, negative, and numeric strings are all clamped", async () => {
+  await withServer(async ({ client }) => {
+    await callJson(client, "remember", { content: "Fact for the token_budget clamp probe.", importance: 0.9 });
+
+    for (const tokenBudget of [0, -5, "200"]) {
+      const { isError } = await callTool(client, "get_context", { query: "token_budget clamp probe", token_budget: tokenBudget });
+      assert.equal(isError, false, `get_context(token_budget: ${JSON.stringify(tokenBudget)}) must not be rejected`);
+    }
+  });
+});
+
+test("update_memory edits a memory; forget by id removes it from recall", async () => {
+  await withServer(async ({ client }) => {
+    const remembered = await callJson<RememberResult>(client, "remember", { content: "Old fact about the roadmap." });
+
+    const updated = await callJson<UpdateResult>(client, "update_memory", {
+      id: remembered.id,
+      content: "Updated fact about the roadmap.",
+      importance: 0.9,
+    });
+    assert.equal(updated.text, "Updated fact about the roadmap.");
+    assert.equal(updated.importance, 0.9);
+
+    const before = await callJson<RecallResult>(client, "recall", { query: "roadmap" });
+    assert.ok(before.hits.some((h) => h.id === remembered.id));
+
+    const forgotten = await callJson<ForgetByIdResult>(client, "forget", { id: remembered.id });
+    assert.equal(forgotten.deleted, true);
+
+    const after = await callJson<RecallResult>(client, "recall", { query: "roadmap" });
+    assert.ok(!after.hits.some((h) => h.id === remembered.id));
+  });
+});
+
+test("forget by query without confirm deletes nothing; with confirm: true it deletes", async () => {
+  await withServer(async ({ client, store }) => {
+    await callJson(client, "remember", { content: "Sensitive detail about the old job at Acme." });
+    await callJson(client, "remember", { content: "Another note about the old job at Acme." });
+
+    const beforeCount = store.list({ limit: 200 }).items.length;
+
+    const preview = await callJson<ForgetPreviewResult>(client, "forget", { query: "old job at Acme" });
+    assert.equal(preview.deleted, false);
+    assert.ok(preview.wouldDelete.length >= 2);
+
+    const afterPreviewCount = store.list({ limit: 200 }).items.length;
+    assert.equal(afterPreviewCount, beforeCount, "a preview (no confirm) must delete nothing");
+
+    const confirmed = await callJson<ForgetConfirmedResult>(client, "forget", { query: "old job at Acme", confirm: true });
+    assert.equal(confirmed.deleted, true);
+    assert.ok(confirmed.count >= 2);
+
+    const afterConfirmCount = store.list({ limit: 200 }).items.length;
+    assert.equal(afterConfirmCount, beforeCount - confirmed.count, "confirm: true must actually delete the matches");
+  });
+});
+
+// The safe form of confirm: pass back exactly the ids a preview returned,
+// so the delete cannot pick up a memory another client wrote (or that
+// re-ranking shifted in) between the preview and the confirm.
+test("forget preview returns bounded ids; confirm with those ids deletes exactly them, not a re-run search", async () => {
+  await withServer(async ({ client, store }) => {
+    await callJson(client, "remember", { content: "Old note about the Contoso contract." });
+    await callJson(client, "remember", { content: "Another old note about the Contoso contract." });
+
+    const preview = await callJson<ForgetPreviewResult>(client, "forget", { query: "Contoso contract" });
+    assert.equal(preview.deleted, false);
+    assert.ok(preview.ids.length >= 2);
+    assert.deepEqual(
+      preview.ids,
+      preview.wouldDelete.map((m) => m.id),
+      "preview `ids` must name exactly the memories listed in `wouldDelete`",
+    );
+    assert.ok(preview.ids.length <= 50, "an unbounded forget preview would defeat §13's bounded-output rule");
+
+    // A memory written after the preview but matching the same query must
+    // NOT be swept in by an ids-based confirm.
+    const late = await callJson<RememberResult>(client, "remember", { content: "Late note about the Contoso contract." });
+
+    const beforeCount = store.list({ limit: 200 }).items.length;
+    const confirmed = await callJson<ForgetConfirmedResult>(client, "forget", { ids: preview.ids, confirm: true });
+    assert.equal(confirmed.deleted, true);
+    assert.deepEqual([...confirmed.ids].sort(), [...preview.ids].sort());
+
+    const afterCount = store.list({ limit: 200 }).items.length;
+    assert.equal(afterCount, beforeCount - preview.ids.length, "must delete exactly the previewed ids, no more, no fewer");
+
+    const stillThere = store.list({ limit: 200 }).items.find((m) => m.id === late.id);
+    assert.ok(stillThere, "the late-written memory matching the same query must survive an ids-scoped confirm");
+  });
+});
+
+// Table-driven over the actual registered tool set (not a hardcoded list of
+// six names) so a newly added tool that forgets to route through a gated
+// Store method fails BOTH tests below: the coverage test if it is missing
+// from this table, and the pause test if it is present but ungated. This is
+// the regression test for the bug where forget()'s query-preview form
+// called the retrieval layer directly and so never reached the per-client
+// pause gate (BUILD_BRIEF §9/§10): with a client paused, every other tool
+// already refused, but forget(query) happily returned memory content.
+const LEAK_MARKER = "must-not-leak-while-paused";
+
+const TOOL_PROBE_ARGS: Record<string, Record<string, unknown>> = {
+  remember: { content: `remember attempted while paused ${LEAK_MARKER}` },
+  recall: { query: LEAK_MARKER },
+  get_context: { query: LEAK_MARKER },
+  list_memories: {},
+  update_memory: { id: "does-not-exist", content: `update attempted while paused ${LEAK_MARKER}` },
+  forget: { query: LEAK_MARKER },
+};
+
+test("the tool probe table covers exactly the registered tool set", async () => {
+  await withServer(async ({ client }) => {
+    const { tools } = await client.listTools();
+    assert.deepEqual([...tools.map((t) => t.name)].sort(), Object.keys(TOOL_PROBE_ARGS).sort());
+  });
+});
+
+// A rejection thrown by a resource read handler surfaces to the client as a
+// rejected request (unlike a tool call, which returns isError: true), so
+// this asserts on the rejection and, defensively, that neither the thrown
+// error's message leaks the marker.
+async function assertResourceReadRefused(client: Client, uri: string): Promise<void> {
+  await assert.rejects(
+    () => client.readResource({ uri }),
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      assert.ok(!message.includes(LEAK_MARKER), `readResource(${uri}) leaked memory content while paused: ${message}`);
+      return true;
+    },
+    `readResource(${uri}) did not refuse a paused client`,
+  );
+}
+
+test("a paused client is refused on every one of the six tools, and none returns memory content", async () => {
+  const clientName = "paused-mcp-client";
+  await withServer(async ({ client, store }) => {
+    const seeded = await callJson<RememberResult>(client, "remember", { content: `seed memory containing ${LEAK_MARKER}` });
+    store.setClientEnabled(clientName, false);
+
+    for (const [name, args] of Object.entries(TOOL_PROBE_ARGS)) {
+      const { text, isError } = await callTool(client, name, args);
+      assert.equal(isError, true, `${name} did not refuse a paused client`);
+      assert.ok(!text.includes(LEAK_MARKER), `${name} returned memory content while the client was paused: ${text}`);
+    }
+
+    // The resource mirror is the same class of read path that already
+    // produced one bypass this milestone (forget's preview) -- it must be
+    // gated too, not just the six tools above.
+    await assertResourceReadRefused(client, "cairn://memories");
+    await assertResourceReadRefused(client, `cairn://memory/${seeded.id}`);
+
+    // Nothing above should have mutated the store: no new remember, no
+    // deletion of the seed memory.
+    assert.equal(store.list({ limit: 200 }).items.length, 1);
+  }, clientName);
+});
+
+test("the audit log records the connected client's name as source_client", async () => {
+  await withServer(async ({ client, store }) => {
+    await callJson(client, "remember", { content: "Audit trail check." });
+    const log = store.auditLog({ action: "remember" });
+    assert.ok(log.items.length > 0);
+    assert.equal(log.items[0]?.sourceClient, "cairn-test-client");
+  }, "cairn-test-client");
+});
+
+test("resource list and read work; a mutation triggers resources/list_changed", async () => {
+  await withServer(async ({ client }) => {
+    const remembered = await callJson<RememberResult>(client, "remember", { content: "Resource-visible memory." });
+
+    const { resources } = await client.listResources();
+    assert.ok(resources.some((r) => r.uri === "cairn://memories"));
+
+    const listRead = await client.readResource({ uri: "cairn://memories" });
+    const listText = firstResourceText(listRead.contents);
+    assert.ok(listText.length > 0);
+
+    const memRead = await client.readResource({ uri: `cairn://memory/${remembered.id}` });
+    const memText = firstResourceText(memRead.contents);
+    const parsed = JSON.parse(memText) as { id: string };
+    assert.equal(parsed.id, remembered.id);
+
+    let resolveNotified: () => void = () => {};
+    const notifiedPromise = new Promise<void>((resolve) => {
+      resolveNotified = resolve;
+    });
+    client.setNotificationHandler(ResourceListChangedNotificationSchema, () => {
+      resolveNotified();
+    });
+
+    await callJson(client, "remember", { content: "Second resource-visible memory." });
+
+    await Promise.race([
+      notifiedPromise,
+      new Promise<void>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("timed out waiting for notifications/resources/list_changed")), 2000);
+      }),
+    ]);
+  });
+});
+
+test("a subscribed client receives resources/updated on mutation; an unsubscribed URI does not", async () => {
+  await withServer(async ({ client }) => {
+    const subscribed = await callJson<RememberResult>(client, "remember", { content: "Subscribed memory." });
+    const unsubscribed = await callJson<RememberResult>(client, "remember", { content: "Unsubscribed memory." });
+    const subscribedUri = `cairn://memory/${subscribed.id}`;
+    const unsubscribedUri = `cairn://memory/${unsubscribed.id}`;
+
+    await client.subscribeResource({ uri: subscribedUri });
+
+    const receivedUris: string[] = [];
+    client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+      receivedUris.push(notification.params.uri);
+    });
+
+    await callJson(client, "update_memory", { id: subscribed.id, content: "Subscribed memory, updated." });
+    await callJson(client, "update_memory", { id: unsubscribed.id, content: "Unsubscribed memory, updated." });
+
+    await Promise.race([
+      (async () => {
+        while (!receivedUris.includes(subscribedUri)) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      })(),
+      new Promise<void>((_resolve, reject) => {
+        setTimeout(() => reject(new Error("timed out waiting for notifications/resources/updated")), 2000);
+      }),
+    ]);
+
+    assert.ok(receivedUris.includes(subscribedUri), "subscribed URI must receive resources/updated");
+    assert.ok(!receivedUris.includes(unsubscribedUri), "an unsubscribed URI must not receive resources/updated");
+  });
+});
+
+test("works end to end with no embedding provider configured (FTS-only mode)", async () => {
+  await withServer(async ({ client }) => {
+    const remembered = await callJson<RememberResult>(client, "remember", { content: "FTS-only fact about apples." });
+    const recalled = await callJson<RecallResult>(client, "recall", { query: "apples" });
+    assert.ok(recalled.hits.some((h) => h.id === remembered.id));
+    assert.equal(recalled.degraded, false);
+    assert.equal(recalled.degradedReason, null);
+  });
+});

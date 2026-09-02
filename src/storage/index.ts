@@ -5,7 +5,7 @@
 // 4 need to name and call it without reaching past the barrel.
 
 export { openStore } from "./store.js";
-export type { Store, StoreOptions, CallContext } from "./store.js";
+export type { Store, StoreOptions, StoreRecallOptions, StoreContextOptions, CallContext } from "./store.js";
 
 export type { CairnDb, DbCapabilities } from "./db.js";
 
@@ -23,6 +23,11 @@ export type {
 } from "./types.js";
 
 export type { AuditAction, ListAuditOptions, ListAuditResult, ClientAuditCounts } from "./repositories/audit.js";
+
+// Store.recall()/Store.context() return retrieval types directly; the MCP
+// layer needs to name SearchHit (to shape its JSON response) without
+// reaching past this barrel into ../retrieval/ itself.
+export type { SearchHit } from "../retrieval/index.js";
 
 export {
   ensureVectorSpace,
