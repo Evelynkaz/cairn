@@ -28,6 +28,7 @@ import { daemonStatus } from "./lifecycle.js";
 import { writeRuntimeFile } from "../daemon/runtime-file.js";
 import { dbPath, ensureHome } from "../config/paths.js";
 import { suppressExperimentalSqliteWarning } from "./index.js";
+import { clientTargets } from "../setup/index.js";
 
 function captureContext(overrides: Partial<CommandContext> = {}): CommandContext & { lines: { out: string[]; err: string[] } } {
   const lines = { out: [] as string[], err: [] as string[] };
@@ -203,19 +204,29 @@ test("setup: with no resolvable home directory anywhere, refuses rather than gue
 
 test("setup: a live, non-dry-run run against a fully isolated home configures all clients under it, nothing outside", async () => {
   await withTempDirAsync(async (home) => {
+    const env = setupEnv(home);
     // Mark every client as "detected" the way a real install would --
     // clientTargets looks for these markers, not the config file itself.
-    mkdirSync(join(home, ".claude"), { recursive: true });
-    mkdirSync(join(home, ".cursor"), { recursive: true });
-    mkdirSync(join(home, "AppData", "Roaming", "Claude"), { recursive: true });
+    // Derive the marker directory (and later, the config path assertions)
+    // from clientTargets itself so this test is correct on every platform
+    // by construction, not by coincidence. Claude Code is the one exception:
+    // its config lives directly at `~/.claude.json`, so dirname(configPath)
+    // is just `home` itself (always present); clientTargets detects it via
+    // a `~/.claude` directory instead (see clients.ts), so that is the
+    // marker to create.
+    for (const target of clientTargets(env, process.platform, home)) {
+      const markerDir = target.id === "claude-code" ? join(home, ".claude") : dirname(target.configPath);
+      mkdirSync(markerDir, { recursive: true });
+    }
 
-    const ctx = captureContext({ env: setupEnv(home) });
+    const ctx = captureContext({ env });
     const code = await runSetup(ctx, { clients: [], dryRun: false, print: false });
     assert.equal(code, 0);
 
-    const claudeCodePath = join(home, ".claude.json");
-    const cursorPath = join(home, ".cursor", "mcp.json");
-    const claudeDesktopPath = join(home, "AppData", "Roaming", "Claude", "claude_desktop_config.json");
+    const targets = clientTargets(env, process.platform, home);
+    const claudeCodePath = targets.find((t) => t.id === "claude-code")?.configPath ?? "";
+    const cursorPath = targets.find((t) => t.id === "cursor")?.configPath ?? "";
+    const claudeDesktopPath = targets.find((t) => t.id === "claude-desktop")?.configPath ?? "";
     assert.ok(existsSync(claudeCodePath));
     assert.ok(existsSync(cursorPath));
     assert.ok(existsSync(claudeDesktopPath));
