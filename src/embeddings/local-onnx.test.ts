@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { createLocalProvider, resolveCacheDir, pickEntry } from "./local-onnx.js";
 import { makeTempDir } from "../testing/tmp.js";
@@ -106,13 +107,20 @@ test("an installed-but-broken runtime reports a distinct error, not 'not install
 });
 
 test("cache directory resolves under CAIRN_HOME by default", () => {
-  const dir = resolveCacheDir(undefined, { CAIRN_HOME: "C:\\fake\\home" });
-  assert.equal(dir, join("C:\\fake\\home", "models"));
+  // Built from tmpdir() rather than a literal like "C:\\fake\\home": that
+  // literal is only absolute on Windows, and a relative path on POSIX gets
+  // the working directory prefixed by resolveCairnHome's path.resolve,
+  // which is exactly the bug a three-platform CI run caught here.
+  const fakeHome = join(tmpdir(), "cairn-fake-home");
+  const dir = resolveCacheDir(undefined, { CAIRN_HOME: fakeHome });
+  assert.equal(dir, join(fakeHome, "models"));
 });
 
 test("cache directory override wins over CAIRN_HOME", () => {
-  const dir = resolveCacheDir("C:\\custom\\cache", { CAIRN_HOME: "C:\\fake\\home" });
-  assert.equal(dir, "C:\\custom\\cache");
+  const fakeHome = join(tmpdir(), "cairn-fake-home");
+  const customCache = join(tmpdir(), "cairn-custom-cache");
+  const dir = resolveCacheDir(customCache, { CAIRN_HOME: fakeHome });
+  assert.equal(dir, customCache);
 });
 
 // The exact shape @huggingface/transformers publishes: no top-level

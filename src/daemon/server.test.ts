@@ -3,7 +3,7 @@
 // checks. Calling handlers directly would skip exactly the transport,
 // Origin and auth wiring this module exists to get right.
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -73,6 +73,22 @@ async function withDaemon<T>(
     }
   });
 }
+
+// StreamableHTTPClientTransport sends its requests over Node's global
+// fetch(), whose keep-alive connection pool is owned by undici's global
+// dispatcher -- there is no public API to close it, only this well-known
+// internal symbol. Closing it is what lets this file's own worker process
+// exit on its own (see CONTRIBUTING.md); it is a no-op if a future Node
+// stops exposing the symbol, rather than a hard failure.
+async function closeGlobalFetchDispatcher(): Promise<void> {
+  const globalAny = globalThis as unknown as Record<symbol, { close?: () => Promise<void> } | undefined>;
+  const dispatcher = globalAny[Symbol.for("undici.globalDispatcher.1")];
+  await dispatcher?.close?.();
+}
+
+after(async () => {
+  await closeGlobalFetchDispatcher();
+});
 
 function connectClient(handle: DaemonHandle, name = "daemon-test-client"): { client: Client; transport: StreamableHTTPClientTransport } {
   const transport = new StreamableHTTPClientTransport(new URL(`${handle.url}/mcp`), {

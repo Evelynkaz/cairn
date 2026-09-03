@@ -3,7 +3,7 @@
 // port: 0 (via CAIRN_PORT), and kills every process it spawns in a
 // `finally` -- a leaked daemon would poison later tests.
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
@@ -52,6 +52,22 @@ function cleanupDir(dir: string): void {
     // Best-effort: never mask the real failure from a test with a cleanup error.
   }
 }
+
+// StreamableHTTPClientTransport sends its requests over Node's global
+// fetch(), whose keep-alive connection pool is owned by undici's global
+// dispatcher -- there is no public API to close it, only this well-known
+// internal symbol. Closing it is what lets this file's own worker process
+// exit on its own (see CONTRIBUTING.md); it is a no-op if a future Node
+// stops exposing the symbol, rather than a hard failure.
+async function closeGlobalFetchDispatcher(): Promise<void> {
+  const globalAny = globalThis as unknown as Record<symbol, { close?: () => Promise<void> } | undefined>;
+  const dispatcher = globalAny[Symbol.for("undici.globalDispatcher.1")];
+  await dispatcher?.close?.();
+}
+
+after(async () => {
+  await closeGlobalFetchDispatcher();
+});
 
 function isPidAlive(pid: number): boolean {
   try {
