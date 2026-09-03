@@ -13,6 +13,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createMcpServer } from "../mcp/server.js";
 import type { McpDeps } from "../mcp/deps.js";
+import { MemoryEventBus } from "../mcp/events.js";
 import { openStore, ensureVectorSpace } from "../storage/index.js";
 import type { Store, VectorSpaceRef } from "../storage/index.js";
 import { openDb } from "../storage/db.js";
@@ -283,7 +284,11 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
 
   const store = options.store ?? openStore({ path: options.dbPath, provider, space });
   const token = options.token ?? generateToken();
-  const deps: McpDeps = { store, provider, space };
+  // ONE bus for the whole daemon, shared by every session's McpDeps below --
+  // this is what lets a mutation on one client's session reach another
+  // client's own subscription (see mcp/events.ts, mcp/server.ts).
+  const bus = new MemoryEventBus();
+  const deps: McpDeps = { store, provider, space, bus };
   const startedAt = Date.now();
   const sessions = new Map<string, SessionEntry>();
   const sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? DEFAULT_SESSION_IDLE_TIMEOUT_MS;

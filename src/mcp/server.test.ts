@@ -11,10 +11,12 @@ import { rmSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ResourceListChangedNotificationSchema, ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { makeTempDir, tempDbPath } from "../testing/tmp.js";
 import { openStore } from "../storage/index.js";
 import type { Store } from "../storage/index.js";
 import { createMcpServer } from "./server.js";
+import { MemoryEventBus } from "./events.js";
 
 interface RememberResult {
   id: string;
@@ -103,6 +105,40 @@ async function withServer<T>(fn: (env: TestEnv) => Promise<T>, clientName = "tes
   } finally {
     await client.close();
     await server.close();
+    store.close();
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch {
+      // Best-effort: never mask the real failure from fn() with a cleanup error.
+    }
+  }
+}
+
+interface SharedBusEnv {
+  store: Store;
+  bus: MemoryEventBus;
+  makeClient(name: string): Promise<{ client: Client; server: McpServer }>;
+}
+
+// The cross-session counterpart to withServer: several createMcpServer
+// instances sharing one store and one MemoryEventBus, the way daemon/
+// server.ts wires up several sessions off of one daemon. Each test closes
+// its own clients/servers (order and timing of that close is itself part
+// of what some of these tests assert), so this helper only owns the store.
+async function withSharedBus<T>(fn: (env: SharedBusEnv) => Promise<T>): Promise<T> {
+  const dir = makeTempDir();
+  const store = openStore({ path: tempDbPath(dir) });
+  const bus = new MemoryEventBus();
+  async function makeClient(name: string): Promise<{ client: Client; server: McpServer }> {
+    const server = createMcpServer({ store, bus });
+    const client = new Client({ name, version: "1.0.0" });
+    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    return { client, server };
+  }
+  try {
+    return await fn({ store, bus, makeClient });
+  } finally {
     store.close();
     try {
       rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -541,5 +577,130 @@ test("works end to end with no embedding provider configured (FTS-only mode)", a
     assert.ok(recalled.hits.some((h) => h.id === remembered.id));
     assert.equal(recalled.degraded, false);
     assert.equal(recalled.degradedReason, null);
+  });
+});
+
+test("list_memories hides a forgotten memory by default, and reveals it with include_deleted (snake_case and camelCase)", async () => {
+  await withServer(async ({ client }) => {
+    const remembered = await callJson<RememberResult>(client, "remember", { content: "To be forgotten and reviewed later." });
+    await callJson(client, "forget", { id: remembered.id });
+
+    const withoutFlag = await callJson<ListResult>(client, "list_memories", { limit: 200 });
+    assert.ok(!withoutFlag.items.some((m) => m.id === remembered.id), "a forgotten memory must be hidden by default");
+
+    const snakeCase = await callJson<ListResult>(client, "list_memories", { limit: 200, include_deleted: true });
+    assert.ok(
+      snakeCase.items.some((m) => m.id === remembered.id),
+      "include_deleted: true must reveal the forgotten memory",
+    );
+
+    const camelCase = await callJson<ListResult>(client, "list_memories", { limit: 200, includeDeleted: true });
+    assert.ok(
+      camelCase.items.some((m) => m.id === remembered.id),
+      "includeDeleted (camelCase alias) must also reveal the forgotten memory",
+    );
+  });
+});
+
+// A mutation through server A must reach a client subscribed on server B --
+// both created off the same daemon's shared MemoryEventBus -- and must NOT
+// reach a client on server C that never subscribed to that URI.
+test("a mutation through one server reaches a client subscribed on another sharing the bus, not one that never subscribed", async () => {
+  await withSharedBus(async ({ makeClient }) => {
+    const a = await makeClient("server-a-client");
+    const b = await makeClient("server-b-client");
+    const c = await makeClient("server-c-client");
+    try {
+      const remembered = await callJson<RememberResult>(a.client, "remember", { content: "Shared-bus memory." });
+      const uri = `cairn://memory/${remembered.id}`;
+
+      const receivedB: string[] = [];
+      b.client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+        receivedB.push(notification.params.uri);
+      });
+      await b.client.subscribeResource({ uri });
+
+      const receivedC: string[] = [];
+      c.client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+        receivedC.push(notification.params.uri);
+      });
+      // c deliberately never subscribes.
+
+      await callJson(a.client, "update_memory", { id: remembered.id, content: "Shared-bus memory, updated." });
+
+      await Promise.race([
+        (async () => {
+          while (!receivedB.includes(uri)) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        })(),
+        new Promise<void>((_resolve, reject) => {
+          setTimeout(() => reject(new Error("timed out waiting for a cross-session notifications/resources/updated")), 2000);
+        }),
+      ]);
+
+      assert.ok(receivedB.includes(uri), "the subscribed peer must receive the cross-session notification");
+      assert.ok(!receivedC.includes(uri), "a peer that never subscribed must not receive it");
+    } finally {
+      await a.client.close();
+      await a.server.close();
+      await b.client.close();
+      await b.server.close();
+      await c.client.close();
+      await c.server.close();
+    }
+  });
+});
+
+test("closing a server unsubscribes it from the shared bus", async () => {
+  await withSharedBus(async ({ bus, makeClient }) => {
+    const a = await makeClient("server-a-client");
+    try {
+      const listenersBeforeB = bus.listenerCount;
+      const b = await makeClient("server-b-client");
+      assert.equal(bus.listenerCount, listenersBeforeB + 1, "creating server B must subscribe it to the bus");
+
+      await b.client.close();
+      await b.server.close();
+
+      assert.equal(bus.listenerCount, listenersBeforeB, "closing server B must unsubscribe its bus listener");
+
+      // A mutation through A afterward must not attempt delivery to B's
+      // now-closed transport -- proven above by B's listener no longer
+      // being registered at all, not merely by the absence of a crash.
+      const remembered = await callJson<RememberResult>(a.client, "remember", { content: "After B closed." });
+      assert.ok(remembered.id);
+    } finally {
+      await a.client.close();
+      await a.server.close();
+    }
+  });
+});
+
+test("a peer whose transport has already failed does not make the mutating client's write fail", async () => {
+  await withSharedBus(async ({ makeClient }) => {
+    const a = await makeClient("server-a-client");
+    const b = await makeClient("server-b-client");
+    try {
+      const remembered = await callJson<RememberResult>(a.client, "remember", { content: "Pre-subscribe memory." });
+      const uri = `cairn://memory/${remembered.id}`;
+      await b.client.subscribeResource({ uri });
+
+      // Simulate B's transport already being gone by the time the
+      // cross-session notification tries to reach it -- the scenario the
+      // guard in server.ts's bus listener exists for.
+      b.server.server.sendResourceUpdated = () => Promise.reject(new Error("simulated dead transport"));
+
+      const { isError, text } = await callTool(a.client, "update_memory", {
+        id: remembered.id,
+        content: "Updated after B's transport died.",
+      });
+      assert.equal(isError, false, `a write must not fail because a third party's transport is gone: ${text}`);
+    } finally {
+      await a.client.close();
+      await a.server.close();
+      await b.client.close();
+      await b.server.close();
+    }
   });
 });

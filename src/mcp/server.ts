@@ -3,11 +3,13 @@
 // resource), and two §6/§8 prompts. Must work with `provider`/`space`
 // absent -- that is the §2 FTS-only default, not an error state.
 
+import { randomUUID } from "node:crypto";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { McpDeps } from "./deps.js";
 import { registerTools, callContext, memoryToJson, MEMORY_URI_TEMPLATE, MEMORIES_LIST_URI } from "./tools.js";
+import { MemoryEventBus } from "./events.js";
 
 const SERVER_NAME = "cairn";
 const SERVER_VERSION = "0.1.0";
@@ -30,11 +32,53 @@ export function createMcpServer(deps: McpDeps): McpServer {
   // state.
   const subscribedUris = new Set<string>();
 
+  // One daemon owns the store (BUILD_BRIEF §4), but each session gets its
+  // own McpServer/transport -- so a mutation on session A must be announced
+  // on session B's own transport, not A's. `bus` is how: daemon/server.ts
+  // shares one MemoryEventBus across every session's McpDeps; a caller that
+  // builds a lone server (every existing test, and any single-session use)
+  // gets a private bus of its own and behaves exactly as before.
+  const bus = deps.bus ?? new MemoryEventBus();
+  const sessionId = randomUUID();
+
+  // A session already learns about its OWN write through resourceEvents
+  // below (the direct, synchronous-per-call path) and through the tool
+  // call's own result -- so a bus event this session itself published is
+  // deliberately skipped here, or every self-subscribed client would see
+  // each of its own writes announced twice.
+  const unsubscribeBus = bus.subscribe((event) => {
+    if (event.sourceSessionId === sessionId) return;
+    if (event.type === "list_changed") {
+      server.sendResourceListChanged();
+      return;
+    }
+    if (subscribedUris.has(event.uri)) {
+      // Fire-and-forget, deliberately not awaited: this runs on a bus
+      // dispatch triggered by ANOTHER session's tool call, so a rejection
+      // here (e.g. this client's transport already closed) must never
+      // reach back into that other session's `remember`/`update_memory`/
+      // `forget` call as a thrown error -- a write that succeeded must not
+      // be reported as failed because a third party's socket died.
+      server.server.sendResourceUpdated({ uri: event.uri }).catch(() => {});
+    }
+  });
+  // The leak this project has already fixed twice: a daemon that never
+  // unsubscribes a closed session's bus listener accumulates one dead
+  // listener per disconnected client for the daemon's whole life.
+  server.server.onclose = () => {
+    unsubscribeBus();
+  };
+
   registerTools(server, deps, {
     async notifyUpdated(uri) {
       if (subscribedUris.has(uri)) {
         await server.server.sendResourceUpdated({ uri });
       }
+      bus.publish({ type: "updated", uri, sourceSessionId: sessionId });
+    },
+    notifyListChanged() {
+      server.sendResourceListChanged();
+      bus.publish({ type: "list_changed", sourceSessionId: sessionId });
     },
   });
 

@@ -35,6 +35,7 @@ export function callContext(server: McpServer, scope?: string): CallContext {
 // subscribed to that URI.
 export interface ResourceEvents {
   notifyUpdated(uri: string): Promise<void>;
+  notifyListChanged(): void;
 }
 
 export const MEMORIES_LIST_URI = "cairn://memories";
@@ -85,6 +86,17 @@ function firstNonEmpty(...values: Array<string | undefined>): string | undefined
     if (value !== undefined && value.trim().length > 0) return value;
   }
   return undefined;
+}
+
+// Same forgiving-alias principle as firstNonEmpty, for the snake_case/
+// camelCase boolean pair list_memories accepts (BUILD_BRIEF §6:
+// `include_deleted`/`includeDeleted`, `include_superseded`/
+// `includeSuperseded`). Absent on both spellings defaults to false.
+function firstBoolean(...values: Array<boolean | undefined>): boolean {
+  for (const value of values) {
+    if (value !== undefined) return value;
+  }
+  return false;
 }
 
 // A number-or-numeric-string schema for every bounded numeric parameter
@@ -150,7 +162,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
   // memory -- that the specific memory resource changed too. Reads never
   // call this.
   async function notifyMutation(memoryId?: string): Promise<void> {
-    server.sendResourceListChanged();
+    resourceEvents.notifyListChanged();
     if (memoryId) {
       await resourceEvents.notifyUpdated(memoryUri(memoryId));
     }
@@ -322,7 +334,9 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         "Browse stored memories with pagination -- for auditing, curating, or finding a memory to update or " +
         "forget when a fuzzy recall search is not precise enough. Example: list_memories(scope: \"work\", " +
         'limit: 20) to see the most recent memories in a scope, then page further with the returned ' +
-        "`nextCursor`. Not for answering a question -- call recall or get_context for that instead.",
+        "`nextCursor`. Not for answering a question -- call recall or get_context for that instead. Pass " +
+        "`include_deleted: true` to review memories the user has forgotten (e.g. to undo one) -- omitted by " +
+        "default, since a forgotten memory should stay out of sight otherwise.",
       inputSchema: {
         scope: z.string().optional().describe("Restrict to one namespace."),
         tags: z.array(z.string()).optional().describe("Only return memories carrying ALL of these tags."),
@@ -333,11 +347,34 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
             "Page size. Defaults to 50, capped at 200. Out-of-range or non-numeric values are clamped, never " +
               "rejected.",
           ),
+        include_deleted: z
+          .boolean()
+          .optional()
+          .describe(
+            "Include soft-deleted (forgotten) memories, for reviewing what was forgotten or undoing a forget. " +
+              "Defaults to false. Alias: `includeDeleted`.",
+          ),
+        includeDeleted: z.boolean().optional().describe("Alias for `include_deleted`."),
+        include_superseded: z
+          .boolean()
+          .optional()
+          .describe(
+            "Include memories superseded by a newer fact (BUILD_BRIEF §5's temporal supersede-not-delete). " +
+              "Defaults to false. Alias: `includeSuperseded`.",
+          ),
+        includeSuperseded: z.boolean().optional().describe("Alias for `include_superseded`."),
       },
     },
     (args) => {
       const result = deps.store.list(
-        { scope: args.scope, tags: args.tags, cursor: args.cursor ?? null, limit: clampInt(args.limit, 1, 200, 50) },
+        {
+          scope: args.scope,
+          tags: args.tags,
+          cursor: args.cursor ?? null,
+          limit: clampInt(args.limit, 1, 200, 50),
+          includeDeleted: firstBoolean(args.include_deleted, args.includeDeleted),
+          includeSuperseded: firstBoolean(args.include_superseded, args.includeSuperseded),
+        },
         callContext(server, args.scope),
       );
       return jsonResult({ items: result.items.map(memoryToJson), nextCursor: result.nextCursor });
@@ -442,7 +479,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
           if (ok) deletedIds.push(id);
         }
         if (deletedIds.length > 0) {
-          server.sendResourceListChanged();
+          resourceEvents.notifyListChanged();
           for (const id of deletedIds) {
             await resourceEvents.notifyUpdated(memoryUri(id));
           }
@@ -483,7 +520,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
       }
 
       if (result.count > 0) {
-        server.sendResourceListChanged();
+        resourceEvents.notifyListChanged();
         for (const match of result.matches) {
           await resourceEvents.notifyUpdated(memoryUri(match.id));
         }

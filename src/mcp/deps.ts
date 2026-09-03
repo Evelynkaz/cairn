@@ -24,10 +24,18 @@
 import type { Store } from "../storage/index.js";
 import type { VectorSpaceRef } from "../storage/index.js";
 import type { EmbeddingProvider } from "../embeddings/types.js";
+import type { MemoryEventBus } from "./events.js";
 
 export interface McpDeps {
   store: Store;
   provider?: EmbeddingProvider | null;
   space?: VectorSpaceRef | null;
   now?: () => number;
+  // The cross-session mutation fan-out (events.ts). Absent in every
+  // existing single-server caller/test -- createMcpServer() falls back to
+  // a private bus of its own, so a lone session behaves exactly as before.
+  // The daemon (daemon/server.ts) creates ONE bus and shares it across
+  // every session's McpDeps, which is what lets one client's write reach
+  // another client's subscription.
+  bus?: MemoryEventBus;
 }
