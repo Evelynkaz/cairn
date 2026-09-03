@@ -66,8 +66,31 @@ async function closeGlobalFetchDispatcher(): Promise<void> {
 }
 
 after(async () => {
+  for (const pid of spawnedDaemonPids) {
+    await killPid(pid);
+  }
   await closeGlobalFetchDispatcher();
 });
+
+// Backstop for every daemon this file spawns (BUILD_BRIEF's own tests are
+// the only thing that ever spawns a *real* `dist/daemon/main.js` process --
+// see CONTRIBUTING.md on why `npm test` must exit on its own). Each test
+// already kills the daemon(s) it knows about in its own `finally`, but
+// ensureDaemon() can spawn a child that never ends up owning daemon.json: two
+// racing calls can both bind and both start, and whichever writes
+// daemon.json last leaves the other alive with nothing pointing at it (see
+// the race comment in ensure-daemon.ts). Every pid recorded here was
+// discovered via a call this file itself made against a temp CAIRN_HOME --
+// never the real one -- so re-killing them all after every test has run is
+// always safe, and a pid already dead (because its own test's `finally`
+// already killed it) is a no-op for killPid().
+const spawnedDaemonPids = new Set<number>();
+
+function trackPid(pid: number | undefined | null): void {
+  if (typeof pid === "number") {
+    spawnedDaemonPids.add(pid);
+  }
+}
 
 function isPidAlive(pid: number): boolean {
   try {
@@ -301,6 +324,7 @@ test("ensureDaemon starts a daemon when none is running, and a second call finds
   let daemonPid: number | undefined;
   try {
     const first = await ensureDaemon({ home, env, timeoutMs: 15_000 });
+    trackPid(first.spawnedPid);
     assert.equal(first.started, true);
     assert.match(first.url, /^http:\/\/127\.0\.0\.1:\d+$/);
     assert.ok(first.token.length > 0);
@@ -308,8 +332,10 @@ test("ensureDaemon starts a daemon when none is running, and a second call finds
     const info = readRuntimeFile(home);
     assert.ok(info);
     daemonPid = info?.pid;
+    trackPid(daemonPid);
 
     const second = await ensureDaemon({ home, env, timeoutMs: 15_000 });
+    trackPid(second.spawnedPid);
     assert.equal(second.started, false);
     assert.equal(second.url, first.url);
     assert.equal(second.token, first.token);
@@ -330,6 +356,7 @@ test("ensureDaemon ignores a stale runtime file naming a dead pid and starts a f
     writeRuntimeFile({ pid: deadPid as number, port: 59999, token: "stale-token", startedAt: Date.now(), version: "0.1.0" }, home);
 
     const result = await ensureDaemon({ home, env, timeoutMs: 15_000 });
+    trackPid(result.spawnedPid);
     assert.equal(result.started, true);
     assert.notEqual(result.token, "stale-token");
 
@@ -337,6 +364,7 @@ test("ensureDaemon ignores a stale runtime file naming a dead pid and starts a f
     assert.ok(info);
     assert.notEqual(info?.pid, deadPid);
     daemonPid = info?.pid;
+    trackPid(daemonPid);
   } finally {
     await killPid(daemonPid ?? readRuntimeFile(home)?.pid);
     cleanupDir(home);
@@ -348,11 +376,24 @@ test("two concurrent ensureDaemon calls racing to spawn on the same port both re
   const port = await freePort();
   const env = { ...process.env, CAIRN_PORT: String(port) };
   let daemonPid: number | undefined;
+  let aPid: number | undefined;
+  let bPid: number | undefined;
   try {
+    // On the fixed port both calls share, only one spawned child can ever
+    // actually bind it -- the loser is expected to hit EADDRINUSE in its own
+    // process and exit unaided (see the comment in ensure-daemon.ts).
+    // Tracking BOTH spawned pids here, not just the eventual owner's, is
+    // what catches it if that assumption ever doesn't hold: a loser that
+    // somehow stays alive would otherwise be referenced by nobody once this
+    // test returns.
     const [a, b] = await Promise.all([
       ensureDaemon({ home, env, timeoutMs: 15_000 }),
       ensureDaemon({ home, env, timeoutMs: 15_000 }),
     ]);
+    aPid = a.spawnedPid;
+    bPid = b.spawnedPid;
+    trackPid(aPid);
+    trackPid(bPid);
     assert.equal(a.url, `http://127.0.0.1:${port}`);
     assert.equal(a.url, b.url);
     assert.equal(a.token, b.token);
@@ -360,8 +401,11 @@ test("two concurrent ensureDaemon calls racing to spawn on the same port both re
     const info = readRuntimeFile(home);
     assert.ok(info);
     daemonPid = info?.pid;
+    trackPid(daemonPid);
   } finally {
     await killPid(daemonPid ?? readRuntimeFile(home)?.pid);
+    await killPid(aPid);
+    await killPid(bPid);
     cleanupDir(home);
   }
 });
@@ -377,6 +421,7 @@ test("ensureDaemon does not leak the daemon.log file descriptor across repeated 
       homes.push(home);
       const env = { ...process.env, CAIRN_PORT: "0" };
       const result = await ensureDaemon({ home, env, timeoutMs: 15_000 });
+      trackPid(result.spawnedPid);
       assert.equal(result.started, true);
       pids.push(readRuntimeFile(home)?.pid);
 
@@ -447,6 +492,7 @@ test("a real MCP client through the shim (stdio) and a real MCP client direct to
     const info = readRuntimeFile(home);
     assert.ok(info, "the shim must have auto-started a daemon and written its runtime file");
     daemonPid = info?.pid;
+    trackPid(daemonPid);
     const url = `http://127.0.0.1:${info?.port}`;
     const token = info?.token ?? "";
 
@@ -503,6 +549,7 @@ test("killing the shim process leaves the daemon running and still serving over 
     const info = readRuntimeFile(home);
     assert.ok(info);
     daemonPid = info?.pid;
+    trackPid(daemonPid);
     const url = `http://127.0.0.1:${info?.port}`;
     const token = info?.token ?? "";
 
@@ -554,6 +601,7 @@ test("closing the shim's stdin, as an MCP client disconnecting would, makes the 
     const info = readRuntimeFile(home);
     assert.ok(info);
     daemonPid = info?.pid;
+    trackPid(daemonPid);
 
     const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
       shimChild.once("exit", (code, signal) => resolve({ code, signal }));
@@ -604,6 +652,7 @@ test("after the daemon dies mid-session, the shim recovers by reconnecting or ex
     const info = readRuntimeFile(home);
     assert.ok(info);
     daemonPid = info?.pid;
+    trackPid(daemonPid);
     await killPid(daemonPid);
     daemonPid = undefined;
 
@@ -628,6 +677,7 @@ test("after the daemon dies mid-session, the shim recovers by reconnecting or ex
       assert.ok(recovered, "the shim must eventually serve a call again after the daemon died: reconnect, or exit for a respawn");
       assert.ok(rememberedAfter?.id);
       daemonPid = readRuntimeFile(home)?.pid;
+      trackPid(daemonPid);
     }
   } finally {
     await stdioClient.close().catch(() => {});

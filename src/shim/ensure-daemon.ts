@@ -24,13 +24,24 @@ export interface EnsureDaemonResult {
   url: string;
   token: string;
   started: boolean;
+  // The pid of the child process THIS call spawned, when it spawned one at
+  // all (unset when an already-live daemon was found and nothing was
+  // spawned). This can differ from the daemon named by the returned
+  // url/token: two callers racing to spawn on the same runtime file can both
+  // successfully bind and both start, but only one ends up owning
+  // daemon.json (see the race comment below). Exposing this is what lets a
+  // caller (in practice, only the test suite) clean up a spawned child it
+  // owns even when that child turned out not to be the eventual owner --
+  // nothing else in this module tracks that child's pid once this call
+  // returns.
+  spawnedPid?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const POLL_INTERVAL_MS = 100;
 
-function toResult(info: RuntimeInfo, started: boolean): EnsureDaemonResult {
-  return { url: `http://127.0.0.1:${info.port}`, token: info.token, started };
+function toResult(info: RuntimeInfo, started: boolean, spawnedPid?: number): EnsureDaemonResult {
+  return { url: `http://127.0.0.1:${info.port}`, token: info.token, started, spawnedPid };
 }
 
 // Resolved relative to this module's own file (dist/shim/ensure-daemon.js
@@ -113,5 +124,5 @@ export async function ensureDaemon(options: EnsureDaemonOptions = {}): Promise<E
     );
   }
   const owner = readRuntimeFile(home) ?? info;
-  return toResult(owner, true);
+  return toResult(owner, true, child.pid);
 }
