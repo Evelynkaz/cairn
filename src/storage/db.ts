@@ -61,6 +61,32 @@ function currentUserVersion(driver: SqliteDriver): number {
 // fixed-arity SQL where practical.
 const STATEMENT_CACHE_LIMIT = 200;
 
+function isLockError(error: unknown): boolean {
+  return error instanceof Error && /database is locked|SQLITE_BUSY/i.test(error.message);
+}
+
+// Synchronous blocking sleep: openDb is called synchronously all over this
+// codebase (CLI commands, every test in this file, driver open itself), so
+// the retry below cannot become async without breaking every one of those
+// callers. Atomics.wait on a private SharedArrayBuffer blocks this thread
+// for `ms` without any new dependency.
+function sleepSync(ms: number): void {
+  const sab = new SharedArrayBuffer(4);
+  const view = new Int32Array(sab);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+// A handful of bounded attempts with a short backoff. This exists here, at
+// the layer that actually contends, rather than in any one caller: every
+// caller of openDb (the daemon's startup, `cairn status`, `cairn
+// embeddings`, ...) races every other one that can also open a fresh
+// database, and `PRAGMA journal_mode=WAL` below takes its own EXCLUSIVE
+// lock that busy_timeout does not reliably cover -- see the comment on that
+// pragma. Retrying only on a lock/busy error keeps a genuine failure (a
+// corrupt file, a failed migration) surfacing immediately and unchanged.
+const OPEN_RETRY_ATTEMPTS = 5;
+const OPEN_RETRY_BASE_DELAY_MS = 25;
+
 export function openDb(options: OpenDbOptions = {}): CairnDb {
   const path = options.path ?? dbPath();
   if (path !== ":memory:") {
@@ -69,6 +95,22 @@ export function openDb(options: OpenDbOptions = {}): CairnDb {
 
   const driverFactory = options.driver ?? defaultDriver;
   const readOnly = options.readOnly ?? false;
+
+  for (let attempt = 0; attempt < OPEN_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return openOnce(driverFactory, path, readOnly);
+    } catch (error) {
+      if (!isLockError(error) || attempt === OPEN_RETRY_ATTEMPTS - 1) {
+        throw error;
+      }
+      sleepSync(OPEN_RETRY_BASE_DELAY_MS * (attempt + 1));
+    }
+  }
+  // Unreachable: the loop above always either returns or throws.
+  throw new Error("openDb: exhausted attempts without a result");
+}
+
+function openOnce(driverFactory: DriverFactory, path: string, readOnly: boolean): CairnDb {
   const driver = driverFactory({ path, allowExtension: true, readOnly });
 
   try {

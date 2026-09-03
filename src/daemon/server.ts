@@ -172,36 +172,6 @@ function tokenMatches(provided: string, expected: string): boolean {
 // answer 413 instead of 400 -- see MAX_REQUEST_BODY_BYTES above.
 class PayloadTooLargeError extends Error {}
 
-function isDatabaseLockedError(error: unknown): boolean {
-  return error instanceof Error && /database is locked/i.test(error.message);
-}
-
-// Measured residual (§4, two-clients-launch-together race): even with
-// busy_timeout armed before journal_mode=WAL and runMigrations' own re-read
-// fix, a small fraction of two-process trials (2-4/40 measured here) still
-// hit "database is locked" -- `PRAGMA journal_mode=WAL` itself takes an
-// EXCLUSIVE lock that two brand-new connections can collide on before
-// busy_timeout gets a chance to wait it out. That lock is only ever held
-// for the instant it takes the other connection to finish the switch, so a
-// short bounded retry here (openDb/openStore own no retry policy of their
-// own, and are off-limits to change) turns that instant into an invisible
-// wait instead of a daemon refusing to start.
-async function withLockRetry<T>(fn: () => T): Promise<T> {
-  const attempts = 4;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      return fn();
-    } catch (error) {
-      if (!isDatabaseLockedError(error) || i === attempts - 1) {
-        throw error;
-      }
-      await new Promise<void>((resolve) => setTimeout(resolve, 25 * (i + 1)));
-    }
-  }
-  // Unreachable: the loop above always either returns or throws.
-  throw new Error("withLockRetry: exhausted attempts without a result");
-}
-
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -515,7 +485,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     const embeddingsMode = options.embeddings ?? "auto";
 
     if (embeddingsMode === "auto" && ownsStore) {
-      const bootstrapDb = await withLockRetry(() => openDb({ path: options.dbPath }));
+      const bootstrapDb = openDb({ path: options.dbPath });
       try {
         if (options.provider !== undefined) {
           provider = options.provider;
@@ -555,7 +525,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       }
     }
 
-    store = options.store ?? (await withLockRetry(() => openStore({ path: options.dbPath, provider, space })));
+    store = options.store ?? openStore({ path: options.dbPath, provider, space });
   } catch (error) {
     // The port is already held; if the database then fails to open, that
     // must not leave a daemon-shaped process squatting on it forever with
