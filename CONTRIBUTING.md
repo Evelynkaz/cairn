@@ -44,6 +44,19 @@ does **not** isolate this: client config paths (`~/.claude.json`,
 `~/.cursor/mcp.json`, the Claude Desktop config path) are deliberately
 outside `CAIRN_HOME`, by design.
 
+## Tests must not encode the host OS's filesystem semantics
+
+A test that passes on one platform and fails on another because it baked in
+that platform's filesystem behaviour is a bug in the test, not a green light
+to special-case it by OS. Two real examples that broke CI: a `C:\fake\home`
+literal used as a path, which is actually a relative path on POSIX; and a
+`renameSync` onto a read-only file, which succeeds on POSIX (rename only
+needs write permission on the directory) but fails on Windows. Where a
+property can genuinely only be measured precisely on one platform (e.g. exact
+open file descriptor counts, which are only readable via `/proc/self/fd` on
+Linux), the test skips elsewhere with `t.skip("reason")` rather than
+asserting a proxy that can fail at random.
+
 ## Pull requests
 
 Keep changes focused and runnable at every step. Add or update tests for

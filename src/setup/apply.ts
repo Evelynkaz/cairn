@@ -1,4 +1,6 @@
 import {
+  accessSync,
+  constants,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -196,6 +198,23 @@ export function applyToClient(
 
   if (options.dryRun) {
     return { target, outcome };
+  }
+
+  // Check writability explicitly, before touching anything, rather than
+  // letting the write fail on its own: on POSIX, renaming a new file onto
+  // an existing one only needs write permission on the *directory*, not on
+  // the target file, so a `chmod 444` config would otherwise be silently
+  // replaced -- atomic rename would defeat the file's own permissions. A
+  // read-only file is the user telling the tool not to touch it; honour
+  // that the same way on every platform.
+  try {
+    accessSync(target.configPath, constants.W_OK);
+  } catch (err) {
+    return {
+      target,
+      outcome: "failed",
+      detail: `${target.configPath}: not writable: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 
   const backupPath = `${target.configPath}.cairn-backup-${backupSuffix()}`;
