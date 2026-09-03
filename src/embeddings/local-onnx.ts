@@ -5,9 +5,11 @@
 // automatically on every install, which would pull that weight into every
 // `npx cairn` run (including FTS-only users) and break the §2 zero-config,
 // instant-start promise. An optional PEER dependency is never auto-installed,
-// so the runtime only shows up once the user (or `cairn embeddings enable`)
-// explicitly installs it. This module resolves it lazily, at call time, and
-// fails with an actionable message when it is missing.
+// so the runtime only shows up once the user explicitly installs it (e.g.
+// `npm install --prefix <CAIRN_HOME> @huggingface/transformers`) --
+// `cairn embeddings enable` records consent to use it, it never installs
+// it. This module resolves it lazily, at call time, and fails with an
+// actionable message when it is missing.
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -64,19 +66,27 @@ export function resolveCacheDir(cacheDir?: string, env: NodeJS.ProcessEnv = proc
   return cacheDir ?? join(resolveCairnHome(env), "models");
 }
 
-function missingRuntimeError(home: string, cause: unknown): Error {
-  return new Error(
+// Exported so other modules that need to explain the same "runtime not
+// installed" situation (e.g. the CLI's `embeddingStatus`, which diagnoses
+// this via require.resolve() rather than by actually loading the runtime)
+// never carry their own, independently-drifting copy of this wording.
+export function missingRuntimeMessage(home: string): string {
+  return (
     "semantic search needs the local embedding runtime, which is not installed. " +
-      `Run: cairn embeddings enable  (or: npm install --prefix ${home} @huggingface/transformers). ` +
-      "Cairn keeps working with keyword search in the meantime.",
-    { cause },
+    `Install it with: npm install --prefix ${home} @huggingface/transformers ` +
+    "(after consenting via: cairn embeddings enable, which records consent but does not install it). " +
+    "Cairn keeps working with keyword search in the meantime."
   );
 }
 
+function missingRuntimeError(home: string, cause: unknown): Error {
+  return new Error(missingRuntimeMessage(home), { cause });
+}
+
 // Distinct from missingRuntimeError: the package IS present at packageDir,
-// so telling the user to (re)run `cairn embeddings enable` -- the same
-// install command that produced this broken install -- would just fail the
-// same way again. Real triggers include a native onnxruntime-node binding
+// so telling the user to (re)run the same `npm install` that produced this
+// broken install would just fail the same way again. Real triggers include
+// a native onnxruntime-node binding
 // mismatch (common on Windows and musl), a half-finished npm install, or a
 // wrong-architecture prebuild; the original error is attached as `cause` so
 // that reason is visible to whoever debugs it.
@@ -98,9 +108,10 @@ function importRuntime(specifier: string): Promise<unknown> {
 }
 
 // Second location: the runtime installed into CAIRN_HOME/node_modules by
-// `cairn embeddings enable` (never into this package's own node_modules).
-// The package's own package.json is read to find its ESM entry point rather
-// than assuming a fixed file layout.
+// `npm install --prefix <CAIRN_HOME> @huggingface/transformers` (never by
+// `cairn embeddings enable`, which only records consent, and never into
+// this package's own node_modules). The package's own package.json is read
+// to find its ESM entry point rather than assuming a fixed file layout.
 async function resolveCairnHomeEntryUrl(packageDir: string): Promise<string> {
   const pkgRaw = await readFile(join(packageDir, "package.json"), "utf8");
   const pkg = JSON.parse(pkgRaw) as { main?: string; module?: string; exports?: unknown };

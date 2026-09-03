@@ -4,7 +4,6 @@
 // nothing here talks to the database.
 
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { connect } from "node:net";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { ensureHome, resolveCairnHome } from "../config/paths.js";
@@ -71,7 +70,7 @@ export function removeRuntimeFile(home: string = resolveCairnHome()): void {
   rmSync(runtimeFilePath(home), { force: true });
 }
 
-function pidIsAlive(pid: number): boolean {
+export function pidIsAlive(pid: number): boolean {
   try {
     // Signal 0 sends nothing; it only probes whether the process exists and
     // is reachable, on both POSIX and Windows.
@@ -82,26 +81,51 @@ function pidIsAlive(pid: number): boolean {
   }
 }
 
-function portAnswers(port: number, timeoutMs = 500): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = connect({ port, host: "127.0.0.1" });
-    const finish = (result: boolean): void => {
-      socket.destroy();
-      resolve(result);
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once("connect", () => finish(true));
-    socket.once("timeout", () => finish(false));
-    socket.once("error", () => finish(false));
-  });
+interface HealthProbeBody {
+  ok?: unknown;
+  pid?: unknown;
+}
+
+function isHealthProbeBody(value: unknown): value is HealthProbeBody {
+  return typeof value === "object" && value !== null;
+}
+
+// A pid existing and a port answering are each independently meaningless:
+// pids are recycled by the OS and any local service can be holding the
+// recorded port, so neither one -- nor both together -- identifies the
+// process as the cairn daemon. /health carries the daemon's own pid (see
+// server.ts) precisely so this can compare it against the runtime file's
+// pid rather than inferring identity from coincidence.
+async function healthIdentifiesDaemon(info: RuntimeInfo, timeoutMs = 500): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${info.port}/health`, { signal: controller.signal });
+    if (!res.ok) {
+      return false;
+    }
+    const body: unknown = await res.json();
+    return isHealthProbeBody(body) && body.ok === true && body.pid === info.pid;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // A stale runtime file left by a daemon that crashed (or a reboot that
 // killed it without cleanup) is the normal case, not an exception -- so this
 // checks liveness on two independent signals rather than trusting the file.
+// Both signals must also PROVE identity, not just presence: a recycled pid
+// or a foreign service that happened to take the recorded port must read as
+// "not alive", not as "alive" -- see healthIdentifiesDaemon above. This
+// matters beyond liveness reporting: ensureDaemon (shim/ensure-daemon.ts)
+// uses this to decide whether to ATTACH to a daemon and hand it the bearer
+// token, and stopDaemon (cli/lifecycle.ts) uses it to decide whether to
+// signal the recorded pid at all.
 export async function isDaemonAlive(info: RuntimeInfo): Promise<boolean> {
   if (!pidIsAlive(info.pid)) {
     return false;
   }
-  return portAnswers(info.port);
+  return healthIdentifiesDaemon(info);
 }

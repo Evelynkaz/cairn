@@ -23,7 +23,13 @@ const KEY_CONSENTED = "embeddings.consented";
 // Every name resolveEmbeddingConfig can produce from configuration. "fake"
 // is deliberately excluded: it exists only for tests to construct directly
 // (see fake.ts) and must never be reachable through env or settings.
-const VALID_PROVIDER_NAMES: readonly ProviderName[] = [
+// Exported so a caller taking an unvalidated provider name from a config
+// command (cli/lifecycle.ts's enableEmbeddings) can reject an unknown value
+// before writing anything, instead of relying on this module to silently
+// degrade it to "off" the way resolveFromSettings does for a corrupted
+// settings row (see the comment there for why that leniency is right for a
+// row we don't control, but wrong for input we do).
+export const VALID_PROVIDER_NAMES: readonly ProviderName[] = [
   "off",
   "local-onnx",
   "local-static",

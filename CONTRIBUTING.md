@@ -29,6 +29,21 @@ npm test
 - No CLA required — contributions are accepted under the project's MIT
   license.
 
+## Never run `cairn setup` for real against your own machine
+
+During verification of a past milestone, an agent ran `cairn setup` for
+real. It wrote a `cairn` entry into the developer's actual `~/.claude.json`,
+pointing at an unpublished package, so the editor would have failed to
+launch it every session from then on. The backup mechanism worked and the
+entry was removed by hand, but the run should never have happened.
+
+Any command that writes outside the repository -- `cairn setup` above all --
+must be verified with `--dry-run`, or with `HOME`/`USERPROFILE` pointed at a
+temp directory, never against the machine you are working on. `CAIRN_HOME`
+does **not** isolate this: client config paths (`~/.claude.json`,
+`~/.cursor/mcp.json`, the Claude Desktop config path) are deliberately
+outside `CAIRN_HOME`, by design.
+
 ## Pull requests
 
 Keep changes focused and runnable at every step. Add or update tests for

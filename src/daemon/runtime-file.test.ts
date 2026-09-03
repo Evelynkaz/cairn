@@ -6,7 +6,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { createServer } from "node:net";
+import { createServer as createNetServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import type { Server as HttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -102,7 +104,7 @@ test("isDaemonAlive is false for a runtime file pointing at a dead pid", async (
 });
 
 test("isDaemonAlive is false for a live pid whose port is closed", async () => {
-  const server = createServer();
+  const server = createNetServer();
   const port = await new Promise<number>((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();
@@ -115,8 +117,33 @@ test("isDaemonAlive is false for a live pid whose port is closed", async () => {
   assert.equal(alive, false);
 });
 
-test("isDaemonAlive is true for a live pid whose port answers", async () => {
-  const server = createServer();
+// A port answering is not enough: it must answer with the daemon's own
+// /health shape AND the recorded pid, or identity is unproven (see the
+// isDaemonAlive comment in runtime-file.ts).
+test("isDaemonAlive is false for a foreign HTTP server on the recorded port, even though the pid is alive", async () => {
+  const server: HttpServer = createHttpServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, pid: process.pid + 1 }));
+  });
+  const port = await new Promise<number>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resolve(typeof address === "object" && address !== null ? address.port : 0);
+    });
+  });
+  try {
+    const alive = await isDaemonAlive(sampleInfo({ pid: process.pid, port }));
+    assert.equal(alive, false);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("isDaemonAlive is true for a live pid whose /health answers ok with the matching pid", async () => {
+  const server: HttpServer = createHttpServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, pid: process.pid }));
+  });
   const port = await new Promise<number>((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       const address = server.address();

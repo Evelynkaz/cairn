@@ -30,7 +30,7 @@ import {
   writeRuntimeFile,
 } from "./runtime-file.js";
 
-const DEFAULT_PORT = 8787;
+export const DEFAULT_PORT = 8787;
 const DAEMON_VERSION = "0.1.0";
 
 // A request body this large is never a legitimate MCP payload; it is either
@@ -313,10 +313,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     // token, no paths.
     sendJson(res, 200, {
       ok: true,
+      pid: process.pid,
       version: DAEMON_VERSION,
       uptimeMs: Date.now() - startedAt,
       memories: store.countMemories(),
       vectors: store.capabilities.vectors,
+      journalMode: store.capabilities.journalMode,
     });
   }
 
