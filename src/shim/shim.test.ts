@@ -371,7 +371,22 @@ test("ensureDaemon ignores a stale runtime file naming a dead pid and starts a f
   }
 });
 
-test("two concurrent ensureDaemon calls racing to spawn on the same port both resolve to the one winner", async () => {
+// The port freePort() hands back is only free at the instant it checks --
+// nothing stops some other process on the machine (including this project's
+// own concurrently-running test files) from grabbing it before the race
+// below gets to it. When that happens, BOTH daemons below fail to bind and
+// exit with EADDRINUSE, and ensureDaemon() times out waiting for either to
+// become healthy: that is an environment collision, not a failure of the
+// property under test (two racing ensureDaemon calls resolve to the one
+// winner). Recognising it by the EADDRINUSE tail ensure-daemon.ts now folds
+// into its timeout error is what lets the retry loop below tell the two
+// apart: a genuine defect (mismatched winners, no runtime file, or any other
+// assertion failing) still fails the test loudly and is never retried away.
+function isPortCollision(err: unknown): boolean {
+  return err instanceof Error && err.message.includes("EADDRINUSE");
+}
+
+async function attemptConcurrentEnsureDaemonRace(): Promise<"success" | "collision"> {
   const home = makeTempDir();
   const port = await freePort();
   const env = { ...process.env, CAIRN_PORT: String(port) };
@@ -382,14 +397,23 @@ test("two concurrent ensureDaemon calls racing to spawn on the same port both re
     // On the fixed port both calls share, only one spawned child can ever
     // actually bind it -- the loser is expected to hit EADDRINUSE in its own
     // process and exit unaided (see the comment in ensure-daemon.ts).
+    let a: EnsureDaemonResult;
+    let b: EnsureDaemonResult;
+    try {
+      [a, b] = await Promise.all([
+        ensureDaemon({ home, env, timeoutMs: 15_000 }),
+        ensureDaemon({ home, env, timeoutMs: 15_000 }),
+      ]);
+    } catch (err) {
+      if (isPortCollision(err)) {
+        return "collision";
+      }
+      throw err;
+    }
     // Tracking BOTH spawned pids here, not just the eventual owner's, is
     // what catches it if that assumption ever doesn't hold: a loser that
     // somehow stays alive would otherwise be referenced by nobody once this
     // test returns.
-    const [a, b] = await Promise.all([
-      ensureDaemon({ home, env, timeoutMs: 15_000 }),
-      ensureDaemon({ home, env, timeoutMs: 15_000 }),
-    ]);
     aPid = a.spawnedPid;
     bPid = b.spawnedPid;
     trackPid(aPid);
@@ -402,12 +426,28 @@ test("two concurrent ensureDaemon calls racing to spawn on the same port both re
     assert.ok(info);
     daemonPid = info?.pid;
     trackPid(daemonPid);
+    return "success";
   } finally {
     await killPid(daemonPid ?? readRuntimeFile(home)?.pid);
     await killPid(aPid);
     await killPid(bPid);
     cleanupDir(home);
   }
+}
+
+test("two concurrent ensureDaemon calls racing to spawn on the same port both resolve to the one winner", async () => {
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const outcome = await attemptConcurrentEnsureDaemonRace();
+    if (outcome === "success") {
+      return;
+    }
+  }
+  assert.fail(
+    `every one of ${maxAttempts} attempts collided on a port grabbed by something else on this machine before ` +
+      "the race under test could use it -- this is an environment collision, not a race bug in ensureDaemon; " +
+      "re-running should resolve it.",
+  );
 });
 
 test("ensureDaemon does not leak the daemon.log file descriptor across repeated spawns", async () => {

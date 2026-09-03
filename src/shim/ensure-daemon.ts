@@ -7,7 +7,7 @@
 
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, openSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureHome, resolveCairnHome } from "../config/paths.js";
@@ -52,6 +52,24 @@ function toResult(info: RuntimeInfo, started: boolean, spawnedPid?: number): Ens
 function daemonEntrypoint(): string {
   const here = dirname(fileURLToPath(import.meta.url));
   return join(here, "..", "daemon", "main.js");
+}
+
+const LOG_TAIL_MAX_CHARS = 2_000;
+const LOG_TAIL_MAX_LINES = 20;
+
+// Best-effort tail of the daemon's own log, for folding into the timeout
+// error below: a user (or CI run) hitting this gets the actual reason the
+// daemon never came up instead of just a path to go looking for it
+// themselves. Must never throw over the top of the real error -- the log may
+// not exist yet, or be unreadable for any number of environment reasons.
+function tailDaemonLog(logPath: string): string | null {
+  try {
+    const contents = readFileSync(logPath, "utf8");
+    const lines = contents.split("\n").slice(-LOG_TAIL_MAX_LINES).join("\n");
+    return lines.slice(-LOG_TAIL_MAX_CHARS);
+  } catch {
+    return null;
+  }
 }
 
 async function pollForHealthyDaemon(home: string, deadline: number): Promise<RuntimeInfo | null> {
@@ -117,10 +135,14 @@ export async function ensureDaemon(options: EnsureDaemonOptions = {}): Promise<E
   const info = await pollForHealthyDaemon(home, deadline);
   if (!info) {
     child.kill();
+    const tail = tailDaemonLog(logPath);
+    const tailMessage = tail
+      ? ` Last output from "${logPath}":\n${tail}`
+      : ` Check the daemon's log at "${logPath}" for what went wrong.`;
     throw new Error(
       `cairn: the daemon did not become healthy within ${timeoutMs}ms. ` +
-        `Tried spawning "${entrypoint}" with CAIRN_HOME="${home}". ` +
-        `Check the daemon's log at "${logPath}" for what went wrong.`,
+        `Tried spawning "${entrypoint}" with CAIRN_HOME="${home}".` +
+        tailMessage,
     );
   }
   const owner = readRuntimeFile(home) ?? info;
