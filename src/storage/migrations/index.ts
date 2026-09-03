@@ -48,6 +48,18 @@ export function runMigrations(
     }
     driver.exec("BEGIN IMMEDIATE");
     try {
+      // A racing connection may have applied this migration (via its own
+      // BEGIN IMMEDIATE) while this one waited out the lock on busy_timeout
+      // -- `current`/`from` above were read before that wait, so they can
+      // no longer be trusted. Re-read now that the lock is actually held
+      // and skip cleanly if the winner already got here first, instead of
+      // replaying DDL onto a schema that already has it.
+      const actual = userVersion(driver);
+      if (migration.version <= actual) {
+        driver.exec("COMMIT");
+        current = actual;
+        continue;
+      }
       migration.up(driver);
       setUserVersion(driver, migration.version);
       driver.exec("COMMIT");

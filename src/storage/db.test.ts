@@ -1,9 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
-import { withTempDir, tempDbPath } from "../testing/tmp.js";
+import { spawn } from "node:child_process";
+import { withTempDir, withTempDirAsync, tempDbPath } from "../testing/tmp.js";
 import { openDb } from "./db.js";
 import { openNodeSqlite } from "./driver/node-sqlite.js";
+import { migrations } from "./migrations/index.js";
 
 function insertMemory(
   db: ReturnType<typeof openDb>,
@@ -222,6 +224,66 @@ test("a second writer fails with 'database is locked' while the first holds BEGI
       writer.close();
     }
   });
+});
+
+test("regression: two real processes opening the same fresh database concurrently both succeed (busy_timeout must be armed before journal_mode=WAL)", async () => {
+  // Schema is pre-migrated with a raw driver so both racers skip
+  // runMigrations' own BEGIN IMMEDIATE entirely (user_version already at
+  // the highest known version) and land on the exact statement this fix is
+  // about: PRAGMA journal_mode=WAL, still un-set on this file. That isolates
+  // the pragma-order bug from unrelated contention elsewhere in openDb.
+  const highest = migrations.reduce((max, m) => Math.max(max, m.version), 0);
+
+  function runChild(path: string): ReturnType<typeof spawn> {
+    return spawn(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `
+      import { openDb } from "${new URL("./db.js", import.meta.url).href}";
+      try {
+        const db = openDb({ path: ${JSON.stringify(path)} });
+        db.close();
+        process.stdout.write("OK\\n");
+      } catch (e) {
+        process.stdout.write("ERR:" + e.message + "\\n");
+      }
+      `,
+    ]);
+  }
+
+  async function childOutput(child: ReturnType<typeof spawn>): Promise<string> {
+    let out = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    await new Promise<void>((resolve) => child.on("exit", () => resolve()));
+    return out.trim();
+  }
+
+  // Real two-process concurrency does not reproduce SQLITE_BUSY on every
+  // single run, so this drives enough trials that a reverted pragma order
+  // is caught reliably (measured: ~25% of trials fail per run when
+  // reverted, 0/40 when fixed) while staying fast enough for CI.
+  const TRIALS = 25;
+  for (let i = 0; i < TRIALS; i++) {
+    await withTempDirAsync(async (dir) => {
+      const path = tempDbPath(dir);
+
+      const setup = openNodeSqlite({ path });
+      for (const migration of migrations) {
+        migration.up(setup);
+      }
+      setup.exec(`PRAGMA user_version = ${highest}`);
+      setup.close();
+
+      const a = runChild(path);
+      const b = runChild(path);
+      const [outA, outB] = await Promise.all([childOutput(a), childOutput(b)]);
+
+      assert.equal(outA, "OK", `first racer failed on trial ${i}: ${outA}`);
+      assert.equal(outB, "OK", `second racer failed on trial ${i}: ${outB}`);
+    });
+  }
 });
 
 test("tx() recovers after a BEGIN IMMEDIATE failure: a later tx() still rolls back on throw", () => {

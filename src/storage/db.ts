@@ -72,6 +72,18 @@ export function openDb(options: OpenDbOptions = {}): CairnDb {
   const driver = driverFactory({ path, allowExtension: true, readOnly });
 
   try {
+    // busy_timeout must be set FIRST, before any statement that can
+    // contend for a lock -- and `PRAGMA journal_mode=WAL` below is exactly
+    // such a statement: switching journal modes takes a brief EXCLUSIVE
+    // lock. Until busy_timeout is armed, this connection has a zero
+    // timeout, so two daemons racing to open the same fresh database (§4:
+    // Claude Desktop and Claude Code launching together) can both hit
+    // SQLITE_BUSY on the journal-mode switch and fail to start -- instead
+    // of one of them waiting the other out, which is the whole point of
+    // this setting. Order here is load-bearing; do not move this below
+    // journal_mode again.
+    driver.exec("PRAGMA busy_timeout=5000");
+
     // `PRAGMA journal_mode=WAL` does not throw when it cannot switch: it
     // silently returns the mode it actually settled on (e.g. `memory` for
     // an in-memory database, or `delete` on a filesystem with no
@@ -93,7 +105,6 @@ export function openDb(options: OpenDbOptions = {}): CairnDb {
       const value = row?.["journal_mode"];
       journalMode = typeof value === "string" ? value : null;
     }
-    driver.exec("PRAGMA busy_timeout=5000");
     driver.exec("PRAGMA foreign_keys=ON");
     // Without this, `INSERT OR REPLACE INTO memories` does not fire the
     // memories_ad delete trigger (SQLite only fires triggers for a
@@ -131,6 +142,11 @@ export function openDb(options: OpenDbOptions = {}): CairnDb {
         );
       }
     } else {
+      // runMigrations issues its own BEGIN IMMEDIATE per migration, which is
+      // exactly the kind of contending statement busy_timeout exists to
+      // protect. Since it is set above before this call, a racing daemon's
+      // migration run waits out a concurrent one instead of dying with
+      // "database is locked".
       runMigrations(driver);
     }
 

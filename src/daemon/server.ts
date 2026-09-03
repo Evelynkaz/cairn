@@ -172,6 +172,36 @@ function tokenMatches(provided: string, expected: string): boolean {
 // answer 413 instead of 400 -- see MAX_REQUEST_BODY_BYTES above.
 class PayloadTooLargeError extends Error {}
 
+function isDatabaseLockedError(error: unknown): boolean {
+  return error instanceof Error && /database is locked/i.test(error.message);
+}
+
+// Measured residual (§4, two-clients-launch-together race): even with
+// busy_timeout armed before journal_mode=WAL and runMigrations' own re-read
+// fix, a small fraction of two-process trials (2-4/40 measured here) still
+// hit "database is locked" -- `PRAGMA journal_mode=WAL` itself takes an
+// EXCLUSIVE lock that two brand-new connections can collide on before
+// busy_timeout gets a chance to wait it out. That lock is only ever held
+// for the instant it takes the other connection to finish the switch, so a
+// short bounded retry here (openDb/openStore own no retry policy of their
+// own, and are off-limits to change) turns that instant into an invisible
+// wait instead of a daemon refusing to start.
+async function withLockRetry<T>(fn: () => T): Promise<T> {
+  const attempts = 4;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return fn();
+    } catch (error) {
+      if (!isDatabaseLockedError(error) || i === attempts - 1) {
+        throw error;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 25 * (i + 1)));
+    }
+  }
+  // Unreachable: the loop above always either returns or throws.
+  throw new Error("withLockRetry: exhausted attempts without a result");
+}
+
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -229,89 +259,40 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   const ownsStore = options.store === undefined;
   const ownsProvider = options.provider === undefined;
 
-  // BUILD_BRIEF §2/§3: resolve the embedding config and build a provider
-  // BEFORE opening the store, so the store itself (not just McpDeps below)
-  // is constructed with the resolved provider/space -- that is what makes
-  // store.forgetWhere()'s own default query-shaped search vector-aware, not
-  // only recall()/context() (which also take a per-call override). "off"
-  // and a caller-supplied store both skip this entirely: a supplied store
-  // already made its own retrieval choice via StoreOptions, and
-  // re-resolving here would be a second, independently-drifting copy of it.
-  let provider: EmbeddingProvider | null = null;
-  let space: VectorSpaceRef | null = null;
-  const embeddingsMode = options.embeddings ?? "auto";
-
-  if (embeddingsMode === "auto" && ownsStore) {
-    const bootstrapDb = openDb({ path: options.dbPath });
-    try {
-      if (options.provider !== undefined) {
-        provider = options.provider;
-      } else {
-        const config = resolveEmbeddingConfig(bootstrapDb);
-        try {
-          provider = await createProviderFromConfig(config);
-        } catch (error) {
-          // A broken local runtime or an unreachable API must never keep
-          // the daemon from starting -- an optional accelerator being down
-          // is worse handled by refusing memory entirely than by degrading.
-          const reason = error instanceof Error ? error.message : String(error);
-          process.stderr.write(
-            `cairn daemon: embedding provider "${config.provider}" failed to start (${reason}); continuing FTS-only\n`,
-          );
-          provider = null;
-        }
-        if (provider === null) {
-          // §2: FTS-only is a supported mode, not an error -- say so once,
-          // to stderr only (stdout is reserved for the MCP stdio protocol).
-          process.stderr.write(`${describeConfig(config)}\n`);
-        }
-      }
-      if (provider !== null) {
-        space = ensureVectorSpace(bootstrapDb, provider.modelId, provider.dim);
-      }
-    } catch (error) {
-      // Covers ensureVectorSpace (or a hand-supplied provider) failing for
-      // a reason the narrower catch above doesn't -- same "never refuse to
-      // start" rule applies.
-      const reason = error instanceof Error ? error.message : String(error);
-      process.stderr.write(`cairn daemon: semantic search unavailable (${reason}); continuing FTS-only\n`);
-      provider = null;
-      space = null;
-    } finally {
-      bootstrapDb.close();
-    }
-  }
-
-  const store = options.store ?? openStore({ path: options.dbPath, provider, space });
   const token = options.token ?? generateToken();
-  // ONE bus for the whole daemon, shared by every session's McpDeps below --
-  // this is what lets a mutation on one client's session reach another
-  // client's own subscription (see mcp/events.ts, mcp/server.ts).
-  const bus = new MemoryEventBus();
-  const deps: McpDeps = { store, provider, space, bus };
   const startedAt = Date.now();
   const sessions = new Map<string, SessionEntry>();
   const sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? DEFAULT_SESSION_IDLE_TIMEOUT_MS;
   const sessionSweepIntervalMs = options.sessionSweepIntervalMs ?? DEFAULT_SESSION_SWEEP_INTERVAL_MS;
   const maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
 
-  // Drains the backlog in the background at whatever pace provider.embed()
-  // sustains (BUILD_BRIEF §2: remember() itself never waits on a model).
-  // Left null in FTS-only mode, or if the indexer itself fails to start
-  // (e.g. capabilities.vectors is false) -- same graceful-degrade rule.
-  let indexer: Indexer | null = null;
-  if (provider !== null) {
-    try {
-      indexer = createIndexer(store.db, provider);
-      indexer.start();
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      process.stderr.write(`cairn daemon: embedding indexer failed to start (${reason}); continuing FTS-only\n`);
-      indexer = null;
-    }
+  // §4: two clients (Claude Desktop, Claude Code) can launch together and
+  // both reach startDaemon() at once. On a fixed port, the port itself is
+  // the real arbiter of who wins that race -- exactly one process can
+  // listen() it -- so it must be claimed BEFORE this function ever opens
+  // the database file; opening the DB first (the previous order) let both
+  // processes start fighting over the file before either had lost. `ready`
+  // is filled in only once the store has actually been opened and
+  // migrated; a request that lands in the window between listen() and that
+  // (real, not hypothetical -- however long openStore() takes) gets an
+  // honest 503 below rather than a 404 (reads as "wrong URL") or a hang.
+  interface ReadyState {
+    store: Store;
+    deps: McpDeps;
+  }
+  let ready: ReadyState | null = null;
+
+  function sendNotReady(res: ServerResponse): void {
+    sendJson(res, 503, { error: "daemon is still starting" });
   }
 
   function handleHealth(res: ServerResponse): void {
+    if (!ready) {
+      // A health check that lies about readiness is worse than one that
+      // says "not yet" -- never report ok:true before the store is real.
+      sendNotReady(res);
+      return;
+    }
     // No auth on this route by design: it must be usable to detect a live
     // daemon before the caller has read the bearer token off disk. It must
     // therefore leak nothing beyond these fields -- no memory content, no
@@ -321,9 +302,9 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
       pid: process.pid,
       version: DAEMON_VERSION,
       uptimeMs: Date.now() - startedAt,
-      memories: store.countMemories(),
-      vectors: store.capabilities.vectors,
-      journalMode: store.capabilities.journalMode,
+      memories: ready.store.countMemories(),
+      vectors: ready.store.capabilities.vectors,
+      journalMode: ready.store.capabilities.journalMode,
     });
   }
 
@@ -339,6 +320,12 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   }
 
   async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!ready) {
+      sendNotReady(res);
+      return;
+    }
+    const deps = ready.deps;
+
     const sessionHeader = req.headers["mcp-session-id"];
     const sessionId = Array.isArray(sessionHeader) ? sessionHeader[0] : sessionHeader;
     const existing = sessionId ? sessions.get(sessionId) : undefined;
@@ -498,6 +485,11 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     })();
   });
 
+  // Claim the port FIRST: on the fixed port production uses, this is what
+  // decides who wins the two-clients-launch-together race (§4). A process
+  // that loses fails here, with EADDRINUSE, having never opened the
+  // database -- exactly the outcome ensure-daemon.ts's own race comment
+  // assumes. The database is not touched until this resolves.
   await new Promise<void>((resolve, reject) => {
     httpServer.once("error", reject);
     httpServer.listen(port, host, () => resolve());
@@ -506,6 +498,99 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   const address = httpServer.address();
   const actualPort = typeof address === "object" && address !== null ? address.port : port;
   const url = `http://${host}:${actualPort}`;
+
+  // BUILD_BRIEF §2/§3: resolve the embedding config and build a provider
+  // BEFORE opening the store, so the store itself (not just McpDeps below)
+  // is constructed with the resolved provider/space -- that is what makes
+  // store.forgetWhere()'s own default query-shaped search vector-aware, not
+  // only recall()/context() (which also take a per-call override). "off"
+  // and a caller-supplied store both skip this entirely: a supplied store
+  // already made its own retrieval choice via StoreOptions, and
+  // re-resolving here would be a second, independently-drifting copy of it.
+  let provider: EmbeddingProvider | null = null;
+  let space: VectorSpaceRef | null = null;
+  let store: Store;
+
+  try {
+    const embeddingsMode = options.embeddings ?? "auto";
+
+    if (embeddingsMode === "auto" && ownsStore) {
+      const bootstrapDb = await withLockRetry(() => openDb({ path: options.dbPath }));
+      try {
+        if (options.provider !== undefined) {
+          provider = options.provider;
+        } else {
+          const config = resolveEmbeddingConfig(bootstrapDb);
+          try {
+            provider = await createProviderFromConfig(config);
+          } catch (error) {
+            // A broken local runtime or an unreachable API must never keep
+            // the daemon from starting -- an optional accelerator being down
+            // is worse handled by refusing memory entirely than by degrading.
+            const reason = error instanceof Error ? error.message : String(error);
+            process.stderr.write(
+              `cairn daemon: embedding provider "${config.provider}" failed to start (${reason}); continuing FTS-only\n`,
+            );
+            provider = null;
+          }
+          if (provider === null) {
+            // §2: FTS-only is a supported mode, not an error -- say so once,
+            // to stderr only (stdout is reserved for the MCP stdio protocol).
+            process.stderr.write(`${describeConfig(config)}\n`);
+          }
+        }
+        if (provider !== null) {
+          space = ensureVectorSpace(bootstrapDb, provider.modelId, provider.dim);
+        }
+      } catch (error) {
+        // Covers ensureVectorSpace (or a hand-supplied provider) failing for
+        // a reason the narrower catch above doesn't -- same "never refuse to
+        // start" rule applies.
+        const reason = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`cairn daemon: semantic search unavailable (${reason}); continuing FTS-only\n`);
+        provider = null;
+        space = null;
+      } finally {
+        bootstrapDb.close();
+      }
+    }
+
+    store = options.store ?? (await withLockRetry(() => openStore({ path: options.dbPath, provider, space })));
+  } catch (error) {
+    // The port is already held; if the database then fails to open, that
+    // must not leave a daemon-shaped process squatting on it forever with
+    // nothing behind it -- close the HTTP server before rejecting so a
+    // retrying client (or the losing racer) can bind the port instead.
+    clearInterval(sessionEvictionTimer);
+    httpServer.closeAllConnections();
+    await new Promise<void>((resolve) => {
+      httpServer.close(() => resolve());
+    });
+    throw error;
+  }
+
+  // ONE bus for the whole daemon, shared by every session's McpDeps below --
+  // this is what lets a mutation on one client's session reach another
+  // client's own subscription (see mcp/events.ts, mcp/server.ts).
+  const bus = new MemoryEventBus();
+  const deps: McpDeps = { store, provider, space, bus };
+  ready = { store, deps };
+
+  // Drains the backlog in the background at whatever pace provider.embed()
+  // sustains (BUILD_BRIEF §2: remember() itself never waits on a model).
+  // Left null in FTS-only mode, or if the indexer itself fails to start
+  // (e.g. capabilities.vectors is false) -- same graceful-degrade rule.
+  let indexer: Indexer | null = null;
+  if (provider !== null) {
+    try {
+      indexer = createIndexer(store.db, provider);
+      indexer.start();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`cairn daemon: embedding indexer failed to start (${reason}); continuing FTS-only\n`);
+      indexer = null;
+    }
+  }
 
   async function shutdownHttpAndStore(): Promise<void> {
     clearInterval(sessionEvictionTimer);

@@ -5,7 +5,7 @@
 
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { rmSync, existsSync } from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { makeTempDir, tempDbPath } from "../testing/tmp.js";
@@ -409,6 +409,46 @@ test("a second daemon refuses to start when the runtime file already names a liv
     } finally {
       await first.close();
     }
+  });
+});
+
+test("two startDaemon calls racing on the SAME fixed port: the loser rejects EADDRINUSE-shaped and never touches its database file", async () => {
+  await withTempCairnHome(async (home) => {
+    // Distinct dbPaths (each nonexistent until touched), both under the
+    // one CAIRN_HOME, so, whichever of the two loses the port, its own
+    // database file staying absent proves that loser's startDaemon() call
+    // never reached openDb() -- the whole point of claiming the port
+    // before touching the database.
+    const pathA = tempDbPath(makeTempDir());
+    const pathB = tempDbPath(makeTempDir());
+    const port = 34567 + Math.floor(Math.random() * 5000);
+
+    const [resultA, resultB] = await Promise.allSettled([
+      startDaemon({ port, dbPath: pathA, embeddings: "off" }),
+      startDaemon({ port, dbPath: pathB, embeddings: "off" }),
+    ]);
+
+    const results = [
+      { result: resultA, path: pathA },
+      { result: resultB, path: pathB },
+    ];
+    const winners = results.filter((r) => r.result.status === "fulfilled");
+    const losers = results.filter((r) => r.result.status === "rejected");
+
+    assert.equal(winners.length, 1, "exactly one racer should win the port");
+    assert.equal(losers.length, 1, "exactly one racer should lose the port");
+
+    const loser = losers[0]!.result as PromiseRejectedResult;
+    const errorMessage = loser.reason instanceof Error ? loser.reason.message : String(loser.reason);
+    assert.match(errorMessage, /EADDRINUSE|address (is )?already in use/i);
+
+    // The loser must never have created (let alone migrated) its own
+    // database file: it failed on the port before ever calling openDb().
+    assert.equal(existsSync(losers[0]!.path), false);
+    assert.equal(existsSync(winners[0]!.path), true);
+
+    const winnerHandle = (winners[0]!.result as PromiseFulfilledResult<DaemonHandle>).value;
+    await winnerHandle.close();
   });
 });
 

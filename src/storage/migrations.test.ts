@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withTempDir, tempDbPath } from "../testing/tmp.js";
+import { spawn } from "node:child_process";
+import { withTempDir, withTempDirAsync, tempDbPath } from "../testing/tmp.js";
 import { openNodeSqlite } from "./driver/node-sqlite.js";
 import { migrations, runMigrations } from "./migrations/index.js";
 import type { Migration } from "./migrations/index.js";
@@ -91,6 +92,70 @@ test("a failing migration leaves user_version and schema untouched, and names it
       driver.close();
     }
   });
+});
+
+test("regression: two real processes racing runMigrations against one fresh database both succeed exactly once (a racer must not replay a migration it waited out)", async () => {
+  const highest = migrations.reduce((max, m) => Math.max(max, m.version), 0);
+
+  function runChild(path: string): ReturnType<typeof spawn> {
+    return spawn(process.execPath, [
+      "--input-type=module",
+      "-e",
+      `
+      import { openNodeSqlite } from "${new URL("./driver/node-sqlite.js", import.meta.url).href}";
+      import { runMigrations } from "${new URL("./migrations/index.js", import.meta.url).href}";
+      const driver = openNodeSqlite({ path: ${JSON.stringify(path)} });
+      try {
+        // busy_timeout is what lets the loser wait out the winner's
+        // BEGIN IMMEDIATE instead of failing outright with SQLITE_BUSY --
+        // exactly the condition under which a stale pre-wait user_version
+        // snapshot would cause it to replay already-applied DDL.
+        driver.exec("PRAGMA busy_timeout=5000");
+        const result = runMigrations(driver);
+        process.stdout.write("OK:" + JSON.stringify(result) + "\\n");
+      } catch (e) {
+        process.stdout.write("ERR:" + e.message + "\\n");
+      } finally {
+        driver.close();
+      }
+      `,
+    ]);
+  }
+
+  async function childOutput(child: ReturnType<typeof spawn>): Promise<string> {
+    let out = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    await new Promise<void>((resolve) => child.on("exit", () => resolve()));
+    return out.trim();
+  }
+
+  const TRIALS = 40;
+  for (let i = 0; i < TRIALS; i++) {
+    await withTempDirAsync(async (dir) => {
+      const path = tempDbPath(dir);
+
+      const a = runChild(path);
+      const b = runChild(path);
+      const [outA, outB] = await Promise.all([childOutput(a), childOutput(b)]);
+
+      assert.ok(outA.startsWith("OK:"), `first racer failed on trial ${i}: ${outA}`);
+      assert.ok(outB.startsWith("OK:"), `second racer failed on trial ${i}: ${outB}`);
+
+      const check = openNodeSqlite({ path });
+      try {
+        const row = check.prepare("PRAGMA user_version").get();
+        assert.equal(Number(row?.["user_version"]), highest, `trial ${i}: unexpected final user_version`);
+        const episodesTables = check
+          .prepare("select count(*) as n from sqlite_master where type = 'table' and name = 'episodes'")
+          .get();
+        assert.equal(episodesTables?.["n"], 1, `trial ${i}: episodes table should exist exactly once`);
+      } finally {
+        check.close();
+      }
+    });
+  }
 });
 
 test("the real migration list is exported sorted ascending by version", () => {
