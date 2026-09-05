@@ -9,7 +9,8 @@ import { rmSync } from "node:fs";
 import { openStore } from "../storage/index.js";
 import type { Store } from "../storage/index.js";
 import { readZip, writeZip } from "./zip.js";
-import { exportArchive, importArchive, ArchiveFormatError } from "./archive.js";
+import { deflateRawSync } from "node:zlib";
+import { exportArchive, importArchive, ArchiveFormatError, MAX_LINES, MAX_ENTRY_BYTES } from "./archive.js";
 
 function withStore<T>(fn: (store: Store) => T): T {
   return withTempDir((dir) => {
@@ -209,6 +210,85 @@ test("tags, scope, importance and sourceClient survive a round trip", () => {
   });
 });
 
+// Swaps one entry's data for `newData` and recomputes the manifest's own
+// checksum for it, so the result is a checksum-VALID archive around
+// deliberately hostile content -- used below to get hostile bytes past the
+// SHA256 gate and into splitLines, which is the code actually under test.
+function replaceEntryWithValidChecksum(archive: Buffer, name: string, newData: Buffer): Buffer {
+  const entries = readZip(archive);
+  const manifestEntry = entries.find((e) => e.name === "manifest.json")!;
+  const manifest = JSON.parse(manifestEntry.data.toString("utf8")) as {
+    entries: Record<string, { sha256: string; bytes: number }>;
+  };
+  manifest.entries[name] = {
+    sha256: createHash("sha256").update(newData).digest("hex"),
+    bytes: newData.length,
+  };
+  const newManifestData = Buffer.from(JSON.stringify(manifest, null, 2), "utf8");
+  return writeZip(
+    entries.map((e) => {
+      if (e.name === name) return { name: e.name, data: newData };
+      if (e.name === "manifest.json") return { name: e.name, data: newManifestData };
+      return e;
+    }),
+  );
+}
+
+test("an entry with more newlines than MAX_LINES is refused, fast and without materialising them all", () => {
+  withStore((source) => {
+    source.remember({ content: "small, legitimate archive" });
+    const { archive } = exportArchive(source);
+
+    // Built with node:zlib (via writeZip's own deflateRawSync): a JSONL
+    // "bomb" of nothing but newlines is small on disk (highly compressible)
+    // but, before the fix, decoded and split into a MAX_LINES+1-entry array
+    // before the line-count cap was ever consulted.
+    const bomb = Buffer.alloc(MAX_LINES + 2, 0x0a);
+    const tampered = replaceEntryWithValidChecksum(archive, "memories.jsonl", bomb);
+
+    withStore((dest) => {
+      const before = countAllMemories(dest);
+      const rssBefore = process.memoryUsage().rss;
+      const t0 = Date.now();
+      assert.throws(
+        () => importArchive(dest, tampered),
+        /memories\.jsonl has more than \d+ lines, exceeding the cap of \d+/,
+      );
+      const elapsedMs = Date.now() - t0;
+      const rssDeltaMb = (process.memoryUsage().rss - rssBefore) / (1024 * 1024);
+      console.log(`line-count cap refusal: ${elapsedMs}ms, RSS delta ${rssDeltaMb.toFixed(1)}MB`);
+      assert.equal(countAllMemories(dest), before);
+    });
+  });
+});
+
+test("an entry whose byte length exceeds MAX_ENTRY_BYTES is refused without decoding", () => {
+  withStore((source) => {
+    source.remember({ content: "small, legitimate archive" });
+    const { archive } = exportArchive(source);
+
+    // A single newline-free "line" too big to ever be caught by the
+    // line-count walk on its own. Just over the cap, not gigabytes over it
+    // -- cheap to allocate, and the cap itself is what's under test, not
+    // how far past it an attacker might go.
+    const bomb = Buffer.alloc(MAX_ENTRY_BYTES + 1, 0x61); // 'a', no newlines
+    assert.ok(deflateRawSync(bomb).length < bomb.length, "fixture should compress well for this test to be honest");
+    const tampered = replaceEntryWithValidChecksum(archive, "memories.jsonl", bomb);
+
+    withStore((dest) => {
+      const before = countAllMemories(dest);
+      const t0 = Date.now();
+      assert.throws(
+        () => importArchive(dest, tampered),
+        /memories\.jsonl is \d+ bytes, exceeding the cap of \d+ bytes/,
+      );
+      const elapsedMs = Date.now() - t0;
+      console.log(`byte-length cap refusal: ${elapsedMs}ms`);
+      assert.equal(countAllMemories(dest), before);
+    });
+  });
+});
+
 test("a tampered archive is refused and leaves the target store completely unchanged", () => {
   withStore((source) => {
     source.remember({ content: "untouched by tampering" });
@@ -320,6 +400,32 @@ test("an archive with an unknown format version is refused", () => {
 
     withStore((dest) => {
       assert.throws(() => importArchive(dest, bumped), ArchiveFormatError);
+    });
+  });
+});
+
+test("a memory line omitting updatedAt/validFrom imports with them defaulted to createdAt, not 1970", () => {
+  withStore((source) => {
+    source.remember({ content: "no explicit updatedAt or validFrom" });
+    const { archive } = exportArchive(source);
+
+    const entries = readZip(archive);
+    const memoriesEntry = entries.find((e) => e.name === "memories.jsonl")!;
+    const line = JSON.parse(memoriesEntry.data.toString("utf8").trimEnd()) as Record<string, unknown>;
+    delete line["updatedAt"];
+    delete line["validFrom"];
+    const newMemoriesData = Buffer.from(`${JSON.stringify(line)}\n`, "utf8");
+    const tampered = replaceEntryWithValidChecksum(archive, "memories.jsonl", newMemoriesData);
+
+    withStore((dest) => {
+      const result = importArchive(dest, tampered);
+      assert.equal(result.imported, 1);
+      const imported = dest.get(line["id"] as string);
+      assert.ok(imported);
+      // Not 0 (1 Jan 1970, the falsified-history bug): the omitted fields
+      // fall back to the memory's own createdAt.
+      assert.equal(imported?.updatedAt, imported?.createdAt);
+      assert.equal(imported?.validFrom, imported?.createdAt);
     });
   });
 });

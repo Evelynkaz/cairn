@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -968,9 +968,9 @@ test("export_memories refuses to write onto the database, its WAL/SHM siblings, 
   const originalHome = process.env.CAIRN_HOME;
   process.env.CAIRN_HOME = home;
   try {
-    await withServer(async ({ client, store }) => {
+    await withServer(async ({ client }) => {
       for (let i = 0; i < 5; i++) {
-        await callJson(store === store ? client : client, "remember", { content: `Protected-file probe memory ${i}` });
+        await callJson(client, "remember", { content: `Protected-file probe memory ${i}` });
       }
       writeRuntimeFile({ pid: process.pid, port: 1, token: "x", startedAt: Date.now(), version: "test" }, home);
 
@@ -1085,10 +1085,9 @@ test("export_memories then import_memories preserves a superseded memory and its
     // supersede path does: set validUntil + supersededBy on the old row,
     // add the new one.
     const berlin = await callJson<RememberResult>(sourceClient, "remember", { content: "I live in Berlin" });
-    sourceStore.db.exec(
-      `UPDATE memories SET valid_until = ?, superseded_by = ? WHERE id = ?`,
-      [Date.now(), berlin.id, munich.id],
-    );
+    sourceStore.db
+      .q(`UPDATE memories SET valid_until = ?, superseded_by = ? WHERE id = ?`)
+      .run(Date.now(), berlin.id, munich.id);
 
     const archivePath = join(sourceDir, "supersede-export.zip");
     const exported = await callJson<ExportResult>(sourceClient, "export_memories", { path: archivePath });

@@ -71,7 +71,35 @@ const EXPORT_PAGE_SIZE = 500;
 // work a hostile/corrupt archive can demand. Matches zip.ts's own
 // MAX_ENTRIES, since a memory-per-line archive built by this module never
 // has more lines than a legitimate archive has zip entries worth of data.
-const MAX_LINES = 100_000;
+export const MAX_LINES = 100_000;
+
+// Caps the DECOMPRESSED size of a single memories.jsonl/episodes.jsonl
+// entry, checked against the RAW ENTRY BYTES before any UTF-8 decoding or
+// line-splitting is attempted -- decoding first and only discovering the
+// line count is over MAX_LINES afterwards is exactly the bug this cap
+// exists to close (a JSONL entry of nothing but newlines deflates around
+// 1000:1, so a small archive can decode into gigabytes before the old
+// MAX_LINES check ever ran).
+//
+// This is a plain, absolute number, deliberately NOT derived from
+// MAX_LINES: the two caps guard different things. MAX_ENTRY_BYTES caps how
+// much decoded data we will ever hold in memory at once; MAX_LINES caps
+// how many records we will bother parsing out of it. Deriving one from the
+// other (MAX_LINES * some per-line byte budget) made the byte cap a
+// ~6.5 GB product that no real archive or attack ever reaches, which made
+// it protect nothing -- every entry that mattered was let through to rely
+// entirely on the line scan below.
+//
+// 64 MiB is large enough that a genuinely big export is never refused: a
+// memories.jsonl line (id, text, scope, tags, importance, timestamps) or
+// episodes.jsonl line (id, content, scope, metadata) runs a few hundred
+// bytes each once JSON-encoded, so 64 MiB holds on the order of 100,000+
+// records -- an order of magnitude above MAX_LINES itself, so this cap
+// never fires before the line-count cap does on legitimate input. It is
+// small enough that refusing at that point costs nothing: allocating and
+// scanning a 64 MiB buffer is sub-millisecond work, so the refusal is
+// still immediate on a hostile archive.
+export const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
 
 interface MemoryRecord {
   id: string;
@@ -81,8 +109,8 @@ interface MemoryRecord {
   importance: number;
   sourceClient: string | null;
   createdAt: number;
-  updatedAt: number;
-  validFrom: number;
+  updatedAt: number | undefined;
+  validFrom: number | undefined;
   validUntil: number | null;
   supersededBy: string | null;
   deletedAt: number | null;
@@ -245,12 +273,34 @@ interface RawMemoryLine {
 // Splits JSONL content into lines without a trailing empty entry for the
 // final "\n" every file written by exportArchive ends with. An archive
 // hand-edited to drop that final newline still parses fine either way.
-function splitLines(data: Buffer): string[] {
-  const text = data.toString("utf8");
-  if (text.length === 0) return [];
-  const lines = text.split("\n");
-  if (lines[lines.length - 1] === "") {
-    lines.pop();
+//
+// Both caps are enforced BEFORE/DURING this walk, never after: the byte
+// cap is checked against `data` up front, before a single byte is
+// UTF-8-decoded, and the line cap is checked as each newline is found via
+// `indexOf` -- so a hostile entry is refused mid-scan, without ever
+// building the full lines array or decoding the tail of the buffer past
+// the point the cap is exceeded.
+function splitLines(data: Buffer, fileName: string): string[] {
+  if (data.length > MAX_ENTRY_BYTES) {
+    throw new ArchiveFormatError(
+      `${fileName} is ${data.length} bytes, exceeding the cap of ${MAX_ENTRY_BYTES} bytes`,
+    );
+  }
+  if (data.length === 0) return [];
+
+  const lines: string[] = [];
+  let start = 0;
+  while (start < data.length) {
+    if (lines.length >= MAX_LINES) {
+      throw new ArchiveFormatError(`${fileName} has more than ${MAX_LINES} lines, exceeding the cap of ${MAX_LINES}`);
+    }
+    const nl = data.indexOf(0x0a, start);
+    if (nl === -1) {
+      lines.push(data.toString("utf8", start, data.length));
+      break;
+    }
+    lines.push(data.toString("utf8", start, nl));
+    start = nl + 1;
   }
   return lines;
 }
@@ -262,10 +312,7 @@ function splitLines(data: Buffer): string[] {
 // never echoes the line's content, which is memory text and may contain
 // secrets.
 function parseMemoryLines(data: Buffer, fileName: string): MemoryRecord[] {
-  const lines = splitLines(data);
-  if (lines.length > MAX_LINES) {
-    throw new ArchiveFormatError(`${fileName} has ${lines.length} lines, exceeding the cap of ${MAX_LINES}`);
-  }
+  const lines = splitLines(data, fileName);
 
   const records: MemoryRecord[] = [];
   for (let i = 0; i < lines.length; i++) {
@@ -291,8 +338,8 @@ function parseMemoryLines(data: Buffer, fileName: string): MemoryRecord[] {
       importance: typeof r.importance === "number" ? r.importance : 0.5,
       sourceClient: typeof r.sourceClient === "string" ? r.sourceClient : null,
       createdAt: typeof r.createdAt === "number" ? r.createdAt : 0,
-      updatedAt: typeof r.updatedAt === "number" ? r.updatedAt : 0,
-      validFrom: typeof r.validFrom === "number" ? r.validFrom : 0,
+      updatedAt: typeof r.updatedAt === "number" ? r.updatedAt : undefined,
+      validFrom: typeof r.validFrom === "number" ? r.validFrom : undefined,
       validUntil: typeof r.validUntil === "number" ? r.validUntil : null,
       supersededBy: typeof r.supersededBy === "string" ? r.supersededBy : null,
       deletedAt: typeof r.deletedAt === "number" ? r.deletedAt : null,
@@ -309,10 +356,7 @@ function parseMemoryLines(data: Buffer, fileName: string): MemoryRecord[] {
 // names the file and line number but never echoes the line's content, which
 // is episode content and may contain secrets.
 function parseEpisodeLines(data: Buffer, fileName: string): EpisodeRecord[] {
-  const lines = splitLines(data);
-  if (lines.length > MAX_LINES) {
-    throw new ArchiveFormatError(`${fileName} has ${lines.length} lines, exceeding the cap of ${MAX_LINES}`);
-  }
+  const lines = splitLines(data, fileName);
 
   const records: EpisodeRecord[] = [];
   for (let i = 0; i < lines.length; i++) {
