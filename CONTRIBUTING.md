@@ -20,12 +20,21 @@ npm run verify-package
 copies the dashboard's static assets (HTML/CSS) into `dist/`.
 `npm run typecheck` chains the same three projects with `--noEmit`.
 `npm test` cleans `dist/`, rebuilds, and runs the whole suite with
-`node --test`; it is currently green (799 tests, 795 pass, 0 fail, 4
+`node --test`; it is currently green (936 tests, 931 pass, 0 fail, 5
 skipped) and is not re-run casually — see `package.json` for the exact
 script.
 `npm run verify-package` checks that `npm pack` would actually ship a
 working CLI and dashboard (bin entry present, dashboard assets present, no
 test artifacts or leaked `src/` tree).
+
+All of the above, plus `npm pack` installed into a scratch directory and
+run by path, and `npm publish --dry-run`, have been verified locally on
+Linux only. GitHub Actions has not actually run since 19:05 today — every
+job since fails in about two seconds with a billing error ("recent
+account payments have failed or your spending limit needs to be
+increased"), reproduced on three separate runs. That means nothing has
+been verified on macOS or Windows for the last several commits; do not
+treat CI's badge or history as current until this is fixed.
 
 ## Guidelines
 
@@ -95,7 +104,10 @@ not a passing test, and should not be read as one.
 ## Pull requests
 
 Keep changes focused and runnable at every step. Add or update tests for
-anything you touch. CI must be green on all three platforms.
+anything you touch. CI must be green on all three platforms — note that as
+of this writing GitHub Actions is not running at all (see above), so until
+that's fixed, verify locally on every platform you can reach before
+merging.
 
 ## `npm test` must exit on its own -- no `--test-force-exit`
 

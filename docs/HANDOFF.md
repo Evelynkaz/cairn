@@ -13,34 +13,103 @@ Status against BUILD_BRIEF §16's eleven milestones, read from `git log --onelin
 |---|---|---|
 | 1 | Storage core | done — `feat(storage)` x2 |
 | 2 | Embeddings | done — `feat(embeddings)` |
-| 3 | Retrieval | done — `feat(retrieval)` |
+| 3 | Retrieval | done — `feat(retrieval)`, hardened by `3877a54` (see §1a) |
 | 4 | MCP server + stdio shim + daemon auto-start | done — `feat(mcp)` |
 | 5 | CLI (`cairn`, `cairn setup`, `cairn ui`) | done — `feat(cli)` |
 | 6 | Cross-client integration test | done — `feat(integration)` |
-| 7 | Dashboard | done — `691c69a`, `329b842`, `9a49164`, `9ea55ee`, `063d621` |
-| 8 | Privacy (redaction, delete-everything) | done — `feat(privacy)` |
+| 7 | Dashboard | done — six sections rendered and screenshotted (`691c69a`, `329b842`, `9a49164`, `9ea55ee`, `063d621`, `1b7ae7d`); no automated browser test |
+| 8 | Privacy (redaction, delete-everything) | done — `feat(privacy)`, hardened by `f4dd3c9` and `6d08e56` (see §1a) |
 | 9 | Recall hook (Claude Code SessionStart) | done — `f58cb2a` |
-| 10 | Portability (export/import, Claude/ChatGPT importers) | done — a dependency-free ZIP codec (`196840d`), a manifest'd archive format with id-preserving import of both memories and episodes (`eadc98c`, `30f674b`, `55e016e`), `export_memories`/`import_memories` (`c1eca59`), the vendor importers wired to dashboard routes (`93fa972`) |
-| 11 | Polish (README hero GIF, demo GIF, MIT LICENSE, CI 3 OSes) | partial — docs are current, CI is green on all three OSes (verified through `gh` on the two most recent runs), `LICENSE` (MIT) present; the hero and demo GIFs still need a human at a screen and are the only thing left |
+| 10 | Portability (export/import, Claude/ChatGPT importers) | done — a dependency-free ZIP codec (`196840d`), a manifest'd archive format with id-preserving import of both memories and episodes (`eadc98c`, `30f674b`, `55e016e`), `export_memories`/`import_memories` (`c1eca59`), the vendor importers wired to dashboard routes (`93fa972`, `1b7ae7d`); never run against a real vendor export (§8) |
+| 11 | Polish (README hero GIF, demo GIF, MIT LICENSE, CI 3 OSes) | blocked — package renamed and published-ready (`114cd47`), screenshots exist, but **CI is not running at all right now** (§1b) and the GIFs still need a human at a screen |
 
-Ten milestones fully done, one (polish) waiting only on the GIFs. By
-line/effort weight the honest estimate — this is a judgement, not a
-measurement — is **roughly 97-98% of v1**: every subsystem in the brief
-exists, is wired end to end (export/import, the vendor importers, the
-dashboard routes that call them), and CI has been read as green on all
-three OSes rather than assumed. What is left is one human task (the GIFs)
-and the two standing gaps recorded in §8.
+The package is published-ready and every subsystem in the brief is wired
+end to end, but call this "done" only with the CI and audit caveats below
+attached — the last stretch of this project was six independent security
+reviews finding nineteen criticals in a suite that was fully green at the
+time, and the fixes for those in turn needed a rework pass of their own. Read
+§1a before touching `src/privacy`, `src/retrieval`, `src/daemon`, or
+`src/portability`.
 
-Current test count: **799 tests, 795 pass, 0 fail, 4 skipped**. CI
-(`.github/workflows/ci.yml`) has been read as green on Windows, macOS and
-Ubuntu on the two most recent runs, verified through `gh run list`/`gh run
-view` — not assumed. Getting there took four pushes that were red on the
-runners while green locally; see §5, the flakiness this document used to
-record in `src/shim/shim.test.ts`'s daemon-reconnect test was not the
-issue found — the actual red runs were an `unzip -O` flag one Info-ZIP
-build doesn't accept, a permission check invisible to root, and a real
-product defect (files extracting at mode 000). None of those show up in a
-run on this machine.
+Current test count: **936 tests, 931 pass, 0 fail, 5 skipped**, verified
+locally on Linux (`6d08e56`). This project has been burned twice on
+trusting a raw pass/skip count without reading what changed it (§5) — the
+skip count and the 5 remaining skips are unchanged from the last handoff
+and are the platform-only assertions recorded in CONTRIBUTING.md, not new
+gaps.
+
+### 1a. The security audits and the rework — read this before touching privacy, retrieval, the daemon, or portability
+
+Six independent audits ran against a tree that reported 799 green tests
+and found nineteen criticals none of those tests caught. They cluster
+into four repeatable patterns, which is the actual lesson — not the list
+of bugs:
+
+- **Redaction stood at one ingest point while the store had five.**
+  `redactText` ran only in `remember()`; `update_memory`, `supersede`,
+  import, and (found only in the rework pass) `episodes.metadata` all
+  wrote raw text straight past it (`f4dd3c9`, `6d08e56`).
+- **Ranking mixed incomparable scales and silently returned wrong
+  answers.** Relevance divided by its own call's max sat on a different
+  scale than recency; importance could never reach outside a
+  recency-bounded pool; the vector branch had no absolute distance floor
+  — none of this crashes or logs, it just returns the wrong memories,
+  which for a memory system is the worst failure mode there is (`3877a54`).
+- **Checks covered entry but not continuation.** A 4 MB body cap applied
+  only to the MCP handshake, not the session after it; a restrictive file
+  mode applied only at file creation, not to a file an attacker
+  pre-created; a containment check compared paths lexically instead of by
+  realpath, so a symlinked parent directory walked straight out of it
+  (`601e7d8`, `3e272af`).
+- **A check trusted the thing it was checking.** `cairn stop` used to
+  trust a process's own claimed liveness; import used to trust an
+  archive's own `redacted: true` flag — an attacker-controlled file
+  simply sets it (`f4dd3c9`).
+
+**The fixes for these then introduced six more defects, two of them worse
+than what they replaced** (`6d08e56`): a new `.env` detector destroyed 7
+of 10 realistic notes irreversibly (redaction rewrites the episode, so
+the user's own words were gone for good), and the ranking fix's min-max
+normalisation pinned the worst candidate to exactly 0 for every corpus
+size, so the relevance floor silently dropped real results — five
+matching memories came back as four.
+
+**How the dropped-result bug got past review is the important part.**
+Landing that ranking fix broke nine pre-existing tests. Each one was
+individually given `minRelevance: 0` with a plausible-sounding
+justification, and each justification was accepted on its own terms.
+Nine tests failing to one change is not nine cases to explain
+separately — it is one signal, repeated nine times, and it should have
+been read as one question ("did the fix change what counts as a match?")
+before any test was touched.
+
+### 1b. CI is not running — nothing since `114cd47` is verified on Windows or macOS
+
+Since 19:05 today every GitHub Actions run on this repo fails in about
+ten seconds with: *"The job was not started because recent account
+payments have failed or your spending limit needs to be increased."*
+Three consecutive pushes (`3877a54`, `5963277`, `6d08e56`) have failed
+this way — `gh run list` shows it plainly, and it is a billing problem on
+the owner's account, not a code or workflow regression. It is blocked on
+the owner (§8); do not try to work around it, and do not assume the
+retrieval fix, the rework, or the refactor are cross-platform clean just
+because they pass here.
+
+**What this means concretely: nothing landed since `114cd47` has been
+verified on Windows or macOS.** This project has hit real
+Windows/macOS-only bugs before that no Linux run could see (§5) — treat
+that risk as live, not historical, until CI billing is fixed and a run
+goes green on all three OSes again.
+
+**What WAS verified by hand on this Linux machine**, and is real evidence
+even though it is not the three-OS matrix: the full 936-test suite;
+`npm run typecheck` across all three `tsconfig` projects; `verify-package`
+against 162 packaged files; `npm pack` followed by installing the tarball
+outside this repo, running the installed CLI, starting the packed
+daemon, getting a 200 from `/health`, and stopping it; and
+`npm publish --dry-run` succeeding end to end. None of that substitutes
+for the Windows/macOS legs — it rules out a broken package, not a
+platform-specific bug.
 
 ## 2. How to run it — every command below was executed in this session
 
@@ -50,7 +119,7 @@ up to date, audited 100 packages in 1s
 found 0 vulnerabilities
 
 $ npm run build
-> cairn@0.0.0 build
+> cairn@0.1.0 build
 > tsc -p tsconfig.json && tsc -p tsconfig.ui.json && tsc -p tsconfig.uitest.json && node dist/scripts/copy-ui-assets.js
 
 copy-ui-assets: copied 2 file(s) to /root/cairn/dist/dashboard/ui
@@ -58,32 +127,40 @@ copy-ui-assets: copied 2 file(s) to /root/cairn/dist/dashboard/ui
 real 0m15.8s
 
 $ npm run typecheck
-> cairn@0.0.0 typecheck
+> cairn@0.1.0 typecheck
 > tsc -p tsconfig.json --noEmit && tsc -p tsconfig.ui.json --noEmit && tsc -p tsconfig.uitest.json --noEmit
-(no output; real 0m14.2s)
+(no output; three projects, all clean)
 
 $ npm test          # runs: clean -> build -> node --test dist/**/*.test.js
 ...
-1..799
-# tests 799
+1..936
+# tests 936
 # suites 0
-# pass 795
+# pass 931
 # fail 0
 # cancelled 0
-# skipped 4
+# skipped 5
 # todo 0
-# duration_ms 26431.4
-real 0m37.8s (last full run recorded here; re-running costs ~90s — don't, unless something changed)
 ```
 
-The build is now three `tsc` invocations plus one asset-copy step, not one:
-`tsconfig.json` (Node-only root project), `tsconfig.ui.json` (the SPA, DOM
-lib), `tsconfig.uitest.json` (the SPA's own unit tests), then
+The build is still three `tsc` invocations plus one asset-copy step, not
+one: `tsconfig.json` (Node-only root project), `tsconfig.ui.json` (the
+SPA, DOM lib), `tsconfig.uitest.json` (the SPA's own unit tests), then
 `copy-ui-assets.js` places the compiled UI's static files next to the
-compiled JS the server serves them from. `npm run typecheck` now runs all
-three `tsc -p ... --noEmit` invocations for the same reason recorded in
+compiled JS the server serves them from. `npm run typecheck` runs all
+three `tsc -p ... --noEmit` invocations for the reason recorded in
 `9a49164`: it used to run only the root project and would report success
 over a dashboard that did not compile.
+
+Beyond the suite, three checks were run and are worth re-running before
+any release rather than trusting they still hold: `verify-package`
+(`node --test` covers it, but it is also runnable standalone — asserts
+the tarball has the bin entrypoint, all twelve dashboard assets, and
+ships no test artifact or `src/`), `npm pack` + install the tarball
+outside the repo + run the installed CLI + start the packed daemon +
+confirm `/health` is 200 + stop it, and `npm publish --dry-run`. All
+three passed locally today; none of them is a substitute for the CI
+matrix that is currently down (§1b).
 
 ```
 $ node dist/cli/index.js --help
@@ -116,36 +193,43 @@ this is intentional, it is what makes the zero-config stdio client config
 work. Use "cairn mcp" or "cairn status" to force one or the other.
 ```
 
-`cairn hook session-start` (M9) is new since the last handoff — see
-docs/RECALL_HOOK.md.
+`cairn hook session-start` (M9) prints a Claude Code SessionStart hook
+envelope — see docs/RECALL_HOOK.md.
 
-`cairn ui` now opens a real dashboard: the daemon serves the compiled SPA
-at `/ui` (list/search/edit/delete/bulk/undo, timeline, access log, stats,
-privacy panel, and now the pasted-memory and ChatGPT-custom-instructions
-importers), not a placeholder. Do not run bare `cairn setup`; see
-§4/§7 and CONTRIBUTING.md.
+`cairn ui` opens a real dashboard now, with all six nav sections
+implemented (memories, timeline, access log, connected apps, privacy,
+stats) rather than the "coming in the next step" placeholder five of them
+carried before `1b7ae7d`: list/search/edit/delete/bulk/undo, a Supersede
+row action on Memories, an Import panel for both vendor importers, plus
+timeline, access log, and stats views. It has been rendered in an actual
+browser, seeded with real data, and reviewed by the project owner over an
+SSH tunnel (§8) — the five screenshots from that session live in
+`assets/` (`hero.png`, `timeline.png`, `access-log.png`, `privacy.png`,
+`stats.png`). There is still **no automated browser test** — the mount
+closures are deliberately untested beyond the pure helpers they call;
+see §8. Do not run bare `cairn setup`; see §4/§7 and CONTRIBUTING.md.
 
 ## 3. The map
 
 | Directory | What lives there | Depends on |
 |---|---|---|
-| `src/storage` | SQLite schema, migrations, WAL/concurrency, driver seam, repositories (memories, episodes, vectors, tags, audit, privacy-settings, stats) | `src/util` (ids, text hashing) |
+| `src/storage` | SQLite schema, migrations, WAL/concurrency, driver seam, repositories (memories, episodes, vectors, tags, audit, privacy-settings, stats), `limits.ts` — the one home for input caps shared with `src/dashboard/api.ts` (`5963277`) | `src/util` (ids, text hashing) |
 | `src/embeddings` | `EmbeddingProvider` interface, ONNX (`local-onnx`), static fallback, `http` (Ollama/OpenAI/Voyage-shaped), factory/registry, background indexer worker | `src/storage` (writes vectors) |
-| `src/retrieval` | FTS5 query, RRF fusion, recency/importance re-rank, MMR, `get_context` budget assembly | `src/storage`, `src/embeddings` |
-| `src/mcp` | The tool surface (`tools.ts`), MCP server wiring, resources/notifications event bus (`events.ts`) | `src/retrieval`, `src/storage`, `src/privacy`, `src/portability`, `src/config` (reserved dashboard client id) |
-| `src/daemon` | HTTP+SSE server hosting the MCP server and the dashboard, shared HTTP primitives (`http.ts` — body cap, constant-time token check), runtime-file (port/pid/token) bookkeeping, lifecycle | `src/mcp`, `src/dashboard` |
-| `src/dashboard` | `api.ts` — the `/api` surface (browse/search/edit/delete/bulk-undo, episodes, timeline, access log, connected-apps/pause, privacy panel, stats, SSE, `/api/context`, `/api/import/pasted`, `/api/import/chatgpt`); `assets.ts` — the static file server for the compiled SPA (path-traversal containment, extension allowlist, CSP); `ui/` — the SPA itself: `app.ts` (shell, hash routing), `dom.ts`, `state.ts`, `api-client.ts`, `views/memories.ts` | `src/storage`, `src/retrieval`, `src/mcp/events.ts`, `src/portability/importers` |
+| `src/retrieval` | FTS5 query, RRF fusion, recency/importance re-rank, MMR, `get_context` budget assembly — the ranking scale/threshold split from `6d08e56` lives here | `src/storage`, `src/embeddings` |
+| `src/mcp` | The tool surface (`tools.ts`), MCP server wiring, resources/notifications event bus (`events.ts`), `withBoundedErrors` applied at registration to every handler including the resource mirror (`3e272af`, `6d08e56`) | `src/retrieval`, `src/storage`, `src/privacy`, `src/portability`, `src/config` (reserved dashboard client id) |
+| `src/daemon` | HTTP+SSE server hosting the MCP server and the dashboard, shared HTTP primitives (`http.ts` — body cap enforced on the full session not just the handshake, constant-time token check), runtime-file (port/pid/token) bookkeeping, lifecycle | `src/mcp`, `src/dashboard` |
+| `src/dashboard` | `api.ts` — the `/api` surface (browse/search/edit/delete/bulk-undo, episodes, timeline, access log, connected-apps/pause, privacy panel, stats, SSE, `/api/context`, `/api/import/pasted`, `/api/import/chatgpt`); `assets.ts` — the static file server for the compiled SPA (path-traversal containment, extension allowlist, CSP); `ui/` — the SPA itself: `app.ts` (shell, hash routing over all six sections via a `Record<SectionId, ...>`), `dom.ts`, `state.ts`, `api-client.ts`, `views/` (memories, timeline, access-log, connected-apps, privacy, stats) | `src/storage`, `src/retrieval`, `src/mcp/events.ts`, `src/portability/importers` |
 | `src/shim` | stdio-to-HTTP shim, daemon auto-start (`ensure-daemon.ts`) | `src/daemon` (spawns it) |
 | `src/cli` | `cairn` entrypoint, arg parsing, command implementations (`status`/`start`/`stop`/`ui`/`embeddings`/`setup`/`hook`), daemon lifecycle helpers | `src/daemon`, `src/shim`, `src/setup` |
 | `src/cli/hook.ts` | `cairn hook session-start` — fetches the budgeted context block from the local daemon and prints the Claude Code hook envelope; always exits 0, writes only the envelope (or nothing) to stdout | `src/daemon` (via HTTP), `src/config` |
-| `src/setup` | Client detection + config writers for Claude Desktop / Claude Code / Cursor (`clients.ts`, `apply.ts`) | `src/config` (paths) |
+| `src/setup` | Client detection + config writers for Claude Desktop / Claude Code / Cursor (`clients.ts`, `apply.ts`); writes `npx -y cairn-mem@latest` into every generated config | `src/config` (paths) |
 | `src/config` | Path resolution (`CAIRN_HOME` vs. client config paths, which are deliberately outside it); `identity.ts` — `DASHBOARD_CLIENT`, the reserved dashboard client id shared between `src/dashboard` and `src/mcp` so neither has to import the other's module to read one string | — |
-| `src/privacy` | Regex secret detectors, redaction (on/strict), `deleteEverything` | `src/storage` |
-| `src/portability` | `zip.ts` — a dependency-free ZIP codec (stored/deflate, CRC-32, central directory); `archive.ts` — the export/import archive format (manifest.json + memories.jsonl + episodes.jsonl + README.txt, SHA256-verified both directions); `importers/` — `pasted.ts` (one memory per copy-pasted line, for Claude/ChatGPT's own settings UI, the only export surface either vendor actually offers) and `chatgpt.ts` (custom instructions out of a real `conversations.json` export) | `src/storage` |
-| `src/integration` | Cross-client end-to-end test + harness (spawns real CLI processes) | everything above |
+| `src/privacy` | Regex secret detectors, redaction (on/strict), `deleteEverything` — now the single chokepoint for all five ingest paths (`f4dd3c9`, `6d08e56`) | `src/storage` |
+| `src/portability` | `zip.ts` — a dependency-free ZIP codec (stored/deflate, CRC-32, central directory); `archive.ts` — the export/import archive format (manifest.json + memories.jsonl + episodes.jsonl + README.txt, SHA256-verified both directions); `importers/` — `pasted.ts` (one memory per copy-pasted line, for Claude/ChatGPT's own settings UI, the only export surface either vendor actually offers) and `chatgpt.ts` (custom instructions out of a real `conversations.json` export) — parsers are tested against constructed fixtures only, never a real vendor export (§8) | `src/storage` |
+| `src/integration` | Cross-client end-to-end test + harness (spawns real CLI processes); locates the repo root by `pkg.name === "cairn-mem"` since the rename | everything above |
 | `src/util` | `uuidv7`/`timestampFromUuidv7`, text normalization/hashing | — |
 | `src/testing` | Shared test helpers (temp dirs) | — |
-| `src/scripts` | `smoke-vec.ts` (CI sqlite-vec loadable-extension check), `copy-ui-assets.ts` (places the SPA's compiled/static files next to the server that serves them), `verify-package.ts` (asserts the published tarball has the bin entrypoint and all dashboard assets, and ships no test artifact or `src/`) | `src/storage`, `src/dashboard/ui` |
+| `src/scripts` | `smoke-vec.ts` (CI sqlite-vec loadable-extension check), `copy-ui-assets.ts` (places the SPA's compiled/static files next to the server that serves them), `verify-package.ts` (asserts the published tarball has the bin entrypoint and all twelve dashboard assets, and ships no test artifact or `src/`) | `src/storage`, `src/dashboard/ui` |
 
 Three `tsconfig`s compile three different things, and the split is
 load-bearing, not tidy (`9a49164`):
@@ -162,9 +246,11 @@ load-bearing, not tidy (`9a49164`):
   test file was added without it; a separate tsconfig for tests was the
   fix.
 
-Top-level `/dashboard`, `/cli`, `/assets` are pre-scaffolded per BUILD_BRIEF
-§13's intended repo layout but remain empty (`.gitkeep` only) — the actual
-code is under `src/dashboard` and `src/cli`, not the top-level directories.
+Top-level `/dashboard`, `/cli`, `/assets` were pre-scaffolded per
+BUILD_BRIEF §13's intended repo layout; `assets/` is no longer empty (it
+now holds the five dashboard screenshots, §2), but `/dashboard` and
+`/cli` remain `.gitkeep`-only — the actual code is under `src/dashboard`
+and `src/cli`.
 
 ## 4. Invariants that are easy to break
 
@@ -175,32 +261,35 @@ code is under `src/dashboard` and `src/cli`, not the top-level directories.
 - **The tool count is 8, not the old 6, and both the design ceiling and the tests that pin the number are load-bearing.** §6 lists `export_memories`/`import_memories` as one line item joined by a slash, but they were split into two tools rather than one with a `direction` flag, because a direction parameter on something that writes into a user's memory store is exactly the ambiguity that makes a model mis-fire (`c1eca59`). §2's ceiling is "≤ ~7"; eight is a deliberate, recorded step past it, not drift. `src/mcp/server.test.ts:206,243` and `src/daemon/server.test.ts:177` all assert `tools.length === 8` — changing one without the other fails loudly rather than silently disagreeing.
 - **`busy_timeout` must be armed before `PRAGMA journal_mode=WAL`, not after.** Reversing the order was measured at 18/40 two-process failures (`d934b79`); the order is now commented in `db.ts` as load-bearing.
 - **The daemon listens on its port before it opens the database.** Only the kernel can arbitrate one thing cleanly — the port — so it decides first; opening the DB first let two racing daemons both start fighting over the file before either had lost (`d934b79`).
-- **`cairn stop` (and the shim's attach path) require the daemon's own reported pid from `/health`, not just "pid exists + port answers."** A recycled pid can belong to an unrelated process; both call sites share the one predicate deliberately (`bd8f75b`).
+- **`cairn stop` (and the shim's attach path) require the daemon's own reported pid from `/health`, not just "pid exists + port answers."** A recycled pid can belong to an unrelated process; both call sites share the one predicate deliberately (`bd8f75b`). This is the general pattern behind §1a's "a check trusted the thing it checked" — don't let a component vouch for itself when an outside signal (the kernel's port, the archive's own hash) is available instead.
 - **`cairn setup` must never be run for real during verification** — always `--dry-run` or with `HOME`/`USERPROFILE` pointed at a temp directory. `CAIRN_HOME` does NOT isolate it: client config paths (`~/.claude.json`, `~/.cursor/mcp.json`, Claude Desktop's config path) are deliberately outside `CAIRN_HOME` (CONTRIBUTING.md).
-- **A redaction finding never carries the secret it found.** Previews are masked; the raw value must appear in no table, including the FTS index (`5b6a9f0`). Do not "helpfully" log or return the matched string when touching `src/privacy`.
-- **`npm test` must exit on its own — no `--test-force-exit`.** Anything a test or the code under test opens must be closed before the file's tests finish, or the process hangs; `src/shim/shim.test.ts`, `src/daemon/server.test.ts` and now `src/cli/commands.test.ts` close undici's global fetch dispatcher in `after()` for exactly this reason (CONTRIBUTING.md, `5945910`, `196840d`).
+- **A redaction finding never carries the secret it found.** Previews are masked with no trailing characters, entropy-prefixed kinds are masked entirely, and the raw value must appear in no table, including the FTS index and `episodes.metadata` (`5b6a9f0`, `f4dd3c9`, `6d08e56`). Do not "helpfully" log or return the matched string when touching `src/privacy`.
+- **Redaction runs at every ingest path, not just `remember`.** `update_memory`, `supersede`, import, and `episodes.metadata` (fed by `remember`'s unbounded `source` parameter) all redact and enforce strict-mode refusal now, in the same transaction as the write. Import derives its own `redacted` flag rather than trusting the archive's (`f4dd3c9`). If you add a sixth way to write memory text into the store, it needs this too.
+- **`npm test` must exit on its own — no `--test-force-exit`.** Anything a test or the code under test opens must be closed before the file's tests finish, or the process hangs; `src/shim/shim.test.ts`, `src/daemon/server.test.ts` and `src/cli/commands.test.ts` close undici's global fetch dispatcher in `after()` for exactly this reason (CONTRIBUTING.md, `5945910`, `196840d`).
 - **`/ui` routes off the raw request path, not the parsed `pathname`.** `new URL()` silently collapses `..` segments itself (`/ui/../../package.json` becomes `/package.json`), so routing off the WHATWG-normalized path would send every traversal attempt to the generic 404 branch instead of ever reaching `serveUiFile`'s containment check — the guard would be tested by its own unit test and nothing else. `src/daemon/server.ts` deliberately re-splits `req.url` for the `/ui` branch (`329b842`).
 - **The dashboard must never be able to pause itself, and its client id is reserved.** `DASHBOARD_CLIENT` (`src/config/identity.ts`) is the id the dashboard stamps on its own store calls; the store's `gate()` refuses every gated call from a disabled client with no bypass, so if the dashboard's own id could be disabled, the very next request — including the one that would re-enable it — would be refused, locking the user out with no recovery short of hand-editing SQLite. `sourceClientName()` in `src/mcp/tools.ts` refuses to let any MCP client claim that name, so nothing can be impersonated into (or out of) the un-pauseable guard (`329b842`).
 - **No CORS headers and no preflight handler, anywhere, ever.** `src/daemon/server.ts` requires an `Authorization` bearer token on `/api`, which is what forces a browser to send a CORS preflight it never answers — that absence is the actual boundary against a cross-origin page reading the store, not something to "fix" if a browser console complains (`329b842`).
-- **`degradedReason` never leaves the process.** The retrieval layer sets it to the embedding provider's own `error.message`, which for an HTTP provider can carry a URL, hostname, or upstream error body. Both `/api/stats`-shaped routes and `/api/context` report a fixed `"embedding_failed"` string instead, through one shared helper, so the two call sites cannot drift apart (`063d621`). The `degraded` boolean itself is unchanged and safe to expose.
-- **The SessionStart hook (`cairn hook session-start`, `src/cli/hook.ts`) always exits 0 and writes only the envelope to stdout.** For that hook, stdout *is* model context — a stray diagnostic line becomes something the model reads and may act on. No daemon, a refused connection, a 401, a 500, malformed JSON, or an unexpected throw all end the same way: exit 0, empty stdout, diagnostics (if any) to stderr. It also enforces its own ~2s deadline shared across draining stdin, the daemon check, and the fetch, rather than trusting whatever timeout the calling client happens to use (`f58cb2a`).
-- **`export_memories` writes with `wx` and refuses the daemon's own files by name.** Confining writes to the Cairn home was a real fix, but the database — and its `-wal`/`-shm` and runtime files — live in that same home, so a path like `cairn.db` passed the containment check and `writeFileSync` truncated the live database to a ZIP (measured: 667648 bytes to 27641, "file is not a database" on next open). Two guards now: `flag: "wx"` so no existing file is ever clobbered regardless of name, and an explicit refusal of the daemon's own filenames, which also covers the window before a fresh home has written its runtime file yet (`e6fa952`).
-- **Import runs in one transaction, episodes and memories together.** Each insert used to run in its own implicit transaction, so a checksum-valid archive containing one row the store rejects — an out-of-range importance, an in-scope text collision, a missing episodeId — left the store permanently half-imported with no record of where it stopped. The tampered-archive test only passed by luck, because the SHA256 gate runs before any insert. One transaction now covers the whole loop, so a failure anywhere rolls back both layers (`0085bd2`).
-- **An archive entry is capped at an absolute 64 MiB, not a derived one.** The first version of the cap was `MAX_LINES * MAX_LINE_BYTES`, about 6.5 GB — it bounded nothing, since the OOM it existed to stop came from a 410 KB archive (splitLines decoded and split("\n") before consulting the line cap; a 512 KB archive killed the daemon with a V8 heap fatal). The cap is now a plain absolute ceiling on a decompressed entry, checked before any decoding (`e6fa952`, `1963819`).
-- **The ZIP's external attributes must carry a Unix file mode whenever "version made by" claims Unix provenance.** `writeZip` sets that high byte to Unix deliberately, so Info-ZIP honours the UTF-8 filename flag instead of mis-decoding non-ASCII names as CP437 — but the same claim makes unzip read the high 16 bits of the external attributes as the file's mode, and an export that left those zero extracted every file at mode 000. The two fields have to move together; the constant says so next to the version-made-by value (`4dde341`).
-- **`verify-package` must run through `npm run` (or otherwise inherit `npm_execpath`) so it can resolve `npm` portably.** `execFile('npm', ...)` fails with `ENOENT` on Windows because `npm` there is `npm.cmd` and `execFile` does not consult `PATHEXT` the way a shell does. The check resolves npm's own JS entrypoint via `npm_execpath` and runs it through the current Node binary instead (`c47f9ca`).
+- **`degradedReason` never leaves the process.** `toSafeDegradedReason` now lives once, beside the `SearchResult.degradedReason` field it describes (`5963277`, undoing an earlier duplication) — a raw embedding-provider error can carry a URL, hostname, or upstream error body, and both `/api/stats`-shaped routes and `/api/context` report a fixed `"embedding_failed"` string through that one shared helper instead (`063d621`). The `degraded` boolean itself is unchanged and safe to expose.
+- **The SessionStart hook (`cairn hook session-start`, `src/cli/hook.ts`) always exits 0 and writes only the envelope to stdout.** For that hook, stdout *is* model context — a stray diagnostic line becomes something the model reads and may act on. No daemon, a refused connection, a 401, a 500, malformed JSON, or an unexpected throw all end the same way: exit 0, empty stdout, diagnostics (if any) to stderr. It also enforces its own ~2s deadline shared across draining stdin, the daemon check, and the fetch, rather than trusting whatever timeout the calling client happens to use (`f58cb2a`). **This hook injects memory text into a session's single highest-trust position with nothing yet constraining imperative content inside a stored memory** — see §8, this is the next mitigation worth building, not a solved problem.
+- **`export_memories` writes with `wx` and refuses the daemon's own files by name, and containment is checked by realpath, not string comparison.** A lexical containment check never sees a symlinked parent directory, and string-identity file-name checks miss a trailing space, a trailing dot, or an alternate-data-stream suffix — all of which can alias `cairn.db` on some filesystem (`e6fa952`, `3e272af`).
+- **Import runs in one transaction, episodes and memories together.** A checksum-valid archive containing one row the store rejects used to leave the store permanently half-imported with no record of where it stopped; one transaction now covers the whole loop (`0085bd2`).
+- **An archive entry is capped at an absolute 64 MiB, not a derived one**, checked before any decoding — a derived cap bounded nothing, and a 410 KB archive alone drove a V8 heap fatal before this was fixed (`e6fa952`, `1963819`).
+- **The ZIP's external attributes must carry a Unix file mode whenever "version made by" claims Unix provenance**, or every extracted file comes out at mode 000 (`4dde341`).
+- **`verify-package` must run through `npm run` (or otherwise inherit `npm_execpath`) so it can resolve `npm` portably**, because `execFile('npm', ...)` fails with `ENOENT` on Windows (`c47f9ca`).
+- **Every MCP tool handler and the resource mirror are wrapped once at registration by `withBoundedErrors`.** An unbounded id, cursor, or archive-derived string echoed into an error message is a prompt-injection channel into the model's context, not just an ugly error — measured at 500,000+ characters before the wrap, and the resource mirror was still missing it after the first pass that wrapped only the eight tools (`3e272af`, `6d08e56`).
+- **Two things must not be duplicated by hand across file boundaries: input limits and the error scrubber.** Both drifted once already, purely because the security work was split across restricted-file-list agents who could not touch both sides at once; the numbers now live once in `src/storage/limits.ts` (imports nothing, to avoid a cycle) and the scrubber lives once beside the type it describes (`5963277`). If a fix needs the same constant or the same masking logic in two files, put it in one shared module instead of writing "keep in sync by hand" in a comment — that comment is a bug already filed, just not yet triggered.
 
 ## 5. What this project has learned the hard way
 
-- **Green locally is not green.** Four commits in the portability milestone were pushed red on CI while every local run passed: an `unzip -O` flag that only this machine's Info-ZIP build accepts (`55e016e`), and a file-permission check that is invisible to a process running as root (`4dde341`) — both real bugs no local run here could see, plus a genuine product defect (files extracting at mode 000, the same commit). Installing `gh` and reading the actual run, rather than trusting a local pass, is what found all three.
-- **A review finding is not a fact until it is reproduced.** Several findings relayed as bugs in this session did not survive being checked against the actual code before that check happened — two examples logged in this document's earlier revision (a "dead" regex that was in fact matching, a claimed stdout leak that a redirect already prevented) — and the rule stands: read the implementation before writing the finding down, not after.
-- **Do not commit while an agent is still writing.** It happened five times in this session and pushed non-compiling code to `main` twice (`063d621`'s `src/cli/commands.ts` missing a return statement; a later commit shipped `src/mcp/server.test.ts` mid-write with a `TS2554` compile error). The remedy that actually works is mechanical, not a reminder to be careful: snapshot `git diff HEAD | md5sum` before and after the test run and refuse to commit if it moved. That guard caught the fifth attempt before it landed (`1963819`).
-- **Tests encoding the host OS.** A `C:\fake\home` literal is a relative path on POSIX; a `renameSync` onto a read-only file succeeds on POSIX (rename only needs directory write permission) but fails on Windows; a Windows-shaped client config marker landed where the POSIX detector never looks. Fix pattern each time: ask the code under test for the real path/behaviour instead of hardcoding a platform's own. Where a property is genuinely only measurable on one OS (open-fd counts via `/proc/self/fd`), skip elsewhere with `t.skip("reason")` (`2e1a4d6`, `14847fb`, CONTRIBUTING.md).
-- **A security predicate duplicated in two places drifted.** The daemon-liveness/pid check was needed both by `cairn stop` and by the shim's attach-and-hand-over-the-token path; it now lives in one shared predicate rather than being reimplemented per call site (`bd8f75b`).
-- **A test-runner flag silently dropped tests.** `--test-force-exit` masked a real hang, but on a slower CI runner it exited the process while a file still had queued subtests — 5 of `store.test.ts`'s tests vanished with no failure and no "cancelled" count. A green build that quietly ran less than it claimed is worse than a red one; the flag is gone and the actual hang (an unguarded module entrypoint) was fixed instead (`5945910`).
-- **Killing a process by a recycled pid.** `cairn stop`'s old check ("pid exists" AND "port answers") could kill an unrelated process after a crash freed the pid for reuse; reproduced by killing a plain `node -e setInterval`. Fixed by requiring `/health` to return the daemon's own pid (`bd8f75b`).
-- **A "finding" that carried the secret it reported.** Early redaction previews would have re-surfaced the very secret they existed to hide, in the dashboard and in error messages. Previews are masked now, and the test asserts the raw value is in no table at all, FTS included (`5b6a9f0`).
-- **Concurrent agents in one working tree corrupt each other.** `npm test` begins with `npm run clean`, which deletes `dist/` outright — running it while another agent's build is mid-flight deletes that build's output out from under it. A `git stash` run for a before/after comparison reverted another agent's in-progress, uncommitted files. A broad `git add -A` swept a half-finished `src/cli/hook.ts` into an unrelated commit (`063d621`), which the following commit (`f58cb2a`) had to note and complete. The rule: one writer per file, no `npm test` while another agent is building, and no commit while an agent is running.
+- **Green locally is not green.** Portability-milestone commits were pushed red on CI while every local run passed: an `unzip -O` flag only this machine's Info-ZIP build accepts, a file-permission check invisible to a process running as root, and a genuine product defect (files extracting at mode 000). None of those three show up in a run on this machine — reading the actual CI run, not trusting a local pass, is what found them. This is doubly true right now: CI itself is down (§1b), which does not mean the risk went away, only that nothing is watching for it.
+- **A review finding is not a fact until it is reproduced.** Read the implementation before writing the finding down, not after; two early "findings" in this project turned out not to reproduce against the actual code.
+- **Do not commit while an agent is still writing.** It has pushed non-compiling code to `main` before. The mechanical fix — snapshot `git diff HEAD | md5sum` before and after a test run, refuse to commit if it moved — is what actually catches it; a reminder to "be careful" does not.
+- **Tests encoding the host OS.** A `C:\fake\home` literal is a relative path on POSIX; a `renameSync` onto a read-only file succeeds on POSIX but fails on Windows; a Windows-shaped config marker landed where the POSIX detector never looks. Ask the code under test for the real path/behaviour instead of hardcoding a platform's own; skip elsewhere with `t.skip("reason")` where a property is genuinely only measurable on one OS.
+- **A security predicate duplicated in two places drifted, and so did input limits and an error scrubber.** The daemon-liveness/pid check, then later the input-size caps and the degraded-reason scrubber, all needed to live in exactly one place after drifting once each (`bd8f75b`, `5963277`) — see §4's last bullet for the rule this generalises to.
+- **A test-runner flag silently dropped tests.** `--test-force-exit` masked a real hang, but on a slower CI runner it exited the process while a file still had queued subtests — tests vanished with no failure and no "cancelled" count. A green build that quietly ran less than it claimed is worse than a red one.
+- **Killing a process by a recycled pid**, and **a "finding" that carried the secret it reported**, and **concurrent agents in one working tree corrupting each other** (`npm run clean` deleting another agent's in-flight build output, `git stash` reverting another agent's uncommitted files, a broad `git add -A` sweeping a half-finished file into an unrelated commit) — all still stand as recorded in earlier revisions of this document, and none of the root causes have reappeared since the fixes landed.
+- **The security fixes themselves needed a rework pass**, and the rework's own root cause (§1a) generalises past this project: when N tests all fail off the back of one change, treat that as one question about the change, not N separate justifications to write down and move past. And **isolation between parallel agents must be real, not a file-list convention** — fourteen agents worked one shared tree this session, partitioned only by which files each was told to touch, and three lost uncommitted work to another agent's `git checkout`/`stash`/`reset`, because git reverts by repository and has no concept of a file-list agreement. The pattern that held up: `git worktree add <tmp> HEAD`, copy only your own files in, verify there, then apply back — a real filesystem boundary, not a promise.
+- **A regression test is not proof until it has been watched to fail.** Every test added across the security and rework commits was reverted against the unfixed code, run, confirmed red, and restored — this caught more than one false positive, including a marker string in a test that was itself secret-shaped and got redacted by the very detector under test, which made the test pass for the wrong reason until someone actually watched it fail first.
 
 ## 6. How work is done here
 
@@ -210,41 +299,39 @@ it does not write code. Every file change goes through a builder agent
 skill runs that full loop; use it for anything that changes files rather
 than improvising the handoff.
 
-Verification discipline this project actually holds itself to, visible
-throughout the commit bodies in `git log`:
-- **A fix is not accepted until the test that proves it has been shown to fail without it.** Several commits report exact before/after failure rates from repeated runs (e.g. "18/40 failed... 0/40 with it") rather than asserting the fix worked.
+Three working rules this project now holds itself to, each learned from
+an incident recorded in §1a/§5 rather than adopted in the abstract:
+
+1. **A regression test must be shown to fail against the unfixed code before it is trusted** — revert, run, watch it fail, restore. A test that has never failed has not proven anything yet, and this project has had a false-positive test slip through review on exactly this gap.
+2. **Many tests failing off one change is one signal, not many.** Nine tests each independently rationalized with `minRelevance: 0` was the same defect reported nine times; the question to ask first is what the failures say in common, not why each one is individually fine.
+3. **Isolation between parallel workers has to be real, not agreed.** A shared working tree partitioned by file-list convention is not isolation — git operates on the whole repository and does not know the convention exists. Use `git worktree add <tmp> HEAD`, copy in only the files you own, and verify there.
+
+Older verification discipline that still holds:
 - **A claim is not reported until it has been reproduced**, ideally on the actual failing platform — "Local measurement is not evidence here: this Windows machine reports 0/60 both before and after. CI on macOS and ubuntu is the decisive check" (`25bfb73`).
-- **Green output is not evidence on its own.** The `--test-force-exit` incident (§5) is the canonical example: the suite reported success while quietly running fewer tests than it claimed. The milestone-10 CI incidents (§5) are the same lesson from the other direction: a local pass is not evidence either, and `gh` is what actually settles it.
+- **Green output is not evidence on its own.** The `--test-force-exit` incident (§5) is the canonical example: the suite reported success while quietly running fewer tests than it claimed.
 
 ## 7. Open decisions that belong to the human
 
-- **The package name.** Settled: the npm package name is `cairn-mem`. `cairn` is taken by an unrelated React Native styling library, `cairn-memory` is taken by an active direct competitor, and `cairn-mcp` is taken by another project. The product name stays Cairn and the bin stays `cairn`; `package.json` now says `"name": "cairn-mem"`.
-- **Publishing.** `package.json` is publishable as of 0.1.0 (no `"private"` key), and `cairn setup` (`src/setup/apply.ts`, `src/cli/commands.ts`, `src/cli/index.ts`) now writes `npx -y cairn-mem@latest` into every client config it generates. That line will not work for any real user until the package is actually published — what remains is the human publish step itself (creating/using an npm account, running `npm publish`), not a naming decision.
-- **The demo/hero GIF.** BUILD_BRIEF §15 wants a hero GIF (Claude tells it something, Cursor recalls it) and a launch demo GIF (VHS/asciinema) — both need a human at a screen with a working dashboard. The dashboard exists now (M7 shipped) and the vendor importers are reachable from it (M10 shipped), so this is unblocked except for the human and the screen.
+- **The package name is settled, not open.** The npm package is `cairn-mem` (`114cd47`) — `cairn` is an unrelated React Native styling library, `cairn-memory` is an active direct competitor on Elastic-2.0, `cairn-mcp` is another project. The product name stays Cairn, the bin stays `cairn`, the MCP server id clients see stays `cairn`, and `~/.cairn`/`CAIRN_HOME`/`CAIRN_PORT`/the dashboard client id are all unchanged. `cairn setup` now writes `npx -y cairn-mem@latest` into every client config it generates.
+- **Publishing itself is the one thing left, and it is blocked on the owner's npm account, not a decision.** `npm publish --dry-run` succeeds end to end (§1b); the actual `npm publish` needs the owner's credentials, which this session does not have.
+- **The demo/hero GIF.** BUILD_BRIEF §15 wants a hero GIF (Claude tells it something, Cursor recalls it) and a launch demo GIF — both need a human at a screen with a working dashboard. The dashboard exists and is screenshotted (`assets/`), so this is unblocked except for the human and the screen.
 
 ## 8. What comes next
 
-Milestone 11's GIFs (§7) are the only remaining scheduled work. One
-standing gap remains open; the other, recorded here for a while, is now
-closed:
+Split by who can move it, because most of what remains is not something
+the next session can pick up and finish alone.
 
-- **CLOSED 2026-09-05: the dashboard SPA had never been rendered in an
-  actual browser.** The daemon was started on this machine, the store was
-  seeded with real data (14 live memories across 3 scopes, a superseded
-  Munich→Berlin pair, a soft-deleted memory, a redacted AWS key, 15
-  episodes), and the project owner opened `http://localhost:8787/ui`
-  through an SSH tunnel and reviewed it by hand — verdict: it looks good,
-  and all 12 UI assets served with correct content types. That establishes
-  human review of the rendered SPA; it does not establish automated
-  browser/end-to-end test coverage, which still does not exist.
-- **The Claude/ChatGPT vendor importers have never been run against a
-  real export.** `c2687d1`'s test fixtures for both formats are built
-  from documented and community-reported shapes, not a real Claude
-  memory paste or a real ChatGPT `conversations.json` — the parsers are
-  wired and tested against constructed input, but unvalidated against
-  reality.
+**Blocked on the project owner:**
+- **GitHub Actions billing.** Every CI run has failed in ~10s since 19:05 today with an account-payments message (§1b); nothing since `114cd47` is verified on Windows or macOS until this is fixed.
+- **`npm publish`.** The dry run passes; the real publish needs the owner's npm credentials.
+- **A real Claude or ChatGPT export.** `c2687d1`'s importer fixtures are built from documented and community-reported shapes, never a real Claude memory paste or a real ChatGPT `conversations.json` — the parsers are tested against constructed input, not reality, and only the owner can produce a real export to test against.
+- **Disk space.** This machine is at 100% (97G/99G used, 715M free), 47 GB of it in directories unrelated to this project — worth knowing before a build or `npm pack` fails for a reason that looks like a code problem and isn't.
+
+**Open engineering work, pick-up-able by the next session:**
+- **No automated browser test exists.** The dashboard has been rendered and reviewed by a human once (§2); the mount closures beyond the pure helpers they call remain untested by anything automated.
+- **The SessionStart hook has no defence against a memory's own content.** It injects memory text into a session's highest-trust position, and nothing today constrains imperative content inside a stored memory (§4). The mitigation worth building is a provenance flag so imported memories are excluded from injection until a human has reviewed them in the dashboard — not a content filter, which is easy to evade; a trust-tier on the memory itself.
 
 `package.json` has no `files`-shaped concern left open (`edb359c`,
-`c47f9ca`, `0085bd2` closed that loop and `verify-package` now guards it in
-CI), and THIRD_PARTY_LICENSES.md is current as of the last dependency
-added.
+`c47f9ca`, `0085bd2`, `d4ccdec` closed that loop and `verify-package` now
+guards it in CI — when CI is running), and THIRD_PARTY_LICENSES.md is
+current as of the last dependency added.

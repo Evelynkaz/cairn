@@ -11,9 +11,14 @@
 
 > Status: pre-release. The daemon, dashboard API, all MCP tools, the
 > SessionStart recall hook, and export/import are implemented and covered
-> by tests (799 tests, 795 passing, 0 failing, 4 skipped; CI green on
-> Linux/macOS/Windows). It is not yet published to npm. The dashboard UI
-> has now been reviewed by hand in a browser against a seeded store and
+> by tests (936 tests, 931 passing, 0 failing, 5 skipped). Verified locally
+> on Linux only: the full suite, `npm run typecheck`, `npm run
+> verify-package`, `npm pack` installed and run from a scratch directory,
+> and `npm publish --dry-run`. NOT verified on macOS or Windows: GitHub
+> Actions has been failing in seconds on every job since account payments
+> stopped going through, so nothing has been checked on those platforms for
+> the last several commits. It is not yet published to npm. The dashboard
+> UI has now been reviewed by hand in a browser against a seeded store and
 > judged good; no automated browser test exists yet.
 
 ## Why

@@ -45,6 +45,11 @@ MCP client, stored in a single file the user owns.
 
 ### Security
 
+Six independent audits (four security, one privacy, one retrieval-
+correctness) ran against this release before it went out. All of the
+following were reproduced and fixed; none require an attacker who already
+has shell access to the machine.
+
 - The daemon binds to loopback only, checks the `Origin` header, and requires
   a bearer token.
 - No telemetry of any kind.
@@ -53,3 +58,40 @@ MCP client, stored in a single file the user owns.
 - `remember` never calls an LLM and never touches the network on the default
   path; writes only run a local embedding model, or skip embedding entirely
   in FTS-only mode.
+- Secret redaction previously ran on only one of the five ways text enters
+  the store. It now runs on all of them — including import, which no
+  longer trusts an archive's own claim that its text was already redacted.
+- A finding cap silently limited how many secrets in a single memory were
+  actually redacted, rather than only limiting what was reported; a memory
+  with many secrets could store some of them raw. The cap on reporting is
+  gone and every finding is now redacted.
+- Redaction previews leaked most of a short secret (first and last four
+  characters). Previews are now a fixed-length mask, and secret kinds whose
+  prefix is itself high-entropy are masked completely rather than partially.
+- "Delete everything" removed the data from normal reads but left the
+  plaintext recoverable from the database file itself. It now removes it
+  from the file on disk.
+- The request-body size limit only applied before an MCP session was
+  established; a large request sent inside an existing session was not
+  bounded and could exhaust the daemon's memory.
+- The daemon's own files — the database, its WAL sidecars, the auth token,
+  and the log — were created world-readable. They are now created
+  restrictively, and an existing home directory's permissions are no longer
+  trusted as-is.
+- `cairn setup` could be redirected by a symlink planted at its temp-file
+  path into writing your client configuration somewhere else. It now
+  refuses to follow one.
+- A hostile import archive could inject large amounts of attacker-chosen
+  text into an AI client's context by way of error messages, and could
+  freeze the daemon by exploiting a slow path in archive parsing. Both are
+  now bounded.
+
+### Fixed
+
+- Ranking returned plausible but wrong results in three ways: recency could
+  outweigh relevance in the default (non-semantic) search mode, an
+  unrelated but larger corpus could crowd out the correct answer in
+  semantic search, and an important older memory could never surface in
+  the budgeted context block used at session start. All three are fixed;
+  ranking now weighs relevance, recency, and importance on a comparable
+  scale and can always reach older, important memories.
