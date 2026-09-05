@@ -108,6 +108,14 @@ function setupEnv(home: string): NodeJS.ProcessEnv {
   return { ...process.env, HOME: home, USERPROFILE: home, APPDATA: join(home, "AppData", "Roaming") };
 }
 
+// Narrow to uid 0 specifically: root bypasses POSIX permission checks
+// entirely, so a chmod(0o444) write-refusal cannot be observed there. Any
+// other POSIX user (including CI's unprivileged `runner`) still exercises
+// the real refusal, which is the property this test exists to protect.
+function permissionChecksAreBypassed(): boolean {
+  return typeof process.getuid === "function" && process.getuid() === 0;
+}
+
 test("setup --dry-run reports outcomes and writes nothing", async () => {
   await withTempDirAsync(async (home) => {
     mkdirSync(join(home, ".claude"), { recursive: true });
@@ -132,7 +140,11 @@ test("setup reports an unparsable client config loudly and leaves it untouched",
   });
 });
 
-test("setup: a failed write (read-only config) reaches stderr, exits non-zero, and does not stop the other clients", async () => {
+test("setup: a failed write (read-only config) reaches stderr, exits non-zero, and does not stop the other clients", async (t) => {
+  if (permissionChecksAreBypassed()) {
+    t.skip("running as root bypasses the permission check, so the write refusal cannot be exercised");
+    return;
+  }
   await withTempDirAsync(async (home) => {
     mkdirSync(join(home, ".claude"), { recursive: true });
     mkdirSync(join(home, ".cursor"), { recursive: true });

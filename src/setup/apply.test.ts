@@ -22,6 +22,14 @@ function backupFiles(dir: string, base: string): string[] {
   return readdirSync(dir).filter((f) => f.startsWith(`${base}.cairn-backup-`));
 }
 
+// Narrow to uid 0 specifically: root bypasses POSIX permission checks
+// entirely, so a chmod(0o444) write-refusal cannot be observed there. Any
+// other POSIX user (including CI's unprivileged `runner`) still exercises
+// the real refusal, which is the property these tests exist to protect.
+function permissionChecksAreBypassed(): boolean {
+  return typeof process.getuid === "function" && process.getuid() === 0;
+}
+
 test("skipped-not-detected leaves nothing on disk", () => {
   withTempDir((dir) => {
     const configPath = join(dir, "sub", "mcp.json");
@@ -203,7 +211,11 @@ test("http entry uses the daemon's default port when none is given", () => {
   });
 });
 
-test("failed: a read-only file produces 'failed' and the write does not truncate it", () => {
+test("failed: a read-only file produces 'failed' and the write does not truncate it", (t) => {
+  if (permissionChecksAreBypassed()) {
+    t.skip("running as root bypasses the permission check, so the write refusal cannot be exercised");
+    return;
+  }
   withTempDir((dir) => {
     const configPath = join(dir, "mcp.json");
     const original = { mcpServers: { other: { command: "foo" } } };
@@ -224,7 +236,11 @@ test("failed: a read-only file produces 'failed' and the write does not truncate
   });
 });
 
-test("failed: other targets are still processed after one fails", () => {
+test("failed: other targets are still processed after one fails", (t) => {
+  if (permissionChecksAreBypassed()) {
+    t.skip("running as root bypasses the permission check, so the write refusal cannot be exercised");
+    return;
+  }
   withTempDir((dir) => {
     const failing = join(dir, "readonly.json");
     const ok = join(dir, "ok.json");

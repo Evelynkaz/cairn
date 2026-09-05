@@ -57,6 +57,21 @@ open file descriptor counts, which are only readable via `/proc/self/fd` on
 Linux), the test skips elsewhere with `t.skip("reason")` rather than
 asserting a proxy that can fail at random.
 
+A property can also be unobservable because of **privilege**, not only
+platform. The common case is root: on POSIX, `root` bypasses file
+permission checks entirely, so a test that `chmod`s a file to `0o444` and
+asserts the write is refused cannot see that refusal when the process runs
+as uid 0 -- `access(W_OK)` and the write itself both succeed. This shows up
+whenever the suite runs inside a container or on a VPS as root, which is
+increasingly where development happens. The fix is the same shape as a
+platform gap: skip narrowly, with `t.skip("reason")`, gated on the specific
+privileged condition (`process.getuid?.() === 0`), never on "POSIX" or "not
+Windows" -- the property is real and must still be exercised for every
+unpermissioned POSIX user, including CI's own runner. Prefer running the
+suite as an unprivileged user for exactly this reason: it is the only way
+these tests stay meaningful. A test that skipped because it ran as root is
+not a passing test, and should not be read as one.
+
 ## Pull requests
 
 Keep changes focused and runnable at every step. Add or update tests for
