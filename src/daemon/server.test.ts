@@ -6,6 +6,7 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { rmSync, existsSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { makeTempDir, tempDbPath } from "../testing/tmp.js";
@@ -89,6 +90,20 @@ async function closeGlobalFetchDispatcher(): Promise<void> {
 after(async () => {
   await closeGlobalFetchDispatcher();
 });
+
+// fetch()'s URL parsing collapses ".." dot-segments before the request ever
+// leaves the process, so it cannot exercise the traversal guard over the
+// wire -- node:http's request(), given a literal `path`, sends it verbatim.
+function rawGet(handle: DaemonHandle, path: string): Promise<{ status: number }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ host: handle.host, port: handle.port, path, method: "GET" }, (res) => {
+      res.resume();
+      res.on("end", () => resolve({ status: res.statusCode ?? 0 }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
 
 function connectClient(handle: DaemonHandle, name = "daemon-test-client"): { client: Client; transport: StreamableHTTPClientTransport } {
   const transport = new StreamableHTTPClientTransport(new URL(`${handle.url}/mcp`), {
@@ -375,8 +390,76 @@ test("/health needs no token; an unknown path returns 404; /ui responds", async 
     const ui = await fetch(`${handle.url}/ui`);
     assert.equal(ui.status, 200);
 
-    const uiSub = await fetch(`${handle.url}/ui/dashboard`);
+    const uiSub = await fetch(`${handle.url}/ui/index.html`);
     assert.equal(uiSub.status, 200);
+  });
+});
+
+test("GET /ui serves the real built dashboard with its security headers", async () => {
+  await withDaemon(async (handle) => {
+    const res = await fetch(`${handle.url}/ui`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "text/html; charset=utf-8");
+    assert.ok(res.headers.get("content-security-policy"));
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+    const body = await res.text();
+    assert.match(body, /<div id="app">/);
+  });
+});
+
+test("GET /ui/styles.css serves the built stylesheet", async () => {
+  await withDaemon(async (handle) => {
+    const res = await fetch(`${handle.url}/ui/styles.css`);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("content-type"), "text/css; charset=utf-8");
+  });
+});
+
+test("GET /ui/../../package.json is rejected by the real daemon, not only the unit test", async () => {
+  await withDaemon(async (handle) => {
+    const res = await rawGet(handle, "/ui/../../package.json");
+    assert.equal(res.status, 403);
+  });
+});
+
+test("/api requires the daemon's bearer token, and an unknown /api path 404s once authorized", async () => {
+  await withDaemon(async (handle) => {
+    const noToken = await fetch(`${handle.url}/api/stats`);
+    assert.equal(noToken.status, 401);
+
+    const withToken = await fetch(`${handle.url}/api/stats`, {
+      headers: { Authorization: `Bearer ${handle.token}` },
+    });
+    assert.equal(withToken.status, 200);
+    const body = (await withToken.json()) as { liveMemories: number };
+    assert.equal(typeof body.liveMemories, "number");
+
+    const unknown = await fetch(`${handle.url}/api/nope`, {
+      headers: { Authorization: `Bearer ${handle.token}` },
+    });
+    assert.equal(unknown.status, 404);
+  });
+});
+
+test("Origin enforcement covers /api too: a foreign Origin is rejected before the route is reached", async () => {
+  await withDaemon(async (handle) => {
+    const res = await fetch(`${handle.url}/api/stats`, {
+      headers: { Authorization: `Bearer ${handle.token}`, Origin: "http://evil.example" },
+    });
+    assert.equal(res.status, 403);
+  });
+});
+
+test("close() ends an open SSE stream instead of hanging", async () => {
+  await withTempCairnHome(async (dir) => {
+    const handle = await startDaemon({ port: 0, dbPath: tempDbPath(dir), embeddings: "off" });
+    const stream = await fetch(`${handle.url}/api/events`, {
+      headers: { Authorization: `Bearer ${handle.token}` },
+    });
+    assert.equal(stream.status, 200);
+    await handle.close();
+    // No assertion beyond resolving: a stream left open here would hang
+    // the whole suite (npm test runs without --test-force-exit).
   });
 });
 

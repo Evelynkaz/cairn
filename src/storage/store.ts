@@ -39,8 +39,11 @@ import { clampLimit } from "./repositories/paging.js";
 import { memoryStats } from "./repositories/stats.js";
 import type { StoreStats, StoreStatsOptions } from "./repositories/stats.js";
 import { redactText } from "../privacy/index.js";
-import type { Finding, SecretKind } from "../privacy/index.js";
-import { resolvePrivacyMode } from "./privacy-settings.js";
+import type { Finding, SecretKind, PrivacyMode } from "../privacy/index.js";
+import { resolvePrivacyMode, setPrivacyMode } from "./privacy-settings.js";
+import type { PrivacyConfig } from "./privacy-settings.js";
+import { listRedactions, countRedactionsByKind } from "./repositories/redactions.js";
+import type { ListRedactionsOptions, ListRedactionsResult, RedactionKindCount } from "./repositories/redactions.js";
 
 export interface StoreOptions {
   path?: string;
@@ -190,7 +193,18 @@ export interface Store {
   auditLog(options?: Parameters<typeof listAudit>[1]): ReturnType<typeof listAudit>;
   clientStats(options?: { since?: number; limit?: number }): ReturnType<typeof countAuditByClient>;
   clients(): ClientRecord[];
-  setClientEnabled(id: string, enabled: boolean): ClientRecord;
+  setClientEnabled(id: string, enabled: boolean, ctx?: CallContext): ClientRecord;
+
+  /** §10 privacy mode, as resolved from env then settings then the default. */
+  privacy(): PrivacyConfig;
+  /** Changes the stored privacy mode. Audited: turning redaction off or down is
+      exactly the change a user must be able to find in the access log later. */
+  setPrivacy(mode: PrivacyMode, ctx?: CallContext): PrivacyConfig;
+  /** §9 "what was blocked": the redaction log. Previews are already masked at
+      write time -- never unmask them here. */
+  redactions(options?: ListRedactionsOptions): ListRedactionsResult;
+  /** §9 privacy panel aggregate: redaction counts by kind and action. */
+  redactionStats(options?: { since?: number; limit?: number }): RedactionKindCount[];
 
   close(): void;
 }
@@ -733,9 +747,56 @@ export function openStore(options: StoreOptions = {}): Store {
       return listClients(db);
     },
 
-    setClientEnabled(id, enabled) {
+    setClientEnabled(id, enabled, ctx) {
       requireWritable("setClientEnabled");
-      return setClientEnabledRepo(db, id, enabled);
+      // Invariant: the mutation and its audit row commit together or not
+      // at all -- a failed audit insert must not leave a client paused (or
+      // resumed) with no trace of it in the §5 access log.
+      return db.tx(() => {
+        const client = setClientEnabledRepo(db, id, enabled);
+        recordAudit(db, {
+          action: "client_enabled",
+          sourceClient: ctx?.sourceClient ?? null,
+          details: { id, enabled },
+        });
+        return client;
+      });
+    },
+
+    privacy() {
+      return resolvePrivacyMode(db);
+    },
+
+    setPrivacy(mode, ctx) {
+      requireWritable("setPrivacy");
+      // Invariant: the mutation and its audit row commit together or not
+      // at all -- a failed audit insert must not leave redaction switched
+      // with no trace of it in the §5 access log.
+      return db.tx(() => {
+        setPrivacyMode(db, mode);
+        // Re-resolve rather than trust setPrivacyMode's return value: env
+        // beats settings (see privacy-settings.ts), so a stored write here can
+        // be immediately overridden by CAIRN_PRIVACY. Returning the raw write
+        // result would report a mode that is not actually in effect. (This
+        // reads process.env via resolvePrivacyMode; it stays inside the
+        // transaction only incidentally -- its correctness does not depend
+        // on the transaction, and it must run after setPrivacyMode either way.)
+        const config = resolvePrivacyMode(db);
+        recordAudit(db, {
+          action: "privacy_mode",
+          sourceClient: ctx?.sourceClient ?? null,
+          details: { requested: mode, effective: config.mode, source: config.source },
+        });
+        return config;
+      });
+    },
+
+    redactions(options) {
+      return listRedactions(db, options);
+    },
+
+    redactionStats(options) {
+      return countRedactionsByKind(db, options);
     },
 
     close() {

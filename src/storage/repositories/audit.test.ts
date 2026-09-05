@@ -11,7 +11,52 @@ import {
   listClients,
   setClientEnabled,
   isClientEnabled,
+  AUDIT_READ_ACTIONS,
+  AUDIT_WRITE_ACTIONS,
+  type AuditAction,
 } from "./audit.js";
+
+// AuditAction is split three ways: read, write, and control-surface
+// (neither list). countAuditByClient only sums the first two -- a control-
+// surface change (e.g. toggling privacy mode) is not memory traffic, so it
+// must never silently fall into "read" or "write". This table is the
+// deliberate exhaustive partition: every action belongs to exactly one
+// group, and a future action added to none of the three fails here rather
+// than silently drifting into an unaccounted-for bucket.
+const CONTROL_SURFACE_ACTIONS: readonly AuditAction[] = ["privacy_mode", "client_enabled"];
+
+// Derived from a `satisfies Record<AuditAction, true>` map instead of a
+// hand-written array: TypeScript accepts a hand-written array that is a
+// proper subset of the AuditAction union, so a future action added to the
+// type but to none of the three groups below would silently pass a
+// hand-written list too. This map forces `npm run typecheck` to fail until
+// a new AuditAction is classified here.
+const ALL_ACTIONS = {
+  remember: true,
+  recall: true,
+  get_context: true,
+  list_memories: true,
+  update_memory: true,
+  forget: true,
+  restore: true,
+  export: true,
+  import: true,
+  privacy_mode: true,
+  client_enabled: true,
+} satisfies Record<AuditAction, true>;
+const allActions = Object.keys(ALL_ACTIONS) as AuditAction[];
+
+test("AUDIT_READ_ACTIONS, AUDIT_WRITE_ACTIONS, and the control-surface actions exhaustively and disjointly partition AuditAction", () => {
+  const groups = [AUDIT_READ_ACTIONS, AUDIT_WRITE_ACTIONS, CONTROL_SURFACE_ACTIONS];
+  const seen = new Set<AuditAction>();
+  for (const group of groups) {
+    for (const action of group) {
+      assert.ok(!seen.has(action), `${action} appears in more than one group`);
+      seen.add(action);
+    }
+  }
+  assert.deepEqual([...seen].sort(), [...allActions].sort());
+});
 
 test("recordAudit stores and listAudit reads back every field; details round-trips as object or null", () => {
   withTempDir((dir) => {
@@ -351,6 +396,39 @@ test("countAuditByClient excludes refused rows: a paused client's blocked attemp
       const paused = counts.find((c) => c.sourceClient === "paused");
       assert.ok(paused);
       assert.equal(paused.writes, 2);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("countAuditByClient returns nothing for a store whose only events are control-surface actions", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      recordAudit(db, { action: "privacy_mode", sourceClient: "dashboard" });
+      recordAudit(db, { action: "client_enabled", sourceClient: "cursor" });
+
+      assert.deepEqual(countAuditByClient(db), []);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("countAuditByClient does not let a control-surface row create a phantom client entry", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      recordAudit(db, { action: "recall", sourceClient: "cursor" });
+      recordAudit(db, { action: "client_enabled", sourceClient: "cursor", details: { id: "cursor", enabled: false } });
+      recordAudit(db, { action: "privacy_mode", sourceClient: "dashboard" });
+
+      const counts = countAuditByClient(db);
+      assert.equal(counts.length, 1);
+      assert.equal(counts[0]?.sourceClient, "cursor");
+      assert.equal(counts[0]?.reads, 1);
+      assert.equal(counts[0]?.writes, 0);
     } finally {
       db.close();
     }

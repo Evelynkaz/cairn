@@ -16,6 +16,9 @@ import type { McpDeps } from "../mcp/deps.js";
 import { MemoryEventBus } from "../mcp/events.js";
 import { openStore, ensureVectorSpace } from "../storage/index.js";
 import type { Store, VectorSpaceRef } from "../storage/index.js";
+import { serveUiFile } from "../dashboard/assets.js";
+import { createDashboardApi } from "../dashboard/api.js";
+import type { DashboardApi } from "../dashboard/api.js";
 import { openDb } from "../storage/db.js";
 import { resolveEmbeddingConfig, describeConfig } from "../embeddings/registry.js";
 import { createProviderFromConfig } from "../embeddings/factory.js";
@@ -78,6 +81,10 @@ export interface DaemonOptions {
   sessionIdleTimeoutMs?: number;
   sessionSweepIntervalMs?: number;
   maxSessions?: number;
+  // Test-only escape hatch: lets a test give the dashboard API (stats'
+  // recency math, in particular) a deterministic clock instead of the real
+  // Date.now, the same reason sessionIdleTimeoutMs etc. exist above.
+  now?: () => number;
 }
 
 export interface DaemonHandle {
@@ -96,16 +103,6 @@ interface SessionEntry {
   server: McpServer;
   lastSeen: number;
 }
-
-const UI_PLACEHOLDER_HTML = `<!doctype html>
-<html>
-  <head><meta charset="utf-8" /><title>Cairn</title></head>
-  <body>
-    <h1>Cairn</h1>
-    <p>The curation dashboard is not built yet. This placeholder keeps the /ui URL stable.</p>
-  </body>
-</html>
-`;
 
 function isLoopbackHost(host: string): boolean {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
@@ -177,6 +174,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   interface ReadyState {
     store: Store;
     deps: McpDeps;
+    api: DashboardApi;
   }
   let ready: ReadyState | null = null;
 
@@ -362,13 +360,46 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
           return;
         }
 
-        if (pathname === "/ui" || pathname.startsWith("/ui/")) {
+        // Unauthenticated by design: the HTML/CSS/JS served here are not
+        // secrets -- they are the same bytes shipped in the npm package --
+        // and the data they render is what the bearer token on /api
+        // protects. Requiring a token here would only stop the browser from
+        // ever loading the page that asks for one.
+        //
+        // Routed off the RAW request path, not the WHATWG-normalized
+        // `pathname` above: `new URL()` silently collapses ".." segments
+        // itself (e.g. "/ui/../../package.json" becomes "/package.json"),
+        // which would route a traversal attempt to the 404 fallback instead
+        // of ever reaching serveUiFile -- harmless, but it would mean the
+        // traversal guard inside serveUiFile is only ever exercised by its
+        // own unit test, never by a real request. Checking and serving off
+        // the raw path keeps that guard load-bearing end-to-end.
+        const rawPath = (req.url ?? "/").split("?", 1)[0] ?? "/";
+        if (rawPath === "/ui" || rawPath.startsWith("/ui/")) {
           if (req.method !== "GET") {
             sendJson(res, 404, { error: "not found" });
             return;
           }
-          res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-          res.end(UI_PLACEHOLDER_HTML);
+          const file = serveUiFile(rawPath);
+          res.writeHead(file.status, file.headers);
+          res.end(file.body);
+          return;
+        }
+
+        if (pathname === "/api" || pathname.startsWith("/api/")) {
+          if (!ready) {
+            sendNotReady(res);
+            return;
+          }
+          // No authorizeMcp() call here on purpose: createDashboardApi does
+          // its own bearer check internally with the same tokenMatches, and
+          // a second, differently-worded check here is exactly the
+          // duplicated-predicate drift this repo already fixed once
+          // (bd8f75b).
+          const handled = await ready.api.handle(req, res, url);
+          if (!handled) {
+            sendJson(res, 404, { error: "not found" });
+          }
           return;
         }
 
@@ -472,7 +503,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   // client's own subscription (see mcp/events.ts, mcp/server.ts).
   const bus = new MemoryEventBus();
   const deps: McpDeps = { store, provider, space, bus };
-  ready = { store, deps };
+  // One instance for the whole daemon, not per request: it owns SSE
+  // streams and heartbeat timers that must outlive any single request.
+  const api = createDashboardApi({ store, token, bus, now: options.now });
+  ready = { store, deps, api };
 
   // Drains the backlog in the background at whatever pace provider.embed()
   // sustains (BUILD_BRIEF §2: remember() itself never waits on a model).
@@ -513,6 +547,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     if (indexer) {
       await indexer.stop();
     }
+    api.close();
     await shutdownHttpAndStore();
     if (ownsProvider && provider) {
       await provider.close();
@@ -529,6 +564,10 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     if (indexer) {
       await indexer.stop();
     }
+    // Every open SSE stream and heartbeat timer must be released here --
+    // npm test runs without --test-force-exit, so a stream left open would
+    // hang the whole suite, not just this daemon.
+    api.close();
     for (const entry of Array.from(sessions.values())) {
       await entry.server.close();
     }

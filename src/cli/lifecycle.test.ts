@@ -13,7 +13,7 @@ import type { Server as HttpServer } from "node:http";
 import { join } from "node:path";
 import { withTempDir, withTempDirAsync } from "../testing/tmp.js";
 import { ensureDaemon } from "../shim/ensure-daemon.js";
-import { generateToken, writeRuntimeFile } from "../daemon/runtime-file.js";
+import { generateToken, readRuntimeFile, writeRuntimeFile } from "../daemon/runtime-file.js";
 import { dbPath } from "../config/paths.js";
 import { openDb } from "../storage/db.js";
 import { resolveEmbeddingConfig } from "../embeddings/registry.js";
@@ -168,10 +168,78 @@ test("stopDaemon with no daemon running reports stopped:false with a detail, and
   });
 });
 
-test("uiUrl is null with no daemon and <url>/ui with one", async () => {
+// A fake daemon good enough to satisfy isDaemonAlive's identity check
+// (matching pid on /health), without spawning a real cairn process --
+// used to control exactly what the runtime file's token is, which
+// withRealDaemon (a genuine spawned daemon) does not let a test do.
+async function withFakeLiveDaemon<T>(
+  dir: string,
+  token: string,
+  fn: (url: string) => Promise<T>,
+): Promise<T> {
+  const server: HttpServer = createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        ok: true,
+        pid: process.pid,
+        version: "0.1.0",
+        uptimeMs: 0,
+        memories: 0,
+        vectors: false,
+        journalMode: null,
+      }),
+    );
+  });
+  const port = await new Promise<number>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resolve(typeof address === "object" && address !== null ? address.port : 0);
+    });
+  });
+  writeRuntimeFile({ pid: process.pid, port, token, startedAt: Date.now(), version: "0.1.0" }, dir);
+  try {
+    return await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+test("uiUrl is null with no daemon and carries the daemon's token in the fragment with one", async () => {
   await withTempDirAsync(async (dir) => {
     assert.equal(await uiUrl(dir), null);
+    const token = generateToken();
+    await withFakeLiveDaemon(dir, token, async (url) => {
+      assert.equal(await uiUrl(dir), `${url}/ui#token=${token}`);
+    });
+  });
+});
+
+test("uiUrl percent-encodes a token with fragment-special characters, and decodes back exactly", async () => {
+  await withTempDirAsync(async (dir) => {
+    const token = "abc#def&ghi jkl";
+    await withFakeLiveDaemon(dir, token, async (url) => {
+      const result = await uiUrl(dir);
+      assert.equal(result, `${url}/ui#token=${encodeURIComponent(token)}`);
+      const fragment = (result as string).split("#token=")[1] ?? "";
+      assert.equal(decodeURIComponent(fragment), token);
+    });
+  });
+});
+
+test("uiUrl against a real spawned daemon carries that daemon's real token", async () => {
+  await withTempDirAsync(async (dir) => {
     await withRealDaemon(dir, async ({ url }) => {
+      const info = readRuntimeFile(dir);
+      assert.ok(info && info.token.length > 0);
+      assert.equal(await uiUrl(dir), `${url}/ui#token=${encodeURIComponent((info as { token: string }).token)}`);
+    });
+  });
+});
+
+test("uiUrl falls back to the plain /ui URL when the runtime file has no usable token", async () => {
+  await withTempDirAsync(async (dir) => {
+    await withFakeLiveDaemon(dir, "", async (url) => {
       assert.equal(await uiUrl(dir), `${url}/ui`);
     });
   });

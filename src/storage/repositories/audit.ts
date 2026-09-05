@@ -34,7 +34,9 @@ export type AuditAction =
   | "forget"
   | "restore"
   | "export"
-  | "import";
+  | "import"
+  | "privacy_mode"
+  | "client_enabled";
 
 // Single source of truth for the read/write split used by both
 // countAuditByClient and the dashboard, so the two never drift apart.
@@ -51,6 +53,14 @@ export const AUDIT_WRITE_ACTIONS: readonly AuditAction[] = [
   "restore",
   "import",
 ];
+
+// "privacy_mode" and "client_enabled" are deliberately in NEITHER list
+// above: they are control-surface changes (a settings toggle), not memory
+// traffic. AUDIT_READ_ACTIONS/AUDIT_WRITE_ACTIONS exist to answer "how much
+// memory activity did this app do" (countAuditByClient); a settings change
+// is not app activity, and counting it there would misreport a paused or
+// idle app as busy. The events still land in audit_log and are still
+// visible in the raw access-log view, which is where they belong.
 
 export interface RecordAuditEvent {
   action: AuditAction;
@@ -221,6 +231,7 @@ export function countAuditByClient(
   const limit = clampLimit(options.limit);
   const readPlaceholders = AUDIT_READ_ACTIONS.map(() => "?").join(", ");
   const writePlaceholders = AUDIT_WRITE_ACTIONS.map(() => "?").join(", ");
+  const trackedActions = [...AUDIT_READ_ACTIONS, ...AUDIT_WRITE_ACTIONS];
   const params: SqlValue[] = [...AUDIT_READ_ACTIONS, ...AUDIT_WRITE_ACTIONS];
 
   // Refused rows (a paused client's blocked attempts) are excluded from
@@ -228,7 +239,16 @@ export function countAuditByClient(
   // is evidence the user should see in the raw log, but it is not activity
   // the app actually performed, and counting it here would report a paused
   // app as busy -- the opposite of what pausing means.
-  const conditions = ["refused = 0"];
+  //
+  // Control-surface actions (privacy_mode, client_enabled) are excluded the
+  // same way, for the same reason: this function answers "how much memory
+  // activity did this app do", not "did this app do anything at all", so a
+  // settings toggle must not produce a phantom 0/0 client row. The rows
+  // themselves are untouched in audit_log and still show up in the raw
+  // access-log view.
+  const trackedPlaceholders = trackedActions.map(() => "?").join(", ");
+  const conditions = ["refused = 0", `action IN (${trackedPlaceholders})`];
+  params.push(...trackedActions);
   if (options.since !== undefined) {
     conditions.push("ts >= ?");
     params.push(options.since);

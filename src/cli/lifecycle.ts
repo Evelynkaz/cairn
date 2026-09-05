@@ -203,12 +203,53 @@ export async function stopDaemon(
   return { stopped: true, pid: info.pid };
 }
 
+// The token rides in the URL FRAGMENT (`#token=...`), never a query string,
+// because a fragment is the one part of a URL that is never sent to the
+// server: it appears in no request line, no access log, and no `Referer`
+// header when the dashboard later loads a subresource or the user follows a
+// link out of it. A query string would leak the token to every one of those.
+//
+// KNOWN GAP: the fragment does NOT close the local-exposure path, only the
+// HTTP one. runUi (src/cli/commands.ts) prints this URL to the terminal
+// (readable in scrollback) and passes it to openInBrowser, which spawns the
+// OS opener (`xdg-open` / `open` / `cmd /c start`) with the URL as an argv
+// element -- on a default Linux setup that argv, fragment and all, is
+// readable by any other local account via `ps -ef`/`/proc`. So this fragment
+// trick protects against a network observer or a malicious page, not
+// against another local user, and on a shared machine the daemon is already
+// reachable by every local account regardless of this token. The real fix
+// is a short-lived, single-use handoff token distinct from the long-lived
+// daemon bearer token; that is planned for the round that wires the
+// dashboard into the daemon, not implemented here.
+//
+// The SPA at `/ui` is REQUIRED (not yet implemented -- `/ui` today serves a
+// static placeholder with no script, see src/daemon/server.ts) to read
+// `location.hash` once on load, stash the token in memory or
+// `sessionStorage`, and then strip the fragment from the address bar (e.g.
+// `history.replaceState`) so it does not linger in browser history or get
+// shared if the user copies the URL. Until that SPA exists, the token stays
+// visible in the address bar and in browser history.
+//
+// The token itself is defence-in-depth, not the primary boundary: the daemon
+// binds loopback-only and rejects any request with a foreign `Origin` (see
+// src/daemon/server.ts). Nobody should conclude, on reading this later, that
+// the token alone is what keeps the store private -- it isn't, and "just
+// simplify this to a query param" would throw away a real protection for no
+// benefit.
 export async function uiUrl(home?: string): Promise<string | null> {
-  const status = await daemonStatus(home);
+  const resolvedHome = home ?? resolveCairnHome();
+  const status = await daemonStatus(resolvedHome);
   if (!status.running || !status.url) {
     return null;
   }
-  return `${status.url}/ui`;
+  const info = readRuntimeFile(resolvedHome);
+  if (!info || !info.token) {
+    // A dashboard the user can open and be told "no token" is strictly
+    // better than a command that reports the daemon as not running when it
+    // plainly is -- fall back to the plain URL rather than null.
+    return `${status.url}/ui`;
+  }
+  return `${status.url}/ui#token=${encodeURIComponent(info.token)}`;
 }
 
 export interface EmbeddingStatus {

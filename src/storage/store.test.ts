@@ -168,6 +168,19 @@ const GATED_METHODS: Record<string, GatedInvoke> = {
 //                      loopback-bound, token-authenticated HTTP route, never
 //                      from MCP client traffic, which is why it carries no
 //                      ctx.sourceClient to gate on
+//   privacy          - the dashboard's own privacy panel: a read of the
+//                      user's own control surface, not client traffic, so
+//                      there is no ctx.sourceClient to gate on
+//   redactions       - the dashboard's own privacy panel: a read of the
+//                      redaction log, not client traffic, so there is no
+//                      ctx.sourceClient to gate on
+//   redactionStats   - the dashboard's own privacy panel: a read of the
+//                      redaction log, not client traffic, so there is no
+//                      ctx.sourceClient to gate on
+//   setPrivacy       - the control surface itself (same category as
+//                      setClientEnabled above); ungated but audited, because
+//                      a change to redaction mode must be findable in the
+//                      access log
 // Adding a name here is a conscious call that the member is not client
 // traffic; it is not a place to silently exempt a new read/write method.
 const DELIBERATELY_UNGATED = new Set([
@@ -180,6 +193,10 @@ const DELIBERATELY_UNGATED = new Set([
   "clientStats",
   "countMemories",
   "stats",
+  "privacy",
+  "setPrivacy",
+  "redactions",
+  "redactionStats",
 ]);
 
 test("the gated-method table matches the store's actual surface exactly", () => {
@@ -298,6 +315,7 @@ test("a read-only store refuses mutating methods and still serves get/list", () 
       assert.throws(() => readOnlyStore.remember({ content: "nope" }), /read-only/);
       assert.throws(() => readOnlyStore.update(memory.id, { text: "nope" }), /read-only/);
       assert.throws(() => readOnlyStore.forget(memory.id), /read-only/);
+      assert.throws(() => readOnlyStore.setPrivacy("off"), /read-only/);
 
       const fetched = readOnlyStore.get(memory.id);
       assert.equal(fetched?.id, memory.id);
@@ -796,5 +814,135 @@ test("deleteEverything refuses without confirm: true", () => {
     store.remember({ content: "kept" });
     assert.throws(() => store.deleteEverything({ confirm: false as unknown as true }), /confirm/);
     assert.equal(countRows(store, "memories"), 1);
+  });
+});
+
+test("setPrivacy changes the mode and privacy() reports it with source 'settings'", () => {
+  withStore((store) => {
+    store.setPrivacy("off");
+    const config = store.privacy();
+    assert.equal(config.mode, "off");
+    assert.equal(config.source, "settings");
+  });
+});
+
+test("setPrivacy writes exactly one privacy_mode audit row, carrying the requested/effective mode and the caller's sourceClient", () => {
+  withStore((store) => {
+    store.setPrivacy("strict", { sourceClient: "dashboard" });
+
+    const { items } = store.auditLog({ action: "privacy_mode" });
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.details?.["requested"], "strict");
+    assert.equal(items[0]?.details?.["effective"], "strict");
+    assert.equal(items[0]?.details?.["source"], "settings");
+    assert.equal(items[0]?.sourceClient, "dashboard");
+  });
+});
+
+test("setPrivacy's return value always equals privacy()'s return value, in every mode", () => {
+  withStore((store) => {
+    for (const mode of ["off", "on", "strict"] as const) {
+      const returned = store.setPrivacy(mode);
+      assert.deepEqual(returned, store.privacy());
+    }
+  });
+});
+
+test("when CAIRN_PRIVACY overrides the store's setting, setPrivacy reports the effective env mode, not the requested one, and the audit row records both", () => {
+  const original = process.env["CAIRN_PRIVACY"];
+  process.env["CAIRN_PRIVACY"] = "off";
+  try {
+    withStore((store) => {
+      const returned = store.setPrivacy("strict");
+      assert.deepEqual(returned, { mode: "off", source: "env" });
+      assert.deepEqual(returned, store.privacy());
+
+      const { items } = store.auditLog({ action: "privacy_mode" });
+      assert.equal(items[0]?.details?.["requested"], "strict");
+      assert.equal(items[0]?.details?.["effective"], "off");
+      assert.equal(items[0]?.details?.["source"], "env");
+    });
+  } finally {
+    if (original === undefined) {
+      delete process.env["CAIRN_PRIVACY"];
+    } else {
+      process.env["CAIRN_PRIVACY"] = original;
+    }
+  }
+});
+
+test("setClientEnabled writes a client_enabled audit row with the id and the new value", () => {
+  withStore((store) => {
+    store.list({}, { sourceClient: "toggle-me" });
+    store.setClientEnabled("toggle-me", false);
+
+    const { items } = store.auditLog({ action: "client_enabled" });
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.details?.["id"], "toggle-me");
+    assert.equal(items[0]?.details?.["enabled"], false);
+  });
+});
+
+test("setClientEnabled's audit row carries the caller's sourceClient, and the two-argument call still works and records null", () => {
+  withStore((store) => {
+    store.list({}, { sourceClient: "toggle-me" });
+    store.setClientEnabled("toggle-me", false, { sourceClient: "dashboard" });
+
+    const { items } = store.auditLog({ action: "client_enabled" });
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.sourceClient, "dashboard");
+
+    store.setClientEnabled("toggle-me", true);
+    const { items: items2 } = store.auditLog({ action: "client_enabled" });
+    assert.equal(items2.length, 2);
+    assert.equal(items2[0]?.sourceClient, null);
+  });
+});
+
+test("redactions() and redactionStats() return what recordRedactions wrote", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "on");
+    store.remember({ content: `AWS key: ${AWS_KEY}` });
+
+    const { items } = store.redactions();
+    assert.equal(items.length, 1);
+    assert.equal(items[0]?.kind, "aws-access-key-id");
+    assert.equal(items[0]?.action, "redacted");
+
+    const stats = store.redactionStats();
+    const entry = stats.find((s) => s.kind === "aws-access-key-id" && s.action === "redacted");
+    assert.ok(entry);
+    assert.equal(entry.count, 1);
+  });
+});
+
+// This project has already shipped a bug where a redaction finding carried
+// the very secret it existed to hide (commit 5b6a9f0). Guard it here: the
+// preview stored in `redactions` must never contain the raw secret in ANY
+// field of what Store.redactions() returns.
+test("redactions() never returns an unmasked secret", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "on");
+    store.remember({ content: `AWS key: ${AWS_KEY} and GitHub token: ${GH_TOKEN}` });
+
+    const { items } = store.redactions();
+    assert.ok(items.length > 0);
+    for (const item of items) {
+      for (const value of Object.values(item)) {
+        if (typeof value === "string") {
+          assert.ok(!value.includes(AWS_KEY), `field leaked the raw AWS key: ${value}`);
+          assert.ok(!value.includes(GH_TOKEN), `field leaked the raw GitHub token: ${value}`);
+        }
+      }
+      // Not just "no full value" -- assert the actual masking shape
+      // (maskPreview: 4 leading + "…" + 4 trailing chars for anything over 8
+      // chars long), so a regression that keeps, say, 16 trailing chars of a
+      // 20-char key still fails this guard.
+      assert.match(
+        item.preview,
+        /^.{4}….{4}$/u,
+        `preview did not match the expected 4…4 mask shape: ${item.preview}`,
+      );
+    }
   });
 });

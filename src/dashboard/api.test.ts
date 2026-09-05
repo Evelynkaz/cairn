@@ -1,0 +1,456 @@
+// Exercises the dashboard API through a real node:http server wrapping
+// `handle`, exactly like ../daemon/server.test.ts exercises the daemon --
+// calling handlers directly would skip the parts (routing, headers,
+// content-length) an integration bug is most likely to hide in.
+
+import { after, before, test } from "node:test";
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { Server } from "node:http";
+import { request } from "node:http";
+import { makeTempDir, tempDbPath } from "../testing/tmp.js";
+import { openStore } from "../storage/index.js";
+import type { Store } from "../storage/index.js";
+import { MemoryEventBus } from "../mcp/events.js";
+import { createDashboardApi, DASHBOARD_CLIENT } from "./api.js";
+import type { DashboardApi } from "./api.js";
+
+const TOKEN = "test-token-0123456789";
+
+interface Ctx {
+  dir: string;
+  store: Store;
+  bus: MemoryEventBus;
+  api: DashboardApi;
+  server: Server;
+  baseUrl: string;
+}
+
+async function setup(): Promise<Ctx> {
+  const dir = makeTempDir();
+  const store = openStore({ path: tempDbPath(dir) });
+  const bus = new MemoryEventBus();
+  const api = createDashboardApi({ store, token: TOKEN, bus });
+  const server = createServer((req, res) => {
+    void (async () => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const handled = await api.handle(req, res, url);
+      if (!handled) {
+        res.writeHead(404).end();
+      }
+    })();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  return { dir, store, bus, api, server, baseUrl: `http://127.0.0.1:${port}` };
+}
+
+async function teardown(ctx: Ctx): Promise<void> {
+  ctx.api.close();
+  await new Promise<void>((resolve) => ctx.server.close(() => resolve()));
+  ctx.store.close();
+}
+
+interface ApiResponse {
+  status: number;
+  headers: Record<string, string | string[] | undefined>;
+  body: unknown;
+}
+
+async function call(
+  ctx: Ctx,
+  method: string,
+  path: string,
+  options: { token?: string | null; body?: unknown } = {},
+): Promise<ApiResponse> {
+  const token = options.token === undefined ? TOKEN : options.token;
+  const headers: Record<string, string> = {};
+  if (token !== null) {
+    headers["authorization"] = `Bearer ${token}`;
+  }
+  let payload: string | undefined;
+  if (options.body !== undefined) {
+    payload = JSON.stringify(options.body);
+    headers["content-type"] = "application/json";
+    headers["content-length"] = String(Buffer.byteLength(payload));
+  }
+  return new Promise((resolve, reject) => {
+    const req = request(`${ctx.baseUrl}${path}`, { method, headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () => {
+        const raw = Buffer.concat(chunks).toString("utf8");
+        let body: unknown = undefined;
+        if (raw.length > 0) {
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            body = raw;
+          }
+        }
+        resolve({ status: res.statusCode ?? 0, headers: res.headers, body });
+      });
+    });
+    req.on("error", reject);
+    if (payload !== undefined) req.write(payload);
+    req.end();
+  });
+}
+
+let ctx: Ctx;
+
+before(async () => {
+  ctx = await setup();
+});
+
+after(async () => {
+  await teardown(ctx);
+});
+
+test("401 with no token, wrong token, right-length-wrong-content token; 200 with correct token", async () => {
+  const noToken = await call(ctx, "GET", "/api/memories", { token: null });
+  assert.equal(noToken.status, 401);
+
+  const wrongToken = await call(ctx, "GET", "/api/memories", { token: "totally-different" });
+  assert.equal(wrongToken.status, 401);
+
+  const rightLengthWrongToken = await call(ctx, "GET", "/api/memories", {
+    token: "x".repeat(TOKEN.length),
+  });
+  assert.equal(rightLengthWrongToken.status, 401);
+
+  const ok = await call(ctx, "GET", "/api/memories");
+  assert.equal(ok.status, 200);
+});
+
+test("handle returns false outside /api", async () => {
+  const res = await call(ctx, "GET", "/health");
+  // The wrapping test server answers plain 404 when handle() returns false.
+  assert.equal(res.status, 404);
+});
+
+test("unknown /api path is 404; known path wrong method is 405", async () => {
+  const unknown = await call(ctx, "GET", "/api/nope");
+  assert.equal(unknown.status, 404);
+  assert.deepEqual(unknown.body, { error: "not found" });
+
+  const wrongMethod = await call(ctx, "POST", "/api/stats");
+  assert.equal(wrongMethod.status, 405);
+  assert.deepEqual(wrongMethod.body, { error: "method not allowed" });
+});
+
+test("memory round-trip: create, list, get, patch, delete, restore", async () => {
+  const { memory } = ctx.store.remember({ content: "roundtrip memory", tags: ["a"] }, { sourceClient: "other" });
+
+  const list = await call(ctx, "GET", "/api/memories");
+  assert.equal(list.status, 200);
+  const listBody = list.body as { mode: string; items: Array<{ id: string }> };
+  assert.equal(listBody.mode, "list");
+  assert.ok(listBody.items.some((item) => item.id === memory.id));
+
+  const got = await call(ctx, "GET", `/api/memories/${memory.id}`);
+  assert.equal(got.status, 200);
+  assert.equal((got.body as { text: string }).text, "roundtrip memory");
+
+  const patched = await call(ctx, "PATCH", `/api/memories/${memory.id}`, { body: { text: "updated" } });
+  assert.equal(patched.status, 200);
+  assert.equal((patched.body as { text: string }).text, "updated");
+
+  const deleted = await call(ctx, "DELETE", `/api/memories/${memory.id}`);
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(deleted.body, { deleted: true });
+
+  const afterDelete = await call(ctx, "GET", "/api/memories");
+  const afterDeleteBody = afterDelete.body as { items: Array<{ id: string }> };
+  assert.ok(!afterDeleteBody.items.some((item) => item.id === memory.id));
+
+  const restored = await call(ctx, "POST", `/api/memories/${memory.id}/restore`);
+  assert.equal(restored.status, 200);
+  assert.deepEqual(restored.body, { restored: true });
+
+  const afterRestore = await call(ctx, "GET", "/api/memories");
+  const afterRestoreBody = afterRestore.body as { items: Array<{ id: string }> };
+  assert.ok(afterRestoreBody.items.some((item) => item.id === memory.id));
+});
+
+test("bulk forget then bulk restore; 201 ids is rejected", async () => {
+  const ids = [
+    ctx.store.remember({ content: "bulk one" }, { sourceClient: "other" }).memory.id,
+    ctx.store.remember({ content: "bulk two" }, { sourceClient: "other" }).memory.id,
+  ];
+
+  const forgetRes = await call(ctx, "POST", "/api/memories/bulk", { body: { op: "forget", ids } });
+  assert.equal(forgetRes.status, 200);
+  const forgetBody = forgetRes.body as { op: string; count: number; results: Array<{ id: string; ok: boolean }> };
+  assert.equal(forgetBody.op, "forget");
+  assert.equal(forgetBody.count, 2);
+  assert.ok(forgetBody.results.every((r) => r.ok));
+
+  const restoreRes = await call(ctx, "POST", "/api/memories/bulk", { body: { op: "restore", ids } });
+  assert.equal(restoreRes.status, 200);
+  const restoreBody = restoreRes.body as { count: number };
+  assert.equal(restoreBody.count, 2);
+
+  const tooMany = Array.from({ length: 201 }, (_, i) => `id-${i}`);
+  const rejected = await call(ctx, "POST", "/api/memories/bulk", { body: { op: "forget", ids: tooMany } });
+  assert.equal(rejected.status, 400);
+});
+
+test("the dashboard cannot pause itself, but re-enabling it works", async () => {
+  const disableAttempt = await call(ctx, "PATCH", `/api/clients/${DASHBOARD_CLIENT}`, {
+    body: { enabled: false },
+  });
+  assert.equal(disableAttempt.status, 400);
+  assert.deepEqual(disableAttempt.body, { error: "the dashboard cannot pause itself" });
+
+  // Prove the dashboard was not locked out: an ordinary GET still works.
+  const stillWorks = await call(ctx, "GET", "/api/memories");
+  assert.equal(stillWorks.status, 200);
+
+  const enableAttempt = await call(ctx, "PATCH", `/api/clients/${DASHBOARD_CLIENT}`, {
+    body: { enabled: true },
+  });
+  assert.equal(enableAttempt.status, 200);
+});
+
+test("a percent-encoded spelling of the dashboard's own id is refused by the self-pause guard", async () => {
+  // %63 is a lowercase "c" -- decodes to exactly DASHBOARD_CLIENT.
+  const res = await call(ctx, "PATCH", "/api/clients/%63airn-dashboard", { body: { enabled: false } });
+  assert.equal(res.status, 400);
+  assert.deepEqual(res.body, { error: "the dashboard cannot pause itself" });
+});
+
+test("PATCH /api/clients/:id round-trips a client id containing a space", async () => {
+  ctx.store.remember({ content: "a memory from an IDE" }, { sourceClient: "Visual Studio Code" });
+
+  const disable = await call(ctx, "PATCH", "/api/clients/Visual%20Studio%20Code", { body: { enabled: false } });
+  assert.equal(disable.status, 200);
+  assert.equal((disable.body as { enabled: boolean }).enabled, false);
+
+  const list = await call(ctx, "GET", "/api/clients");
+  const found = (list.body as { clients: Array<{ id: string; enabled: boolean }> }).clients.find(
+    (c) => c.id === "Visual Studio Code",
+  );
+  assert.ok(found);
+  assert.equal(found?.enabled, false);
+
+  const enable = await call(ctx, "PATCH", "/api/clients/Visual%20Studio%20Code", { body: { enabled: true } });
+  assert.equal(enable.status, 200);
+});
+
+test("GET /api/memories?q=...&tags=... narrows a search result by tag, same as list", async () => {
+  ctx.store.remember({ content: "deploy the production server", tags: ["work"] }, { sourceClient: "other" });
+  ctx.store.remember({ content: "deploy the personal blog", tags: ["personal"] }, { sourceClient: "other" });
+
+  const res = await call(ctx, "GET", "/api/memories?q=deploy&tags=work");
+  assert.equal(res.status, 200);
+  const body = res.body as { mode: string; hits: Array<{ text: string }> };
+  assert.equal(body.mode, "search");
+  assert.ok(body.hits.some((h) => h.text.includes("production server")));
+  assert.ok(!body.hits.some((h) => h.text.includes("personal blog")));
+});
+
+test("PATCH /api/memories/does-not-exist is 404, not 500", async () => {
+  const res = await call(ctx, "PATCH", "/api/memories/does-not-exist", { body: { text: "x" } });
+  assert.equal(res.status, 404);
+  assert.deepEqual(res.body, { error: "not found" });
+});
+
+test("POST /api/memories/nope/supersede is 404, not 500", async () => {
+  const res = await call(ctx, "POST", "/api/memories/nope/supersede", { body: { text: "x" } });
+  assert.equal(res.status, 404);
+  assert.deepEqual(res.body, { error: "not found" });
+});
+
+test("PATCH /api/clients/never-seen is 404, not 500", async () => {
+  const res = await call(ctx, "PATCH", "/api/clients/never-seen", { body: { enabled: false } });
+  assert.equal(res.status, 404);
+  assert.deepEqual(res.body, { error: "not found" });
+});
+
+test("PATCH with importance outside 0..1 is 400, not 500", async () => {
+  const memory = ctx.store.remember({ content: "importance target" }, { sourceClient: "other" }).memory;
+  const res = await call(ctx, "PATCH", `/api/memories/${memory.id}`, { body: { importance: 5 } });
+  assert.equal(res.status, 400);
+});
+
+test("PATCH on a superseded memory is a plain 500 with no message leak", async () => {
+  const memory = ctx.store.remember({ content: "will be superseded via api test" }, { sourceClient: "other" })
+    .memory;
+  ctx.store.supersede(memory.id, { text: "already superseded replacement" }, { sourceClient: "other" });
+  const res = await call(ctx, "PATCH", `/api/memories/${memory.id}`, { body: { text: "edited" } });
+  assert.equal(res.status, 500);
+  assert.deepEqual(res.body, { error: "internal error" });
+});
+
+test("a supersede whose text collides with a live memory is a plain 500 with no message leak", async () => {
+  const a = ctx.store.remember({ content: "alpha collision text" }, { sourceClient: "other" }).memory;
+  const b = ctx.store.remember({ content: "bravo collision text" }, { sourceClient: "other" }).memory;
+  const res = await call(ctx, "POST", `/api/memories/${b.id}/supersede`, { body: { text: "alpha collision text" } });
+  assert.equal(res.status, 500);
+  assert.deepEqual(res.body, { error: "internal error" });
+});
+
+test("no CORS headers, and OPTIONS is not answered as a preflight", async () => {
+  const res = await call(ctx, "GET", "/api/memories");
+  assert.equal(res.headers["access-control-allow-origin"], undefined);
+  assert.deepEqual(
+    Object.keys(res.headers).filter((h) => h.startsWith("access-control-")),
+    [],
+  );
+
+  const options = await call(ctx, "OPTIONS", "/api/memories");
+  // No preflight handler exists for this route/method combination, so it
+  // falls through to the ordinary method-not-allowed handling -- a real
+  // preflight handler would answer 204, so anything but exactly 405 here
+  // means OPTIONS was accidentally treated as one.
+  assert.equal(options.status, 405);
+  assert.deepEqual(
+    Object.keys(options.headers).filter((h) => h.startsWith("access-control-")),
+    [],
+  );
+});
+
+test("PUT /api/privacy then GET reflects it; invalid mode is rejected and unchanged", async () => {
+  const put = await call(ctx, "PUT", "/api/privacy", { body: { mode: "strict" } });
+  assert.equal(put.status, 200);
+
+  const got = await call(ctx, "GET", "/api/privacy");
+  assert.equal((got.body as { mode: string }).mode, "strict");
+
+  const invalid = await call(ctx, "PUT", "/api/privacy", { body: { mode: "nonsense" } });
+  assert.equal(invalid.status, 400);
+
+  const stillGot = await call(ctx, "GET", "/api/privacy");
+  assert.equal((stillGot.body as { mode: string }).mode, "strict");
+
+  // Reset to "off" so later tests in this file that write memories are not
+  // subject to strict-mode refusal.
+  const reset = await call(ctx, "PUT", "/api/privacy", { body: { mode: "off" } });
+  assert.equal(reset.status, 200);
+});
+
+test("delete-everything without confirm is a no-op; with confirm:true it deletes", async () => {
+  ctx.store.remember({ content: "will be purged" }, { sourceClient: "other" });
+  const before = ctx.store.stats({});
+
+  const noConfirm = await call(ctx, "POST", "/api/privacy/delete-everything", { body: {} });
+  assert.equal(noConfirm.status, 400);
+  const afterNoConfirm = ctx.store.stats({});
+  assert.equal(afterNoConfirm.liveMemories, before.liveMemories);
+
+  const confirmed = await call(ctx, "POST", "/api/privacy/delete-everything", { body: { confirm: true } });
+  assert.equal(confirmed.status, 200);
+  const afterConfirmed = ctx.store.stats({});
+  assert.equal(afterConfirmed.liveMemories, 0);
+});
+
+test("malformed cursor is a 400, not a 500", async () => {
+  const res = await call(ctx, "GET", "/api/memories?cursor=not-a-real-cursor");
+  assert.equal(res.status, 400);
+  assert.deepEqual(res.body, { error: "malformed cursor" });
+});
+
+test("/api/stats reflects a known fixture", async () => {
+  ctx.store.remember({ content: "stats fixture one", tags: ["fixture-tag"] }, { sourceClient: "other" });
+  ctx.store.remember({ content: "stats fixture two", tags: ["fixture-tag"] }, { sourceClient: "other" });
+
+  const res = await call(ctx, "GET", "/api/stats");
+  assert.equal(res.status, 200);
+  const body = res.body as {
+    liveMemories: number;
+    topTags: Array<{ tag: string; count: number }>;
+    vectors: boolean;
+    journalMode: string;
+  };
+  assert.equal(body.liveMemories, 2);
+  const fixtureTag = body.topTags.find((t) => t.tag === "fixture-tag");
+  assert.ok(fixtureTag);
+  assert.equal(fixtureTag?.count, 2);
+  assert.equal(body.vectors, ctx.store.capabilities.vectors);
+  assert.equal(body.journalMode, ctx.store.capabilities.journalMode);
+});
+
+test("SSE: connects, receives a published event, and close() leaves no open handle", async () => {
+  await new Promise<void>((resolve, reject) => {
+    let timeout: NodeJS.Timeout;
+    const finish = (fn: () => void) => {
+      clearTimeout(timeout);
+      fn();
+    };
+    const req = request(
+      `${ctx.baseUrl}/api/events`,
+      { method: "GET", headers: { authorization: `Bearer ${TOKEN}` } },
+      (res) => {
+        assert.equal(res.statusCode, 200);
+        assert.equal(res.headers["content-type"], "text/event-stream; charset=utf-8");
+        let buffer = "";
+        res.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString("utf8");
+          if (buffer.includes("event: updated")) {
+            assert.ok(buffer.includes(`"uri"`));
+            req.destroy();
+            finish(resolve);
+          }
+        });
+        res.on("error", () => {
+          // req.destroy() above ends the response with an error on some
+          // Node versions -- that is the expected way this stream ends.
+        });
+        // By the time the response headers have arrived, handleEvents has
+        // already subscribed synchronously on the server -- safe to publish.
+        ctx.bus.publish({ type: "updated", uri: "cairn://memory/test", sourceSessionId: "s1" });
+      },
+    );
+    req.on("error", () => {
+      // Same as above: destroying the request can surface as a client-side
+      // socket error once the server has already sent what we needed.
+    });
+    req.end();
+    timeout = setTimeout(() => finish(() => reject(new Error("timed out waiting for SSE event"))), 5000);
+  });
+  // The bus must have no lingering listener from the stream above once the
+  // request has been destroyed and the server has noticed the close.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(ctx.bus.listenerCount, 0);
+});
+
+test("401 on /api/events specifically, not just /api/memories", async () => {
+  const res = await call(ctx, "GET", "/api/events", { token: null });
+  assert.equal(res.status, 401);
+});
+
+test("a request body over the 4 MB cap is rejected with 413", async () => {
+  const oversized = "x".repeat(5 * 1024 * 1024);
+  const res = await call(ctx, "PATCH", "/api/memories/does-not-exist", { body: { text: oversized } });
+  assert.equal(res.status, 413);
+});
+
+test("the 51st concurrent SSE stream is refused with 503", async () => {
+  const openReqs: ReturnType<typeof request>[] = [];
+  try {
+    for (let i = 0; i < 50; i++) {
+      await new Promise<void>((resolve, reject) => {
+        const req = request(
+          `${ctx.baseUrl}/api/events`,
+          { method: "GET", headers: { authorization: `Bearer ${TOKEN}` } },
+          (res) => {
+            assert.equal(res.statusCode, 200);
+            resolve();
+          },
+        );
+        req.on("error", reject);
+        req.end();
+        openReqs.push(req);
+      });
+    }
+    const overflow = await call(ctx, "GET", "/api/events");
+    assert.equal(overflow.status, 503);
+  } finally {
+    for (const req of openReqs) req.destroy();
+    // Give the server a moment to notice each destroyed socket and clean
+    // up its SSE stream before any later test relies on the stream count.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+});

@@ -58,6 +58,7 @@ export type { VectorSpaceRef } from "./repositories/vectors.js";
 
 export { resolvePrivacyMode, setPrivacyMode, VALID_PRIVACY_MODES } from "./privacy-settings.js";
 export type { PrivacyConfig } from "./privacy-settings.js";
+export type { PrivacyMode } from "../privacy/index.js";
 
 export { memoryStats } from "./repositories/stats.js";
 export type { StoreStats, StoreStatsOptions } from "./repositories/stats.js";

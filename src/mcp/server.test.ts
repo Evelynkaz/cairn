@@ -17,6 +17,7 @@ import { openStore } from "../storage/index.js";
 import type { Store } from "../storage/index.js";
 import { createMcpServer } from "./server.js";
 import { MemoryEventBus } from "./events.js";
+import { DASHBOARD_CLIENT } from "../dashboard/api.js";
 
 interface RememberResult {
   id: string;
@@ -500,6 +501,27 @@ test("the audit log records the connected client's name as source_client", async
     assert.ok(log.items.length > 0);
     assert.equal(log.items[0]?.sourceClient, "cairn-test-client");
   }, "cairn-test-client");
+});
+
+test("an MCP client that reports the dashboard's reserved name cannot occupy its clients row, and that row stays pauseable", async () => {
+  await withServer(async ({ client, store }) => {
+    // The real dashboard registers its own clients row the same way
+    // api.ts does: a store call stamped with DASHBOARD_CLIENT as
+    // sourceClient, independent of anything the MCP client does below.
+    store.list({}, { sourceClient: DASHBOARD_CLIENT });
+
+    await callJson(client, "remember", { content: "Impersonation attempt." });
+    const log = store.auditLog({ action: "remember" });
+    assert.ok(log.items.length > 0);
+    // Not attributed to the reserved dashboard id -- it must never share
+    // the dashboard's clients row.
+    assert.notEqual(log.items[0]?.sourceClient, DASHBOARD_CLIENT);
+
+    // The dashboard's own row, seeded above, remains a normal, pauseable
+    // client row -- the impersonating MCP client never touched it.
+    const client_record = store.setClientEnabled(DASHBOARD_CLIENT, false);
+    assert.equal(client_record.enabled, false);
+  }, DASHBOARD_CLIENT);
 });
 
 test("resource list and read work; a mutation triggers resources/list_changed", async () => {

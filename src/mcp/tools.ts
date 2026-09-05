@@ -12,6 +12,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { CallContext, Memory, SearchHit } from "../storage/index.js";
 import type { McpDeps } from "./deps.js";
+import { DASHBOARD_CLIENT } from "../dashboard/api.js";
 
 // The label used when a connected client did not identify itself (a bare
 // stdio pipe, or a client that skips clientInfo). Kept distinct from `null`
@@ -21,7 +22,15 @@ export const UNKNOWN_CLIENT = "unknown-client";
 
 export function sourceClientName(server: McpServer): string {
   const name = server.server.getClientVersion()?.name;
-  return name !== undefined && name.trim().length > 0 ? name : UNKNOWN_CLIENT;
+  if (name === undefined || name.trim().length === 0) return UNKNOWN_CLIENT;
+  // §9: `cairn-dashboard` is a reserved identity -- the dashboard's own
+  // `clients` row is the one the user is guaranteed to be able to pause
+  // (its PATCH handler refuses to disable it). If an MCP client were
+  // allowed to claim that same name, it would share that row: its writes
+  // would be attributed to "cairn-dashboard" and it would inherit the
+  // un-pauseable guard, making an impersonator un-stoppable. Refuse the
+  // claim rather than let any MCP client occupy the reserved id.
+  return name === DASHBOARD_CLIENT ? UNKNOWN_CLIENT : name;
 }
 
 export function callContext(server: McpServer, scope?: string): CallContext {
