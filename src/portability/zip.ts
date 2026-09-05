@@ -102,7 +102,15 @@ const EXTERNAL_ATTRS_REGULAR_FILE = UNIX_FILE_MODE << 16;
 // anything, so a small malicious/corrupt archive (a "zip bomb" declaring a
 // huge uncompressed size, or an absurd entry count) is refused up front
 // rather than causing an unbounded allocation or loop.
-const MAX_ENTRIES = 100_000;
+// Bounded below the field's own 16-bit range (0-65535) rather than at it:
+// `totalEntries` is read from a uint16 (see readZip below), so a cap set at
+// or above 65535 can never actually reject anything that field can express
+// -- the guard would be dead code. 4096 is far more than any real Cairn
+// export needs (memories.jsonl/episodes.jsonl are single entries; the
+// archive only ever has a handful of top-level files) while still being
+// comfortably reachable by a 16-bit value, so a hostile/corrupt archive
+// declaring an absurd entry count is actually refused.
+const MAX_ENTRIES = 4096;
 const MAX_TOTAL_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 function validateEntryName(name: string): void {

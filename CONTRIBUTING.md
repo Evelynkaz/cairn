@@ -6,15 +6,25 @@ truth for what to build, why, and in what order.
 
 ## Dev setup
 
-The project scaffold does not yet have a working build. Once implemented:
-
 ```
 npm install
 npm run build
+npm run typecheck
 npm test
+npm run verify-package
 ```
 
-(Placeholders for now — see `package.json`.)
+`npm run build` runs three separate `tsc` projects (`tsconfig.json` for
+`src/`, `tsconfig.ui.json` for the dashboard's browser bundle, and
+`tsconfig.uitest.json` for the UI's own tests) and then a Node script that
+copies the dashboard's static assets (HTML/CSS) into `dist/`.
+`npm run typecheck` chains the same three projects with `--noEmit`.
+`npm test` cleans `dist/`, rebuilds, and runs the whole suite with
+`node --test`; it is currently green (742 tests, 738 pass, 0 fail) and is
+not re-run casually — see `package.json` for the exact script.
+`npm run verify-package` checks that `npm pack` would actually ship a
+working CLI and dashboard (bin entry present, dashboard assets present, no
+test artifacts or leaked `src/` tree).
 
 ## Guidelines
 
@@ -56,6 +66,15 @@ property can genuinely only be measured precisely on one platform (e.g. exact
 open file descriptor counts, which are only readable via `/proc/self/fd` on
 Linux), the test skips elsewhere with `t.skip("reason")` rather than
 asserting a proxy that can fail at random.
+
+The same lesson has bitten in two more shapes since. `unzip -O` (to force an
+output encoding) is not accepted by every Info-ZIP build — a test that
+shelled out to it broke CI on all three platforms, not just one, because the
+flag itself isn't portable across `unzip` versions. And on Windows, `npm` is
+actually `npm.cmd`; Node's `child_process` refuses to spawn a `.cmd` file
+unless the call passes `shell: true` (or the exact `.cmd` path), so a test
+or script that spawns `"npm"` directly via `execFile`/`spawn` without a
+shell works on POSIX and fails only on Windows.
 
 A property can also be unobservable because of **privilege**, not only
 platform. The common case is root: on POSIX, `root` bypasses file

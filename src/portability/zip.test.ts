@@ -109,7 +109,12 @@ test("rejects an archive declaring more entries than the cap", () => {
   const eocdOffset = tampered.length - 22;
   tampered.writeUInt16LE(0xffff, eocdOffset + 8);
   tampered.writeUInt16LE(0xffff, eocdOffset + 10);
-  assert.throws(() => readZip(tampered), ZipFormatError);
+  // Assert the cap's OWN message, not merely "some ZipFormatError" -- a
+  // weaker assertion here would also pass if the loop below the guard
+  // failed for an unrelated reason (e.g. "bad central directory signature"
+  // because the file only actually has one entry), which would never fail
+  // if the guard itself were deleted.
+  assert.throws(() => readZip(tampered), /declares 65535 entries, exceeding the cap of 4096/);
 });
 
 test("rejects an archive declaring more uncompressed bytes than the cap (zip bomb shape)", () => {

@@ -7,7 +7,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -19,6 +19,9 @@ import type { Store } from "../storage/index.js";
 import { createMcpServer } from "./server.js";
 import { MemoryEventBus } from "./events.js";
 import { DASHBOARD_CLIENT } from "../dashboard/api.js";
+import { dbPath } from "../config/paths.js";
+import { runtimeFilePath, writeRuntimeFile } from "../daemon/runtime-file.js";
+import { exportArchive } from "../portability/archive.js";
 
 interface RememberResult {
   id: string;
@@ -503,26 +506,44 @@ async function assertResourceReadRefused(client: Client, uri: string): Promise<v
 
 test("a paused client is refused on every one of the eight tools, and none returns memory content", async () => {
   const clientName = "paused-mcp-client";
-  await withServer(async ({ client, store }) => {
-    const seeded = await callJson<RememberResult>(client, "remember", { content: `seed memory containing ${LEAK_MARKER}` });
-    store.setClientEnabled(clientName, false);
+  const archiveDir = makeTempDir();
+  try {
+    await withServer(async ({ client, store }) => {
+      const seeded = await callJson<RememberResult>(client, "remember", { content: `seed memory containing ${LEAK_MARKER}` });
 
-    for (const [name, args] of Object.entries(TOOL_PROBE_ARGS)) {
-      const { text, isError } = await callTool(client, name, args);
-      assert.equal(isError, true, `${name} did not refuse a paused client`);
-      assert.ok(!text.includes(LEAK_MARKER), `${name} returned memory content while the client was paused: ${text}`);
-    }
+      // import_memories' probe must point at a REAL, readable archive.
+      // Pointing it at a nonexistent path (as before) makes the tool refuse
+      // for a filesystem reason before the pause gate is ever consulted, so
+      // deleting the gate would leave this test green for the wrong reason.
+      // Only the gate may be what refuses this call.
+      const probeArchivePath = join(archiveDir, "probe.zip");
+      writeFileSync(probeArchivePath, exportArchive(store).archive);
+      const probeArgs: Record<string, Record<string, unknown>> = {
+        ...TOOL_PROBE_ARGS,
+        import_memories: { path: probeArchivePath },
+      };
 
-    // The resource mirror is the same class of read path that already
-    // produced one bypass this milestone (forget's preview) -- it must be
-    // gated too, not just the six tools above.
-    await assertResourceReadRefused(client, "cairn://memories");
-    await assertResourceReadRefused(client, `cairn://memory/${seeded.id}`);
+      store.setClientEnabled(clientName, false);
 
-    // Nothing above should have mutated the store: no new remember, no
-    // deletion of the seed memory.
-    assert.equal(store.list({ limit: 200 }).items.length, 1);
-  }, clientName);
+      for (const [name, args] of Object.entries(probeArgs)) {
+        const { text, isError } = await callTool(client, name, args);
+        assert.equal(isError, true, `${name} did not refuse a paused client`);
+        assert.ok(!text.includes(LEAK_MARKER), `${name} returned memory content while the client was paused: ${text}`);
+      }
+
+      // The resource mirror is the same class of read path that already
+      // produced one bypass this milestone (forget's preview) -- it must be
+      // gated too, not just the six tools above.
+      await assertResourceReadRefused(client, "cairn://memories");
+      await assertResourceReadRefused(client, `cairn://memory/${seeded.id}`);
+
+      // Nothing above should have mutated the store: no new remember, no
+      // deletion of the seed memory.
+      assert.equal(store.list({ limit: 200 }).items.length, 1);
+    }, clientName);
+  } finally {
+    rmSync(archiveDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
 });
 
 test("the audit log records the connected client's name as source_client", async () => {
@@ -880,4 +901,222 @@ test("import_memories on a nonexistent path returns a clear error, not an unhand
     assert.equal(isError, true, "importing a nonexistent path must return isError: true, not throw unhandled");
     assert.ok(text.length > 0, "the error must say something clear");
   });
+});
+
+// A nonexistent path, a directory, and a file that reads fine but is not an
+// archive are three DIFFERENT filesystem facts. Returning a different error
+// string for each turns import_memories into an existence-and-readability
+// oracle over the filesystem for any connected MCP client -- they must
+// collapse to one identical, path-free string.
+test("import_memories returns the identical error for a nonexistent path, a directory, and a non-archive file", async () => {
+  await withServer(async ({ client }) => {
+    const dir = makeTempDir();
+    try {
+      const notArchivePath = join(dir, "not-an-archive.txt");
+      writeFileSync(notArchivePath, "just some plain text, not a zip");
+
+      const nonexistent = await callTool(client, "import_memories", { path: "/no/such/archive-for-this-test.zip" });
+      const directory = await callTool(client, "import_memories", { path: dir });
+      const notArchive = await callTool(client, "import_memories", { path: notArchivePath });
+
+      assert.equal(nonexistent.isError, true);
+      assert.equal(directory.isError, true);
+      assert.equal(notArchive.isError, true);
+
+      assert.equal(nonexistent.text, directory.text, "nonexistent path and directory must produce the identical error");
+      assert.equal(nonexistent.text, notArchive.text, "nonexistent path and non-archive file must produce the identical error");
+
+      assert.ok(!nonexistent.text.includes("/no/such"), "the error must not echo the requested path");
+      assert.ok(!directory.text.includes(dir), "the error must not echo the requested path");
+      assert.ok(!notArchive.text.includes(notArchivePath), "the error must not echo the requested path");
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+});
+
+test("import_memories refuses a file over the size ceiling, checked with statSync before reading it into memory", async () => {
+  await withServer(async ({ client }) => {
+    const dir = makeTempDir();
+    try {
+      const hugePath = join(dir, "huge.zip");
+      // A sparse file: truncateSync extends the file's reported size
+      // without writing real bytes to disk, so this stays fast regardless
+      // of the ceiling's magnitude. What matters is that statSync's
+      // reported size alone is enough to refuse it, before readFileSync
+      // would ever load it into memory.
+      writeFileSync(hugePath, "");
+      const oversized = 300 * 1024 * 1024;
+      const { truncateSync } = await import("node:fs");
+      truncateSync(hugePath, oversized);
+      assert.equal(statSync(hugePath).size, oversized);
+
+      const { isError, text } = await callTool(client, "import_memories", { path: hugePath });
+      assert.equal(isError, true, "an oversized file must be refused");
+      assert.ok(!text.includes(hugePath), "the refusal must not echo the path");
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+});
+
+// Defect 1: export_memories confines writes to the Cairn home, but the
+// database itself lives there too. Without an explicit refusal by identity,
+// export_memories(path: "cairn.db") truncates the live SQLite file to a ZIP.
+test("export_memories refuses to write onto the database, its WAL/SHM siblings, or the runtime file, by name", async () => {
+  const home = makeTempDir();
+  const originalHome = process.env.CAIRN_HOME;
+  process.env.CAIRN_HOME = home;
+  try {
+    await withServer(async ({ client, store }) => {
+      for (let i = 0; i < 5; i++) {
+        await callJson(store === store ? client : client, "remember", { content: `Protected-file probe memory ${i}` });
+      }
+      writeRuntimeFile({ pid: process.pid, port: 1, token: "x", startedAt: Date.now(), version: "test" }, home);
+
+      const db = dbPath(home);
+      const runtime = runtimeFilePath(home);
+      for (const target of [db, `${db}-wal`, `${db}-shm`, runtime]) {
+        const { isError, text } = await callTool(client, "export_memories", { path: target });
+        assert.equal(isError, true, `export_memories(path: ${target}) must be refused`);
+        assert.ok(!text.includes(home), "the refusal must not echo the path");
+      }
+    });
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.CAIRN_HOME;
+    } else {
+      process.env.CAIRN_HOME = originalHome;
+    }
+    rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+});
+
+test("export_memories never clobbers an existing file, whatever its name", async () => {
+  const home = makeTempDir();
+  const originalHome = process.env.CAIRN_HOME;
+  process.env.CAIRN_HOME = home;
+  try {
+    await withServer(async ({ client }) => {
+      const target = join(home, "already-here.zip");
+      writeFileSync(target, "not a real archive, just occupying the name");
+
+      const { isError, text } = await callTool(client, "export_memories", { path: target });
+      assert.equal(isError, true, "exporting onto an existing file must be refused");
+      assert.ok(!text.includes(target), "the refusal must not echo the path");
+      assert.equal(readFileSync(target, "utf8"), "not a real archive, just occupying the name", "the existing file must be untouched");
+    });
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.CAIRN_HOME;
+    } else {
+      process.env.CAIRN_HOME = originalHome;
+    }
+    rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+});
+
+// The assertion that matters: after a refused export attempt at the
+// database's own path, the database must still open and still hold its
+// memories -- not be truncated to a ZIP archive.
+test("the database survives a refused export attempt onto its own path", async () => {
+  const home = makeTempDir();
+  const originalHome = process.env.CAIRN_HOME;
+  process.env.CAIRN_HOME = home;
+  try {
+    const store = openStore({ path: dbPath(home) });
+    const server = createMcpServer({ store });
+    const client = new Client({ name: "protected-file-client", version: "1.0.0" });
+    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      for (let i = 0; i < 5; i++) {
+        await callJson(client, "remember", { content: `Survives-refusal probe memory ${i}` });
+      }
+      const before = store.list({ limit: 200 }).items.length;
+      assert.equal(before, 5);
+
+      const { isError } = await callTool(client, "export_memories", { path: dbPath(home) });
+      assert.equal(isError, true, "exporting onto the database's own path must be refused");
+
+      const after = store.list({ limit: 200 }).items.length;
+      assert.equal(after, before, "the database must still hold every memory after a refused export attempt");
+    } finally {
+      await client.close();
+      await server.close();
+      store.close();
+    }
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.CAIRN_HOME;
+    } else {
+      process.env.CAIRN_HOME = originalHome;
+    }
+    rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+});
+
+// Defect 2: exportArchive was called without includeSuperseded, so
+// listMemories' default `valid_until IS NULL` filter silently dropped every
+// superseded row -- losing the §5/§7 temporal history a backup must
+// preserve.
+test("export_memories then import_memories preserves a superseded memory and its successor, with validUntil/supersededBy intact", async () => {
+  const sourceDir = makeTempDir();
+  const destDir = makeTempDir();
+  const sourceStore = openStore({ path: tempDbPath(sourceDir) });
+  const destStore = openStore({ path: tempDbPath(destDir) });
+  const sourceServer = createMcpServer({ store: sourceStore });
+  const destServer = createMcpServer({ store: destStore });
+  const sourceClient = new Client({ name: "source-client", version: "1.0.0" });
+  const destClient = new Client({ name: "dest-client", version: "1.0.0" });
+  const [sourceServerTransport, sourceClientTransport] = InMemoryTransport.createLinkedPair();
+  const [destServerTransport, destClientTransport] = InMemoryTransport.createLinkedPair();
+  const originalHome = process.env.CAIRN_HOME;
+  process.env.CAIRN_HOME = sourceDir;
+  try {
+    await Promise.all([sourceServer.connect(sourceServerTransport), sourceClient.connect(sourceClientTransport)]);
+    await Promise.all([destServer.connect(destServerTransport), destClient.connect(destClientTransport)]);
+
+    const munich = await callJson<RememberResult>(sourceClient, "remember", { content: "I live in Munich" });
+    const munichBefore = sourceStore.list({ limit: 200 }).items.find((m) => m.id === munich.id);
+    assert.ok(munichBefore, "the Munich memory must exist before supersede");
+
+    // Supersede Munich with Berlin the same way the storage layer's own
+    // supersede path does: set validUntil + supersededBy on the old row,
+    // add the new one.
+    const berlin = await callJson<RememberResult>(sourceClient, "remember", { content: "I live in Berlin" });
+    sourceStore.db.exec(
+      `UPDATE memories SET valid_until = ?, superseded_by = ? WHERE id = ?`,
+      [Date.now(), berlin.id, munich.id],
+    );
+
+    const archivePath = join(sourceDir, "supersede-export.zip");
+    const exported = await callJson<ExportResult>(sourceClient, "export_memories", { path: archivePath });
+    assert.equal(exported.memories, 2);
+
+    const imported = await callJson<ImportResult>(destClient, "import_memories", { path: archivePath });
+    assert.equal(imported.imported, 2, "both the superseded memory and its successor must import");
+
+    const destItems = destStore.list({ limit: 200, includeSuperseded: true }).items;
+    const destMunich = destItems.find((m) => m.id === munich.id);
+    const destBerlin = destItems.find((m) => m.id === berlin.id);
+    assert.ok(destMunich, "the superseded Munich memory must survive the round trip");
+    assert.ok(destBerlin, "the successor Berlin memory must survive the round trip");
+    assert.ok(destMunich.validUntil !== null, "the Munich memory's validUntil must round-trip, not be dropped");
+    assert.equal(destMunich.supersededBy, berlin.id, "the Munich memory's supersededBy pointer must round-trip");
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.CAIRN_HOME;
+    } else {
+      process.env.CAIRN_HOME = originalHome;
+    }
+    await sourceClient.close();
+    await sourceServer.close();
+    await destClient.close();
+    await destServer.close();
+    sourceStore.close();
+    destStore.close();
+    rmSync(sourceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    rmSync(destDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
 });

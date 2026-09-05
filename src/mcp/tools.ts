@@ -14,14 +14,15 @@
 // orchestration is only ~60-70% reliable on its own.
 
 import { z } from "zod";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { resolve, sep } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { CallContext, Memory, SearchHit } from "../storage/index.js";
 import type { McpDeps } from "./deps.js";
 import { DASHBOARD_CLIENT } from "../config/identity.js";
-import { resolveCairnHome, ensureHome } from "../config/paths.js";
+import { resolveCairnHome, ensureHome, dbPath } from "../config/paths.js";
+import { runtimeFilePath } from "../daemon/runtime-file.js";
 import { exportArchive, importArchive, ArchiveFormatError } from "../portability/archive.js";
 import { recordAudit } from "../storage/repositories/audit.js";
 
@@ -185,6 +186,15 @@ function defaultExportPath(): string {
 // difference is who chose the path. Mirrors the prefix check in
 // src/dashboard/assets.ts: compare with a separator-terminated prefix, not a
 // bare startsWith, so a sibling directory like "<home>-evil" cannot pass.
+// import_memories takes an unconfined path (unlike export_memories, this one
+// is human-driven -- restoring a backup from wherever the user put it), so
+// it must not become a filesystem oracle: one fixed, path-free message for
+// every "nothing readable here" outcome (see below), and a size ceiling
+// checked with `statSync` before `readFileSync` ever loads the file into
+// memory.
+const IMPORT_NO_ARCHIVE_MESSAGE = "import_memories: no readable archive at that path";
+const MAX_IMPORT_ARCHIVE_BYTES = 200 * 1024 * 1024;
+
 function resolveWithinCairnHome(requested: string): string {
   const home = resolve(ensureHome(resolveCairnHome()));
   const candidate = resolve(home, requested);
@@ -192,6 +202,22 @@ function resolveWithinCairnHome(requested: string): string {
     throw new Error("export_memories: path must be inside the Cairn home directory");
   }
   return candidate;
+}
+
+// Being inside the Cairn home is necessary but not sufficient: the database
+// itself (and its WAL/SHM siblings) and the daemon's runtime file also live
+// there, and export_memories writing to any of THOSE names would truncate
+// the live store or the running daemon's rendezvous file instead of
+// producing a backup. Refuse those exact paths by identity, using the same
+// helpers the daemon uses to find them, rather than hardcoding filenames
+// that could drift out of sync.
+function refuseCairnOwnedPath(candidate: string): void {
+  const home = resolveCairnHome();
+  const db = dbPath(home);
+  const forbidden = new Set([db, `${db}-wal`, `${db}-shm`, runtimeFilePath(home)]);
+  if (forbidden.has(candidate)) {
+    throw new Error("export_memories: path must be inside the Cairn home directory");
+  }
 }
 
 /**
@@ -592,9 +618,9 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
       description:
         "Back up or move the user's whole memory store to a file on disk. Call this when the user asks to " +
         'back up, export, or move their memory to another machine. Example: the user says "back up my ' +
-        'memories before I reset my laptop" -- call export_memories(path: "~/cairn-backup.zip") (or omit ' +
-        "`path` for a timestamped default under the Cairn home). Returns the file's path, size, and counts -- " +
-        "never the memory contents themselves, so a large store never floods this response.",
+        'memories before I reset my laptop" -- call export_memories(path: "backup.zip") (or omit `path` for ' +
+        "a timestamped default under the Cairn home). Returns the file's path, size, and counts -- never the " +
+        "memory contents themselves, so a large store never floods this response.",
       inputSchema: {
         path: z
           .string()
@@ -609,8 +635,24 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         args.path && args.path.trim().length > 0
           ? resolveWithinCairnHome(args.path)
           : defaultExportPath();
-      const result = exportArchive(deps.store, { scope: args.scope });
-      writeFileSync(path, result.archive);
+      refuseCairnOwnedPath(path);
+      // includeSuperseded: true -- otherwise listMemories' default
+      // `valid_until IS NULL` filter silently drops every superseded row,
+      // and with it the §5/§7 temporal history (a supersede's old value and
+      // its `validUntil`/`supersededBy` pointer) this "backup" is supposed
+      // to preserve. Soft-deleted rows are left out (includeDeleted stays
+      // false): a memory the user has forgotten, especially one past its
+      // undo window, is not part of the store a backup is meant to restore.
+      const result = exportArchive(deps.store, { scope: args.scope, includeSuperseded: true });
+      try {
+        writeFileSync(path, result.archive, { flag: "wx" });
+      } catch (err) {
+        const code = err && typeof err === "object" && "code" in err ? (err as NodeJS.ErrnoException).code : undefined;
+        if (code === "EEXIST") {
+          throw new Error("export_memories: refuses to overwrite an existing file");
+        }
+        throw new Error("export_memories: failed to write the archive");
+      }
       recordAudit(deps.store.db, {
         action: "export",
         scope: args.scope ?? null,
@@ -635,7 +677,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         "replaces or overwrites anything: a memory whose id or content is already present is skipped, so " +
         "importing the same archive twice is safe and imports nothing the second time. Call this when the " +
         'user asks to restore a backup or bring memories over from another machine. Example: the user says ' +
-        '"load the memories I exported from my old laptop" -- call import_memories(path: "~/cairn-backup.zip"). ' +
+        '"load the memories I exported from my old laptop" -- call import_memories(path: "backup.zip"). ' +
         "Never present this as a destructive restore; it is additive only.",
       inputSchema: {
         path: z.string().min(1).describe("Path to a Cairn export archive (.zip) previously written by export_memories."),
@@ -645,21 +687,36 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
     async (args) => {
       requireEnabled(args.scope);
       const path = resolve(args.path);
-      if (!existsSync(path)) {
-        throw new Error(`import_memories: no file found at ${path}`);
-      }
       let archiveBuf: Buffer;
       try {
+        const stat = statSync(path);
+        if (!stat.isFile() || stat.size > MAX_IMPORT_ARCHIVE_BYTES) {
+          throw new Error(IMPORT_NO_ARCHIVE_MESSAGE);
+        }
         archiveBuf = readFileSync(path);
-      } catch (err) {
-        throw new Error(`import_memories: could not read ${path}: ${err instanceof Error ? err.message : String(err)}`);
+      } catch {
+        // Collapsed to one fixed, path-free string on purpose (BUILD_BRIEF
+        // §10): a nonexistent path, a directory, and an unreadable file are
+        // each an ordinary "no archive here" outcome to the caller, not
+        // three distinguishable ones -- letting them differ turns this tool
+        // into an existence-and-readability oracle over the filesystem for
+        // any connected MCP client.
+        throw new Error(IMPORT_NO_ARCHIVE_MESSAGE);
       }
       let result: { imported: number; skipped: number; memories: number };
       try {
         result = importArchive(deps.store, archiveBuf);
       } catch (err) {
+        // A file that reads fine but isn't a ZIP at all (e.g. /etc/shadow)
+        // is the same "no archive here" outcome as the two filesystem cases
+        // above, for the same oracle reason -- collapse it to the identical
+        // message. A real archive that fails deeper validation (checksum
+        // mismatch, unsupported format version, ...) proves the caller COULD
+        // read a real archive at that path, so it keeps its own message.
         if (err instanceof ArchiveFormatError) {
-          throw new Error(`import_memories: ${err.message}`);
+          throw new Error(
+            err.message.startsWith("not a valid Cairn archive") ? IMPORT_NO_ARCHIVE_MESSAGE : `import_memories: ${err.message}`,
+          );
         }
         throw err;
       }
