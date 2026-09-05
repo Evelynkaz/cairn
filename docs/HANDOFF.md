@@ -349,7 +349,11 @@ Older verification discipline that still holds:
 Split by who can move it, because most of what remains is not something
 the next session can pick up and finish alone.
 
-**Blocked on the project owner:**
+**Blocked on the project owner:** everything that blocks the actual publish
+— a payment method for CI, npm credentials, and disk space — plus the
+order to do it in and how to verify each step, is now
+[docs/RELEASING.md](RELEASING.md); read that instead of reconstructing the
+steps here.
 - **GitHub Actions billing.** Every CI run has failed in ~10s since 19:05 today with an account-payments message (§1b); nothing since `114cd47` is verified on Windows or macOS until this is fixed.
 - **`npm publish`.** The dry run passes; the real publish needs the owner's npm credentials.
 - **A real Claude or ChatGPT export.** `c2687d1`'s importer fixtures are built from documented and community-reported shapes, never a real Claude memory paste or a real ChatGPT `conversations.json` — the parsers are tested against constructed input, not reality, and only the owner can produce a real export to test against.

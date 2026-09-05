@@ -95,7 +95,8 @@ and ChatGPT custom-instructions importers — all under test.
 an automated browser test for the dashboard (it has been reviewed by hand,
 but nothing checks it in CI), and the release housekeeping in
 `docs/BUILD_BRIEF.md` §13/§15 (hero GIF, cross-OS smoke test of the
-published package).
+published package). See [docs/RELEASING.md](docs/RELEASING.md) for the
+publish runbook.
 
 **Deferred to v2+:** knowledge-graph / graph view, multi-user/teams/RBAC, cross-device sync, at-rest encryption (SQLCipher), opt-in LLM enrichment (fact extraction/summarization), feedback re-ranking, opt-in auto-capture hooks, a LanceDB large-scale backend, and auto-config for more clients.
 
