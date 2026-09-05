@@ -20,7 +20,7 @@ npm run verify-package
 copies the dashboard's static assets (HTML/CSS) into `dist/`.
 `npm run typecheck` chains the same three projects with `--noEmit`.
 `npm test` cleans `dist/`, rebuilds, and runs the whole suite with
-`node --test`; it is currently green (760 tests, 756 pass, 0 fail, 4
+`node --test`; it is currently green (799 tests, 795 pass, 0 fail, 4
 skipped) and is not re-run casually — see `package.json` for the exact
 script.
 `npm run verify-package` checks that `npm pack` would actually ship a

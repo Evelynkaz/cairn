@@ -14,9 +14,11 @@ the same state live.
 
 The dashboard is a static single-page app the daemon serves at `/ui`, backed
 by its own `/api` namespace on the same process (memories, episodes,
-timeline, audit log, connected clients, privacy actions); it has not yet
-been opened in a browser, so its correctness is only established by the
-`/api` handlers' own tests, not by rendering. A Claude Code `SessionStart`
+timeline, audit log, connected clients, privacy actions). The SPA now has
+six sections (memories, timeline, access log, connected apps, privacy,
+stats), all backed by that same `/api` namespace; it has been opened in a
+browser against a seeded store and reviewed by hand, in addition to the
+`/api` handlers' own tests — there is still no automated browser test. A Claude Code `SessionStart`
 hook (`cairn hook session-start`) calls `GET /api/context` on the local
 daemon and prints a token-budgeted (~800 token) memory block into the
 session, so recall does not depend on the model choosing to call a tool.

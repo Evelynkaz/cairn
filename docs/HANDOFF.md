@@ -31,7 +31,7 @@ dashboard routes that call them), and CI has been read as green on all
 three OSes rather than assumed. What is left is one human task (the GIFs)
 and the two standing gaps recorded in §8.
 
-Current test count: **760 tests, 756 pass, 0 fail, 4 skipped**. CI
+Current test count: **799 tests, 795 pass, 0 fail, 4 skipped**. CI
 (`.github/workflows/ci.yml`) has been read as green on Windows, macOS and
 Ubuntu on the two most recent runs, verified through `gh run list`/`gh run
 view` — not assumed. Getting there took four pushes that were red on the
@@ -64,10 +64,10 @@ $ npm run typecheck
 
 $ npm test          # runs: clean -> build -> node --test dist/**/*.test.js
 ...
-1..760
-# tests 760
+1..799
+# tests 799
 # suites 0
-# pass 756
+# pass 795
 # fail 0
 # cancelled 0
 # skipped 4
@@ -219,20 +219,24 @@ throughout the commit bodies in `git log`:
 ## 7. Open decisions that belong to the human
 
 - **The package name.** BUILD_BRIEF §0 flags `cairn` as a placeholder pending npm-name / GitHub-org / `.dev`-domain / trademark verification, with `Marrow` and `Loam` as fallbacks (possible suffix: `cairn-mcp`, `usecairn`). `package.json` currently says `"name": "cairn"`. This needs a human to actually check availability before publish.
-- **Publishing.** `package.json` has `"private": true` today, but `cairn setup` (`src/setup/apply.ts`, `src/cli/commands.ts`, `src/cli/index.ts`) writes `npx -y cairn@latest` into every client config it generates. That line will not work for any real user until the package is published under whatever name §0 settles on — a human decision (npm account, publish flow), not an agent one.
+- **Publishing.** `package.json` is publishable as of 0.1.0 (no `"private"` key), but `cairn setup` (`src/setup/apply.ts`, `src/cli/commands.ts`, `src/cli/index.ts`) writes `npx -y cairn@latest` into every client config it generates. That line will not work for any real user until the package is actually published under whatever name §0 settles on — what blocks publication is the unresolved package name above, not the `private` flag — a human decision (npm account, publish flow), not an agent one.
 - **The demo/hero GIF.** BUILD_BRIEF §15 wants a hero GIF (Claude tells it something, Cursor recalls it) and a launch demo GIF (VHS/asciinema) — both need a human at a screen with a working dashboard. The dashboard exists now (M7 shipped) and the vendor importers are reachable from it (M10 shipped), so this is unblocked except for the human and the screen.
 
 ## 8. What comes next
 
-Milestone 11's GIFs (§7) are the only remaining scheduled work. Two
-standing gaps, not scheduled to any milestone but real and worth a fresh
-session knowing about immediately rather than discovering by surprise:
+Milestone 11's GIFs (§7) are the only remaining scheduled work. One
+standing gap remains open; the other, recorded here for a while, is now
+closed:
 
-- **The dashboard SPA has never been rendered in an actual browser.** No
-  browser is available on this machine. Everything claimed about it in
-  this document and in the commit bodies it draws from is verified by
-  asset delivery (the static server tests), type checking across all
-  three `tsconfig`s, unit tests, and code review — not by looking at it.
+- **CLOSED 2026-09-05: the dashboard SPA had never been rendered in an
+  actual browser.** The daemon was started on this machine, the store was
+  seeded with real data (14 live memories across 3 scopes, a superseded
+  Munich→Berlin pair, a soft-deleted memory, a redacted AWS key, 15
+  episodes), and the project owner opened `http://localhost:8787/ui`
+  through an SSH tunnel and reviewed it by hand — verdict: it looks good,
+  and all 12 UI assets served with correct content types. That establishes
+  human review of the rendered SPA; it does not establish automated
+  browser/end-to-end test coverage, which still does not exist.
 - **The Claude/ChatGPT vendor importers have never been run against a
   real export.** `c2687d1`'s test fixtures for both formats are built
   from documented and community-reported shapes, not a real Claude

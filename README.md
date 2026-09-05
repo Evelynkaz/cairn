@@ -7,14 +7,14 @@
 ![CI](https://github.com/Evelynkaz/cairn/actions/workflows/ci.yml/badge.svg)
 ![Node >=22.13](https://img.shields.io/badge/node-%3E%3D22.13-brightgreen.svg)
 
-<!-- ![Cairn dashboard hero screenshot](assets/hero.png) -->
+![Cairn dashboard hero screenshot](assets/hero.png)
 
 > Status: pre-release. The daemon, dashboard API, all MCP tools, the
 > SessionStart recall hook, and export/import are implemented and covered
-> by tests (760 tests, 756 passing, 0 failing, 4 skipped; CI green on
-> Linux/macOS/Windows). It is not yet published to npm (`package.json` is still
-> `"private": true`) and the dashboard UI has never been rendered in a
-> browser — only its API handlers are tested.
+> by tests (799 tests, 795 passing, 0 failing, 4 skipped; CI green on
+> Linux/macOS/Windows). It is not yet published to npm. The dashboard UI
+> has now been reviewed by hand in a browser against a seeded store and
+> judged good; no automated browser test exists yet.
 
 ## Why
 
@@ -42,6 +42,18 @@ node dist/cli/index.js ui     # open the dashboard
 ## Architecture
 
 A single local daemon owns one WAL-mode SQLite file (`sqlite-vec` + FTS5) as the single source of truth for memory. MCP clients connect either directly over Streamable HTTP or through a small stdio→HTTP shim (for stdio-only clients like Claude Desktop), so every client — Claude, Cursor, and others — shares the same store and sees the same state. Retrieval is hybrid: vector KNN and FTS5 keyword search fused with Reciprocal Rank Fusion, re-ranked by relevance, recency, and importance. Embeddings run locally via ONNX (no API key, no network call) by default.
+
+## Dashboard
+
+`cairn ui` opens a real dashboard served by the daemon, with six sections:
+memories (list/search/inline edit/bulk forget with undo), timeline (the
+store as of any instant, excluding memories you have since forgotten),
+access log, connected apps, privacy (redaction
+mode, masked findings, delete-everything, shown in `assets/privacy.png`),
+and stats (`assets/stats.png`). See `assets/access-log.png` and
+`assets/timeline.png` for the others. For setup details see
+[docs/INSTALL.md](docs/INSTALL.md); for the MCP tools it sits alongside,
+see [docs/TOOLS.md](docs/TOOLS.md).
 
 ## Tools
 
@@ -75,13 +87,14 @@ SessionStart recall hook, and export/import with pasted Claude/ChatGPT text
 and ChatGPT custom-instructions importers — all under test.
 
 **Still open before v1 is "done":** publishing to npm so `npx cairn` works,
-verifying the dashboard actually renders correctly in a browser, and the
-release housekeeping in `docs/BUILD_BRIEF.md` §13/§15 (hero GIF, cross-OS
-smoke test of the published package).
+an automated browser test for the dashboard (it has been reviewed by hand,
+but nothing checks it in CI), and the release housekeeping in
+`docs/BUILD_BRIEF.md` §13/§15 (hero GIF, cross-OS smoke test of the
+published package).
 
 **Deferred to v2+:** knowledge-graph / graph view, multi-user/teams/RBAC, cross-device sync, at-rest encryption (SQLCipher), opt-in LLM enrichment (fact extraction/summarization), feedback re-ranking, opt-in auto-capture hooks, a LanceDB large-scale backend, and auto-config for more clients.
 
-See [docs/BUILD_BRIEF.md](docs/BUILD_BRIEF.md) for the full spec.
+See [docs/BUILD_BRIEF.md](docs/BUILD_BRIEF.md) for the full spec, [docs/INSTALL.md](docs/INSTALL.md) for per-client install steps, [docs/TOOLS.md](docs/TOOLS.md) for the MCP tool reference, and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## FAQ
 
@@ -112,8 +125,9 @@ Note the vendor-side importers (pasted Claude/ChatGPT memory text, ChatGPT
 custom instructions) have not yet been exercised against a real export from
 either product.
 
-**What's not built yet?** Publishing to npm, a rendered/screenshotted
-dashboard, and everything under "Deferred to v2+" below.
+**What's not built yet?** Publishing to npm, an automated browser test for
+the dashboard (it has been reviewed by hand and looks good, but nothing
+checks it in CI), and everything under "Deferred to v2+" below.
 
 ## Contributing
 
