@@ -47,6 +47,7 @@ import { resolvePrivacyMode, setPrivacyMode } from "./privacy-settings.js";
 import type { PrivacyConfig } from "./privacy-settings.js";
 import { listRedactions, countRedactionsByKind } from "./repositories/redactions.js";
 import type { ListRedactionsOptions, ListRedactionsResult, RedactionKindCount } from "./repositories/redactions.js";
+import { MAX_TAGS, MAX_TAG_LENGTH, MAX_SCOPE_LENGTH, MAX_CONTENT_LENGTH } from "./limits.js";
 
 export interface StoreOptions {
   path?: string;
@@ -326,13 +327,9 @@ function isEpisodeForgotten(episode: Episode): boolean {
 // on THIS Store are the one chokepoint every write path shares -- HTTP,
 // every MCP tool, and both import methods all call in here -- so the bound
 // has to live here too, or an MCP client (which never touches api.ts) still
-// reaches an unbounded store. These limits are the SAME numbers api.ts
-// enforces (32 tags, 64 chars/tag, 128 chars of scope); store.ts cannot
-// import them from the dashboard layer without introducing a cycle (api.ts
-// already depends on store.ts, not the reverse), so they are restated here
-// deliberately -- a different number in each place would be worse than
-// either number alone, so keep these two literally in sync by hand if they
-// ever change.
+// reaches an unbounded store. The limit numbers themselves live in
+// ./limits.js, imported by both this file and api.ts, so the two
+// enforcement sites can never drift apart the way they already have once.
 //
 // A cap is refused with a thrown Error, never silently truncated: api.ts
 // already decided a 400 is right at the HTTP boundary because the caller
@@ -341,27 +338,11 @@ function isEpisodeForgotten(episode: Episode): boolean {
 // equally retry with a shorter list, whereas truncating would silently drop
 // tags a user asked to keep, which is data loss they never asked for and
 // never observe.
-const MAX_TAGS = 32;
-const MAX_TAG_LENGTH = 64;
-const MAX_SCOPE_LENGTH = 128;
-
-// Separately, nothing anywhere bounded a memory's own TEXT length: a 4 MB
-// memory made list_memories's default page return 7.8 MB, and a 20 MB one
-// crashed the ingest path with a raw V8 "Maximum call stack size exceeded"
-// out of the redaction regex (../privacy/detectors.ts runs against this
-// exact string on every one of the four ingest paths below) -- surfaced
-// straight to the client, and a persistent one: every later list/recall
-// pays for one oversized write forever, which is exactly the "bound every
-// tool's output" rule (BUILD_BRIEF §12) this violates. 64 KiB is chosen as
-// comfortably larger than any real note, transcript excerpt or pasted
-// snippet this product's memories are for (§1: not document storage), while
-// keeping the redaction regex pass, the FTS index and every paginated read
-// far away from the input sizes that produced the measured crash. Checked
-// and refused BEFORE redactText ever runs, for the same reason the regex
-// crashed in the first place -- an over-cap string must never reach that
-// pass at all, so refusing here also doubles as the fix for the stack
-// exhaustion, not just the byte-count amplification.
-const MAX_CONTENT_LENGTH = 65536;
+//
+// Checked and refused BEFORE redactText ever runs, for the same reason the
+// regex crashed in the first place (see ./limits.js) -- an over-cap string
+// must never reach that pass at all, so refusing here also doubles as the
+// fix for the stack exhaustion, not just the byte-count amplification.
 
 function assertTagsWithinCap(tags: string[] | undefined): void {
   if (tags === undefined) return;

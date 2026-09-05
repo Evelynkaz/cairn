@@ -146,6 +146,25 @@ export interface SearchResult {
   degradedReason: string | null;
 }
 
+// Shared by src/dashboard/api.ts and src/mcp/tools.ts: `degradedReason`
+// above is whatever text an HTTP-backed embedding provider's failure
+// carried out of this module's own catch block, which can embed
+// `${response.status} ${readBodyExcerpt(...)}` of the upstream response --
+// a provider URL, a host name, or raw upstream error body. That text must
+// never reach an HTTP or MCP caller verbatim (the no-echo rule both of
+// those layers apply over this daemon), so both consumers replace it with
+// this fixed, safe value instead. `degraded` (the boolean) is untouched;
+// it is already safe and is what callers need. `rawReason`, when given, is
+// logged to stderr only -- for whoever operates this daemon -- never
+// forwarded to the caller.
+export type SafeDegradedReason = "embedding_failed" | null;
+export function toSafeDegradedReason(degraded: boolean, rawReason: string | null = null): SafeDegradedReason {
+  if (degraded && rawReason) {
+    console.error(`degraded retrieval: ${rawReason}`);
+  }
+  return degraded ? "embedding_failed" : null;
+}
+
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 50;
 const DEFAULT_CANDIDATE_LIMIT = 50;

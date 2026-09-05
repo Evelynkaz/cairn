@@ -25,6 +25,7 @@ import { resolveCairnHome, ensureHome, dbPath } from "../config/paths.js";
 import { runtimeFilePath } from "../daemon/runtime-file.js";
 import { exportArchive, importArchive, ArchiveFormatError } from "../portability/archive.js";
 import { recordAudit } from "../storage/repositories/audit.js";
+import { toSafeDegradedReason } from "../retrieval/search.js";
 
 // The label used when a connected client did not identify itself (a bare
 // stdio pipe, or a client that skips clientInfo). Kept distinct from `null`
@@ -96,24 +97,6 @@ function hitToJson(hit: SearchHit): Record<string, unknown> {
 
 function jsonResult(data: unknown): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-}
-
-// Mirrors src/dashboard/api.ts's toSafeDegradedReason: the retrieval layer's
-// raw `degradedReason` (src/retrieval/search.ts's catch block) is whatever
-// text an HTTP-backed embedding provider's failure carried, which can embed
-// `${response.status} ${readBodyExcerpt(...)}` of the upstream response --
-// a provider URL, a host name, or raw upstream error body. That text must
-// never reach an MCP client verbatim (the same no-echo rule the dashboard's
-// API already applies over this daemon); keep the detail on stderr only and
-// return this fixed value instead. `degraded` (the boolean) is untouched.
-type SafeDegradedReason = "embedding_failed" | null;
-function toSafeDegradedReason(degraded: boolean, rawReason: string | null): SafeDegradedReason {
-  if (degraded && rawReason) {
-    // The detailed, potentially upstream-carrying text stays on stderr for
-    // whoever operates this daemon -- it never reaches the MCP client.
-    console.error(`degraded retrieval: ${rawReason}`);
-  }
-  return degraded ? "embedding_failed" : null;
 }
 
 // Picks the first non-blank value, in order -- how remember/recall/get_context/

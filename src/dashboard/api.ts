@@ -13,6 +13,8 @@ import { PayloadTooLargeError, readJsonBody, sendJson, tokenMatches } from "../d
 import { DASHBOARD_CLIENT } from "../config/identity.js";
 import { LiveTextCollisionError } from "../storage/repositories/memories.js";
 import { extractCustomInstructions, ImporterFormatError, parsePastedMemories } from "../portability/importers/index.js";
+import { toSafeDegradedReason } from "../retrieval/search.js";
+import { MAX_TAGS, MAX_TAG_LENGTH, MAX_SCOPE_LENGTH } from "../storage/limits.js";
 
 // Re-exported for callers that already import it from here.
 export { DASHBOARD_CLIENT };
@@ -136,23 +138,6 @@ function validateImportance(value: unknown): number | undefined {
   return value;
 }
 
-// Shared by GET /api/context and GET /api/memories?q=... (search mode): both
-// surface the retrieval layer's `degraded`/`degradedReason` (BUILD_BRIEF §7),
-// but the raw `degradedReason` string set at src/retrieval/search.ts's catch
-// block is `error instanceof Error ? error.message : String(error)` -- the
-// unmodified text thrown by whatever embedding provider is configured
-// (Ollama, OpenAI, Voyage, ..., all HTTP-backed per BUILD_BRIEF §3). That
-// text originates outside our code and can carry a provider URL, a host
-// name, a file path, or an upstream API's raw error body. The no-echo rule
-// in ../daemon/server.ts -- an error's own text never reaches an HTTP caller
-// -- applies to it exactly like any other error text, so it is dropped here
-// and replaced with a fixed, safe value. `degraded` (the boolean) is left
-// untouched; it is already safe and is what the UI needs.
-type SafeDegradedReason = "embedding_failed" | null;
-function toSafeDegradedReason(degraded: boolean): SafeDegradedReason {
-  return degraded ? "embedding_failed" : null;
-}
-
 // A pasted import's `tags` array is re-applied to EVERY entry parsed out of
 // `text` (handleImportPasted below), so nothing here bounding array length
 // or per-tag length means N entries x unbounded tags becomes unbounded rows
@@ -161,10 +146,10 @@ function toSafeDegradedReason(degraded: boolean): SafeDegradedReason {
 // shared by every other write path in this file that accepts a caller-
 // supplied `tags` array (PATCH, supersede) for the same reason. A cap is
 // refused with a fixed 400 rather than silently truncated, so a paste that
-// looks like it worked never silently drops the user's own tags.
-const MAX_TAGS = 32;
-const MAX_TAG_LENGTH = 64;
-const MAX_SCOPE_LENGTH = 128;
+// looks like it worked never silently drops the user's own tags. The limit
+// numbers themselves live in ../storage/limits.js, imported by both this
+// file and store.ts, so the two enforcement sites can never drift apart the
+// way they already have once.
 
 function clampTags(tags: unknown[]): string[] {
   if (tags.length > MAX_TAGS) {
