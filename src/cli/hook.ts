@@ -77,6 +77,51 @@ function isContextApiResponse(value: unknown): value is ContextApiResponse {
   return typeof value === "object" && value !== null;
 }
 
+// The server-side ~800-token budget (src/retrieval/context.ts) is the
+// intended limit, but this hook must not simply trust it: a daemon on a
+// hand-edited CAIRN_PORT, or any process that wins the port race, can
+// return an arbitrarily large body. 64 KB is generous headroom over an
+// 800-token response (a few KB at most) while still being far short of
+// anything that could meaningfully pollute a model's context window.
+const MAX_RESPONSE_BYTES = 64 * 1024;
+
+// The hard ceiling on the injected text itself, applied even to a
+// well-formed response that merely claims to respect the server-side
+// budget -- the last line of defence against §14's context-pollution
+// failure. ~4 chars/token is a conservative rule of thumb, so this is
+// comfortably above the ~800-token budget without being large enough to
+// matter if the budget is ever miscalculated upstream.
+const MAX_TEXT_CHARS = 6_000;
+
+// Reads the response body up to MAX_RESPONSE_BYTES and abandons it past
+// that point, rather than trusting a `content-length` header that may be
+// absent or wrong -- a chunked or lying response must not be buffered
+// unboundedly just because we couldn't check its length up front.
+async function readBodyCapped(res: Response): Promise<string | null> {
+  const reader = res.body?.getReader();
+  if (!reader) {
+    // No streaming body available (e.g. a test double) -- fall back to
+    // res.text(), which is still bounded by the content-length check the
+    // caller already performed.
+    return res.text();
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.byteLength;
+      if (total > MAX_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+  }
+  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+}
+
 async function fetchContextText(info: RuntimeInfo, deadlineAt: number): Promise<string | null> {
   const remaining = deadlineAt - Date.now();
   if (remaining <= 0) return null;
@@ -90,11 +135,21 @@ async function fetchContextText(info: RuntimeInfo, deadlineAt: number): Promise<
     if (!res.ok) {
       return null;
     }
-    const body: unknown = await res.json();
+    // Reject an oversized body without ever reading it, when the daemon
+    // was honest enough to declare its size.
+    const contentLength = res.headers.get("content-length");
+    if (contentLength !== null && Number(contentLength) > MAX_RESPONSE_BYTES) {
+      return null;
+    }
+    const raw = await readBodyCapped(res);
+    if (raw === null) {
+      return null;
+    }
+    const body: unknown = JSON.parse(raw);
     if (!isContextApiResponse(body) || typeof body.text !== "string" || body.text.trim() === "") {
       return null;
     }
-    return body.text;
+    return body.text.length > MAX_TEXT_CHARS ? body.text.slice(0, MAX_TEXT_CHARS) : body.text;
   } catch {
     // Covers a network error, our own deadline abort, and malformed JSON --
     // all of these mean "inject nothing", never a thrown error.

@@ -68,6 +68,32 @@ test("embeddings status/enable/disable parse", () => {
   assert.deepEqual(parseArgs(["embeddings", "disable"]), { command: "embeddings-disable" });
 });
 
+test("hook session-start parses", () => {
+  assert.deepEqual(parseArgs(["hook", "session-start"]), { command: "hook-session-start" });
+});
+
+test("unknown hook subcommand names the offender and lists valid subcommands", () => {
+  const result = parseArgs(["hook", "frobnicate"]);
+  assert.equal(result.command, "error");
+  assert.ok(result.command === "error");
+  assert.match(result.message, /unknown "cairn hook" subcommand "frobnicate"/);
+  assert.match(result.message, /session-start/);
+});
+
+test("hook with no subcommand is a usage error, not a crash", () => {
+  const result = parseArgs(["hook"]);
+  assert.equal(result.command, "error");
+  assert.ok(result.command === "error");
+  assert.match(result.message, /unknown "cairn hook" subcommand ""/);
+});
+
+test("hook session-start rejects unexpected flags like the other commands", () => {
+  const result = parseArgs(["hook", "session-start", "--bogus"]);
+  assert.equal(result.command, "error");
+  assert.ok(result.command === "error");
+  assert.match(result.message, /unknown flag "--bogus"/);
+});
+
 test("unknown command names the offender and lists valid commands", () => {
   const result = parseArgs(["frobnicate"]);
   assert.equal(result.command, "error");

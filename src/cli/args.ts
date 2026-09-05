@@ -218,6 +218,8 @@ export function parseArgs(argv: string[]): ParsedCommand {
       return parseSetup(rest);
     case "embeddings":
       return parseEmbeddings(rest);
+    case "hook":
+      return parseHook(rest);
     default:
       return {
         command: "error",

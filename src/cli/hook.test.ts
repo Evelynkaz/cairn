@@ -1,0 +1,331 @@
+// Exercises the `cairn hook session-start` command (BUILD_BRIEF §8) against
+// isolated temp homes -- no test here touches the developer's real
+// ~/.cairn, and every process/server this file spawns is closed in a
+// `finally`. The safety contract (always exit 0, stdout is empty or exactly
+// one envelope object, own deadline honoured) matters more than the
+// feature, so most tests below assert that contract directly.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { Server as HttpServer } from "node:http";
+import { Readable } from "node:stream";
+import { withTempDirAsync } from "../testing/tmp.js";
+import { ensureDaemon } from "../shim/ensure-daemon.js";
+import { generateToken, writeRuntimeFile } from "../daemon/runtime-file.js";
+import { dbPath } from "../config/paths.js";
+import { openStore } from "../storage/store.js";
+import { runSessionStartHook } from "./hook.js";
+import type { SessionStartHookOptions } from "./hook.js";
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function killPid(pid: number | undefined | null): Promise<void> {
+  if (pid === undefined || pid === null || !isPidAlive(pid)) {
+    return;
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    return;
+  }
+  const deadline = Date.now() + 2000;
+  while (isPidAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+// A never-resolving daemon-start seam: this must be injected into every
+// test that must not spawn a real background daemon process, per the
+// test-only `startDaemon` option hook.ts exposes for exactly this reason.
+function neverStartDaemon(): Promise<{ url: string; token: string; started: boolean; pid?: number }> {
+  return new Promise(() => {});
+}
+
+// Asserts the one thing every test in this file cares about: stdout is
+// either completely empty, or exactly one parseable JSON object shaped
+// like the SessionStart envelope -- never a diagnostic line, never partial
+// output.
+function assertEnvelopeOrEmpty(stdout: string): void {
+  if (stdout === "") {
+    return;
+  }
+  const parsed: unknown = JSON.parse(stdout);
+  assert.ok(typeof parsed === "object" && parsed !== null);
+  const body = parsed as Record<string, unknown>;
+  const keys = Object.keys(body);
+  assert.deepEqual(keys, ["hookSpecificOutput"]);
+  const inner = body["hookSpecificOutput"] as Record<string, unknown>;
+  assert.deepEqual(Object.keys(inner).sort(), ["additionalContext", "hookEventName"]);
+  assert.equal(inner["hookEventName"], "SessionStart");
+  assert.equal(typeof inner["additionalContext"], "string");
+}
+
+test("with a running daemon and seeded memories, stdout is exactly the envelope and contains the memory text", async () => {
+  await withTempDirAsync(async (dir) => {
+    const store = openStore({ path: dbPath(dir) });
+    store.remember({ content: "the user's favourite editor is neovim, set on 2026-01-01" });
+    store.close();
+
+    const result = await ensureDaemon({ home: dir, env: { ...process.env, CAIRN_PORT: "0" } });
+    const pid = result.spawnedPid;
+    assert.ok(typeof pid === "number", "ensureDaemon must have spawned a daemon for a fresh temp home");
+    try {
+      const hookResult = await runSessionStartHook({ home: dir });
+      assertEnvelopeOrEmpty(hookResult.stdout);
+      assert.notEqual(hookResult.stdout, "", "expected non-empty context for a seeded store");
+      const parsed = JSON.parse(hookResult.stdout) as {
+        hookSpecificOutput: { additionalContext: string };
+      };
+      assert.match(parsed.hookSpecificOutput.additionalContext, /neovim/);
+    } finally {
+      await killPid(pid);
+    }
+  });
+});
+
+test("with no daemon running, stdout is completely empty and the command reports exit 0", async () => {
+  await withTempDirAsync(async (dir) => {
+    // startDaemon is stubbed so this genuinely exercises "no runtime file
+    // found" rather than racing a real background daemon spawn -- the
+    // production path (fire-and-forget startDaemonDetached) is covered by
+    // the args/wiring, not re-spawned here.
+    const options: SessionStartHookOptions = { home: dir, startDaemon: neverStartDaemon };
+    const result = await runSessionStartHook(options);
+    assert.equal(result.stdout, "");
+  });
+});
+
+test("with a daemon that answers 401 (wrong token), stdout is empty", async () => {
+  await withTempDirAsync(async (dir) => {
+    const server: HttpServer = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pid: process.pid }));
+        return;
+      }
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+    });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resolve(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    writeRuntimeFile({ pid: process.pid, port, token: generateToken(), startedAt: Date.now(), version: "0.1.0" }, dir);
+    try {
+      const result = await runSessionStartHook({ home: dir, startDaemon: neverStartDaemon });
+      assert.equal(result.stdout, "");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+test("with a daemon that answers 500, stdout is empty", async () => {
+  await withTempDirAsync(async (dir) => {
+    const server: HttpServer = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pid: process.pid }));
+        return;
+      }
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "internal error" }));
+    });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resolve(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    writeRuntimeFile({ pid: process.pid, port, token: generateToken(), startedAt: Date.now(), version: "0.1.0" }, dir);
+    try {
+      const result = await runSessionStartHook({ home: dir, startDaemon: neverStartDaemon });
+      assert.equal(result.stdout, "");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+test("with a daemon that hangs on /api/context, the hook still returns within its own deadline with empty stdout", async () => {
+  await withTempDirAsync(async (dir) => {
+    // /health answers immediately (so isDaemonAlive reports the daemon as
+    // alive and this genuinely drives the /api/context timeout path, not
+    // the "no live daemon" path) but /api/context never responds --
+    // this is how a wedged daemon is simulated without a real one.
+    const server: HttpServer = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pid: process.pid }));
+        return;
+      }
+      // Never call res.end() or res.write(): the connection just hangs.
+    });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resolve(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    writeRuntimeFile({ pid: process.pid, port, token: generateToken(), startedAt: Date.now(), version: "0.1.0" }, dir);
+    const deadlineMs = 300;
+    try {
+      const startedAt = Date.now();
+      const result = await runSessionStartHook({ home: dir, deadlineMs, startDaemon: neverStartDaemon });
+      const elapsed = Date.now() - startedAt;
+      assert.equal(result.stdout, "");
+      assert.ok(elapsed < deadlineMs + 1000, `expected the hook to return near its ${deadlineMs}ms deadline, took ${elapsed}ms`);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+test("with a malformed JSON response, stdout is empty", async () => {
+  await withTempDirAsync(async (dir) => {
+    const server: HttpServer = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pid: process.pid }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{not json");
+    });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resolve(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    writeRuntimeFile({ pid: process.pid, port, token: generateToken(), startedAt: Date.now(), version: "0.1.0" }, dir);
+    try {
+      const result = await runSessionStartHook({ home: dir, startDaemon: neverStartDaemon });
+      assert.equal(result.stdout, "");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+test("a response declaring an oversized content-length is rejected without reading the body", async () => {
+  await withTempDirAsync(async (dir) => {
+    const server: HttpServer = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pid: process.pid }));
+        return;
+      }
+      // Declares a body far larger than the hook's ceiling but never
+      // actually sends that many bytes -- if the hook trusted the header
+      // only for validation but still read the (short) body, this would
+      // pass for the wrong reason, so the assertion is on stdout alone.
+      const oversized = JSON.stringify({ text: "x".repeat(100) });
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "content-length": String(100 * 1024),
+      });
+      res.end(oversized);
+    });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resolve(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    writeRuntimeFile({ pid: process.pid, port, token: generateToken(), startedAt: Date.now(), version: "0.1.0" }, dir);
+    try {
+      const result = await runSessionStartHook({ home: dir, startDaemon: neverStartDaemon });
+      assert.equal(result.stdout, "");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+test("a response with no content-length but an oversized body is abandoned, stdout empty", async () => {
+  await withTempDirAsync(async (dir) => {
+    const server: HttpServer = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pid: process.pid }));
+        return;
+      }
+      // No content-length header at all (chunked), and a body that
+      // exceeds the hook's hard byte cap -- the "lying or absent header"
+      // case the cap must also guard.
+      res.writeHead(200, { "content-type": "application/json" });
+      const huge = JSON.stringify({ text: "x".repeat(200 * 1024) });
+      res.end(huge);
+    });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resolve(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    writeRuntimeFile({ pid: process.pid, port, token: generateToken(), startedAt: Date.now(), version: "0.1.0" }, dir);
+    try {
+      const result = await runSessionStartHook({ home: dir, startDaemon: neverStartDaemon });
+      assert.equal(result.stdout, "");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+test("a well-formed but over-budget text field is truncated, never emitted whole", async () => {
+  await withTempDirAsync(async (dir) => {
+    const longText = "y".repeat(10_000);
+    const server: HttpServer = createServer((req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pid: process.pid }));
+        return;
+      }
+      const payload = JSON.stringify({ text: longText });
+      res.writeHead(200, { "content-type": "application/json", "content-length": String(Buffer.byteLength(payload)) });
+      res.end(payload);
+    });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resolve(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    writeRuntimeFile({ pid: process.pid, port, token: generateToken(), startedAt: Date.now(), version: "0.1.0" }, dir);
+    try {
+      const result = await runSessionStartHook({ home: dir, startDaemon: neverStartDaemon });
+      assertEnvelopeOrEmpty(result.stdout);
+      assert.notEqual(result.stdout, "");
+      const parsed = JSON.parse(result.stdout) as {
+        hookSpecificOutput: { additionalContext: string };
+      };
+      assert.ok(parsed.hookSpecificOutput.additionalContext.length < longText.length);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+test("stdin is drained without being required, and never blocks the hook", async () => {
+  await withTempDirAsync(async (dir) => {
+    // A readable that never ends (like Claude Code's real stdin write can
+    // look, mid-write) -- proving the hook does not wait for it.
+    const neverEndingStdin = new Readable({ read() {} });
+    neverEndingStdin.push("some payload");
+    const result = await runSessionStartHook({ home: dir, stdin: neverEndingStdin, startDaemon: neverStartDaemon });
+    assert.equal(result.stdout, "");
+    neverEndingStdin.destroy();
+  });
+});

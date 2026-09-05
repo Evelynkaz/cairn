@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ParsedCommand } from "./args.js";
 import { TOP_LEVEL_COMMANDS } from "./args.js";
+import { runSessionStartHook } from "./hook.js";
 import {
   daemonStatus,
   disableEmbeddings,
@@ -69,6 +70,8 @@ Usage:
   cairn embeddings status [--json]
   cairn embeddings enable [--provider=<name>] [--model=<id>]
   cairn embeddings disable
+  cairn hook session-start       print a Claude Code SessionStart hook envelope
+                                  (see docs/RECALL_HOOK.md); never fails the session
   cairn help | --help | -h       show this help
   cairn --version                show the installed version
 
@@ -409,6 +412,23 @@ export async function runEmbeddingsDisable(ctx: CommandContext): Promise<number>
   }
 }
 
+// The hook's own contract (see hook.ts's header) is to never throw and to
+// never produce a non-empty result on any failure path -- but this wrapper
+// still catches defensively and always returns 0, so that even a bug that
+// violates that contract cannot turn a SessionStart hook into something
+// that blocks or visibly fails a session.
+export async function runHookSessionStart(ctx: CommandContext): Promise<number> {
+  try {
+    const result = await runSessionStartHook({ home: ctx.home, stdin: process.stdin });
+    if (result.stdout) {
+      ctx.out(result.stdout);
+    }
+  } catch {
+    // Never surface anything here -- see hook.ts's header comment.
+  }
+  return 0;
+}
+
 export function runHelp(ctx: CommandContext): number {
   ctx.out(helpText());
   return 0;
@@ -452,6 +472,8 @@ export async function runCommand(parsed: ParsedCommand, ctx: CommandContext): Pr
       return runEmbeddingsEnable(ctx, { provider: parsed.provider, modelId: parsed.modelId });
     case "embeddings-disable":
       return runEmbeddingsDisable(ctx);
+    case "hook-session-start":
+      return runHookSessionStart(ctx);
     case "error":
       return runError(ctx, parsed.message);
     case "mcp":
