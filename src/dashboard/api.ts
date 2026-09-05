@@ -49,11 +49,20 @@ const MAX_BULK_IDS = 200;
 // laptop, `curl | head`) -- see the backpressure handling in handleEvents.
 const SSE_BACKPRESSURE_CAP_BYTES = 1024 * 1024;
 
+// The only discriminator a 409's body ever carries (see handlePatchMemory,
+// handleRestoreMemory and handleSupersedeMemory below): drawn from which
+// code path threw, never from an error's own message, so a client can tell
+// "this memory is history" apart from "that text already exists elsewhere"
+// without anything user-supplied ever leaking into the enum.
+type ConflictReason = "superseded" | "duplicate_text";
+
 class HttpError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  readonly reason?: ConflictReason;
+  constructor(status: number, message: string, reason?: ConflictReason) {
     super(message);
     this.status = status;
+    this.reason = reason;
   }
 }
 
@@ -104,6 +113,15 @@ function parseRequiredIntParam(url: URL, name: string): number | undefined {
 // client mistake (a stale bookmark, a hand-edited URL), not a server fault.
 function isMalformedCursorError(err: unknown): boolean {
   return err instanceof Error && /malformed .*cursor/i.test(err.message);
+}
+
+// Matches ONLY store.remember's strict-mode refusal (src/storage/store.ts),
+// whose message is a fixed prefix followed by kind names and counts, never
+// a value or a preview -- so testing the prefix here is safe and does not
+// forward anything user-supplied. Any other throw (e.g. a disabled client,
+// a read-only store) is a genuine failure and must still propagate.
+function isStrictRedactionRefusal(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith("remember refused: found ");
 }
 
 // Shared by the memory patch and supersede handlers: `importance` is a
@@ -253,7 +271,7 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     // store's rules forbid, not a server fault -- answer it as a conflict
     // rather than letting store.update's throw fall into the generic 500.
     if (current.validUntil !== null) {
-      throw new HttpError(409, "conflict");
+      throw new HttpError(409, "conflict", "superseded");
     }
     // Same rationale as handleSupersedeMemory below: catch the store's typed
     // collision error and map it to 409, without ever forwarding its
@@ -263,7 +281,7 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       memory = store.update(id, patch, CTX);
     } catch (err) {
       if (err instanceof LiveTextCollisionError) {
-        throw new HttpError(409, "conflict");
+        throw new HttpError(409, "conflict", "duplicate_text");
       }
       throw err;
     }
@@ -284,7 +302,7 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       restored = store.restore(id, CTX);
     } catch (err) {
       if (err instanceof LiveTextCollisionError) {
-        throw new HttpError(409, "conflict");
+        throw new HttpError(409, "conflict", "duplicate_text");
       }
       throw err;
     }
@@ -312,7 +330,7 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       result = store.supersede(id, { text, tags, importance }, CTX);
     } catch (err) {
       if (err instanceof LiveTextCollisionError) {
-        throw new HttpError(409, "conflict");
+        throw new HttpError(409, "conflict", "duplicate_text");
       }
       throw err;
     }
@@ -513,18 +531,32 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     const parsed = parsePastedMemories(text);
     let imported = 0;
     let skipped = 0;
+    let refused = 0;
+    // Each entry is its own store.remember call/transaction, so a strict-mode
+    // refusal on one entry must not abort the rest -- caught and counted
+    // per entry, exactly like handleBulk's per-id handling above. Anything
+    // that is NOT that specific refusal is a genuine bug and still propagates
+    // to the generic 500 handler rather than being swallowed here.
     for (const entry of parsed) {
-      const result = store.remember({ content: entry.text, scope, tags }, CTX);
-      if (result.deduped) {
-        skipped++;
-      } else {
-        imported++;
+      try {
+        const result = store.remember({ content: entry.text, scope, tags }, CTX);
+        if (result.deduped) {
+          skipped++;
+        } else {
+          imported++;
+        }
+      } catch (err) {
+        if (isStrictRedactionRefusal(err)) {
+          refused++;
+          continue;
+        }
+        throw err;
       }
     }
     if (imported > 0) {
       bus?.publish({ type: "list_changed", sourceSessionId: DASHBOARD_CLIENT });
     }
-    sendJson(res, 200, { imported, skipped });
+    sendJson(res, 200, { imported, skipped, refused });
   }
 
   // Same rationale as handleImportPasted above, for the one officially-
@@ -556,19 +588,33 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
 
     let imported = 0;
     let skipped = 0;
+    let refused = 0;
+    // Each field is its own store.remember call/transaction, so a strict-mode
+    // refusal on one field must not abort the rest -- caught and counted per
+    // field, exactly like handleImportPasted's per-entry handling above.
+    // Anything that is NOT that specific refusal is a genuine bug and still
+    // propagates to the generic 500 handler rather than being swallowed here.
     for (const field of fields) {
       if (field.value === undefined || field.value.length === 0) continue;
-      const result = store.remember({ content: field.value, scope, tags: ["chatgpt-import", field.tag] }, CTX);
-      if (result.deduped) {
-        skipped++;
-      } else {
-        imported++;
+      try {
+        const result = store.remember({ content: field.value, scope, tags: ["chatgpt-import", field.tag] }, CTX);
+        if (result.deduped) {
+          skipped++;
+        } else {
+          imported++;
+        }
+      } catch (err) {
+        if (isStrictRedactionRefusal(err)) {
+          refused++;
+          continue;
+        }
+        throw err;
       }
     }
     if (imported > 0) {
       bus?.publish({ type: "list_changed", sourceSessionId: DASHBOARD_CLIENT });
     }
-    sendJson(res, 200, { imported, skipped, found });
+    sendJson(res, 200, { imported, skipped, refused, found });
   }
 
   function handleEvents(req: IncomingMessage, res: ServerResponse): void {
@@ -842,7 +888,7 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
           return true;
         }
         if (err instanceof HttpError) {
-          sendJson(res, err.status, { error: err.message });
+          sendJson(res, err.status, err.reason ? { error: err.message, reason: err.reason } : { error: err.message });
           return true;
         }
         if (isMalformedCursorError(err)) {

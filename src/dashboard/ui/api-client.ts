@@ -8,9 +8,16 @@ import { getToken, clearToken } from "./state.js";
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  // Only ever set on a 409: a fixed enum ("superseded" | "duplicate_text",
+  // see src/dashboard/api.ts's ConflictReason) telling apart the two
+  // different meanings that status code carries there. Typed as `string`
+  // here, not the literal union, since this module has no reason to import
+  // that server-side type -- a caller narrows it with `===` itself.
+  readonly reason?: string;
+  constructor(status: number, message: string, reason?: string) {
     super(message);
     this.status = status;
+    this.reason = reason;
   }
 }
 
@@ -62,7 +69,11 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       data !== null && typeof data === "object" && typeof (data as { error?: unknown }).error === "string"
         ? (data as { error: string }).error
         : `request failed with status ${res.status}`;
-    throw new ApiError(res.status, message);
+    const reason =
+      data !== null && typeof data === "object" && typeof (data as { reason?: unknown }).reason === "string"
+        ? (data as { reason: string }).reason
+        : undefined;
+    throw new ApiError(res.status, message, reason);
   }
   return data as T;
 }
@@ -135,10 +146,35 @@ export interface StatsResult {
   recentActivity: number;
   vectors: boolean;
   journalMode: string | null;
+  redactions: Array<{ kind: string; action: string; count: number }>;
 }
 
 export function getStats(): Promise<StatsResult> {
   return request<StatsResult>("GET", "/api/stats?topLimit=50");
+}
+
+export interface GetContextParams {
+  q?: string;
+  scope?: string;
+  budget?: number;
+}
+
+export interface ContextResult {
+  text: string;
+  memories: SearchHit[];
+  tokensEstimated: number;
+  truncated: boolean;
+  degraded: boolean;
+  degradedReason: string | null;
+}
+
+export function getContext(params: GetContextParams = {}): Promise<ContextResult> {
+  const sp = new URLSearchParams();
+  if (params.q) sp.set("q", params.q);
+  if (params.scope) sp.set("scope", params.scope);
+  if (params.budget !== undefined) sp.set("budget", String(params.budget));
+  const qs = sp.toString();
+  return request<ContextResult>("GET", `/api/context${qs ? `?${qs}` : ""}`);
 }
 
 export function listMemories(params: ListMemoriesParams): Promise<ListMemoriesResult> {
@@ -172,6 +208,35 @@ export function restoreMemory(id: string): Promise<{ restored: boolean }> {
   return request<{ restored: boolean }>("POST", `/api/memories/${encodeURIComponent(id)}/restore`);
 }
 
+export interface GetMemoryOptions {
+  includeDeleted?: boolean;
+  includeSuperseded?: boolean;
+}
+
+export function getMemory(id: string, opts: GetMemoryOptions = {}): Promise<Memory> {
+  const sp = new URLSearchParams();
+  if (opts.includeDeleted) sp.set("includeDeleted", "1");
+  if (opts.includeSuperseded) sp.set("includeSuperseded", "1");
+  const qs = sp.toString();
+  return request<Memory>("GET", `/api/memories/${encodeURIComponent(id)}${qs ? `?${qs}` : ""}`);
+}
+
+export interface SupersedeResult {
+  superseded: Memory;
+  replacement: Memory;
+}
+
+// The server answers 409 when `body.text` collides with an existing live
+// memory (and deliberately never echoes memory text in that error) -- the
+// caller must catch ApiError and check `.status === 409` itself to show a
+// useful message, since `.message` carries nothing text-specific to show.
+export function supersedeMemory(
+  id: string,
+  body: { text: string; tags?: string[]; importance?: number },
+): Promise<SupersedeResult> {
+  return request<SupersedeResult>("POST", `/api/memories/${encodeURIComponent(id)}/supersede`, body);
+}
+
 export interface BulkResult {
   op: "forget" | "restore";
   results: Array<{ id: string; ok: boolean }>;
@@ -200,6 +265,207 @@ export interface ClientsResult {
 // store, not just the ones with memories on the current page.
 export function getClients(): Promise<ClientsResult> {
   return request<ClientsResult>("GET", "/api/clients");
+}
+
+// Mirrors src/config/identity.ts's DASHBOARD_CLIENT. Not imported directly:
+// this module is compiled by tsconfig.ui.json with rootDir set to
+// src/dashboard/ui, which rejects any import reaching outside that
+// directory (TS6059) -- so the value is kept in sync here by hand instead.
+export const DASHBOARD_CLIENT_ID = "cairn-dashboard";
+
+export function patchClient(id: string, enabled: boolean): Promise<ClientInfo> {
+  return request<ClientInfo>("PATCH", `/api/clients/${encodeURIComponent(id)}`, { enabled });
+}
+
+export function getTimeline(params: { at: number; scope?: string; limit?: number }): Promise<{ items: Memory[] }> {
+  const sp = new URLSearchParams();
+  sp.set("at", String(params.at));
+  if (params.scope) sp.set("scope", params.scope);
+  if (params.limit !== undefined) sp.set("limit", String(params.limit));
+  return request<{ items: Memory[] }>("GET", `/api/timeline?${sp.toString()}`);
+}
+
+export interface AuditEntry {
+  id: number;
+  ts: number;
+  action: string;
+  memoryId: string | null;
+  scope: string | null;
+  sourceClient: string | null;
+  query: string | null;
+  resultCount: number | null;
+  details: Record<string, unknown> | null;
+  refused: boolean;
+}
+
+export interface AuditResult {
+  items: AuditEntry[];
+  nextCursor: string | null;
+}
+
+export interface GetAuditParams {
+  action?: string;
+  sourceClient?: string;
+  memoryId?: string;
+  since?: number;
+  until?: number;
+  limit?: number;
+  cursor?: string;
+  refused?: boolean;
+}
+
+export function getAudit(params: GetAuditParams = {}): Promise<AuditResult> {
+  const sp = new URLSearchParams();
+  if (params.action) sp.set("action", params.action);
+  if (params.sourceClient) sp.set("sourceClient", params.sourceClient);
+  if (params.memoryId) sp.set("memoryId", params.memoryId);
+  if (params.since !== undefined) sp.set("since", String(params.since));
+  if (params.until !== undefined) sp.set("until", String(params.until));
+  if (params.limit !== undefined) sp.set("limit", String(params.limit));
+  if (params.cursor) sp.set("cursor", params.cursor);
+  if (params.refused !== undefined) sp.set("refused", String(params.refused));
+  const qs = sp.toString();
+  return request<AuditResult>("GET", `/api/audit${qs ? `?${qs}` : ""}`);
+}
+
+// `preview` is already a MASKED excerpt by the time it reaches the daemon
+// (BUILD_BRIEF §10) -- e.g. "AKIA...MPLE" -- never the raw secret. There is
+// no unmasked value anywhere to show; do not try to add one here.
+export interface RedactionEntry {
+  id: number;
+  ts: number;
+  memoryId: string | null;
+  episodeId: string | null;
+  scope: string | null;
+  sourceClient: string | null;
+  kind: string;
+  preview: string;
+  action: string;
+}
+
+export interface RedactionsResult {
+  items: RedactionEntry[];
+  nextCursor: string | null;
+}
+
+export interface GetRedactionsParams {
+  action?: string;
+  memoryId?: string;
+  since?: number;
+  limit?: number;
+  cursor?: string;
+}
+
+export function getRedactions(params: GetRedactionsParams = {}): Promise<RedactionsResult> {
+  const sp = new URLSearchParams();
+  if (params.action) sp.set("action", params.action);
+  if (params.memoryId) sp.set("memoryId", params.memoryId);
+  if (params.since !== undefined) sp.set("since", String(params.since));
+  if (params.limit !== undefined) sp.set("limit", String(params.limit));
+  if (params.cursor) sp.set("cursor", params.cursor);
+  const qs = sp.toString();
+  return request<RedactionsResult>("GET", `/api/redactions${qs ? `?${qs}` : ""}`);
+}
+
+export interface Episode {
+  id: string;
+  content: string;
+  scope: string;
+  sourceClient: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface EpisodesResult {
+  items: Episode[];
+  nextCursor: string | null;
+}
+
+export function getEpisodes(params: { scope?: string; limit?: number; cursor?: string } = {}): Promise<EpisodesResult> {
+  const sp = new URLSearchParams();
+  if (params.scope) sp.set("scope", params.scope);
+  if (params.limit !== undefined) sp.set("limit", String(params.limit));
+  if (params.cursor) sp.set("cursor", params.cursor);
+  const qs = sp.toString();
+  return request<EpisodesResult>("GET", `/api/episodes${qs ? `?${qs}` : ""}`);
+}
+
+export function getEpisode(id: string): Promise<Episode> {
+  return request<Episode>("GET", `/api/episodes/${encodeURIComponent(id)}`);
+}
+
+export type PrivacyMode = "off" | "on" | "strict";
+
+export interface PrivacyState {
+  mode: PrivacyMode;
+  source: string;
+}
+
+export function getPrivacy(): Promise<PrivacyState> {
+  return request<PrivacyState>("GET", "/api/privacy");
+}
+
+export function putPrivacy(mode: PrivacyMode): Promise<PrivacyState> {
+  return request<PrivacyState>("PUT", "/api/privacy", { mode });
+}
+
+export interface DeleteEverythingResult {
+  memories: number;
+  episodes: number;
+  vectors: number;
+}
+
+// `confirm: true` is hardcoded rather than a parameter: the server refuses
+// with 400 unless it is the literal `true`, so exposing it as an argument
+// would only let a caller pass the wrong thing.
+export function deleteEverything(): Promise<DeleteEverythingResult> {
+  return request<DeleteEverythingResult>("POST", "/api/privacy/delete-everything", { confirm: true });
+}
+
+// The two importers behind the dashboard's "Import" panel (BUILD_BRIEF
+// §1/§12): neither ChatGPT's nor Claude's data export contains a memory
+// file, so a user copies their stored memory text out of the product's own
+// settings screen and pastes it here, or uploads a ChatGPT
+// conversations.json export for its one officially-confirmed structured
+// field (custom instructions). Both write through store.remember, so
+// `skipped` below always means "deduped", never an error.
+export interface ImportResult {
+  imported: number;
+  skipped: number;
+}
+
+// `refused` counts entries the store's strict privacy mode blocked outright
+// (a detected secret) -- distinct from `skipped`, which always means
+// "deduped", never an error. Each entry is its own store.remember call, so
+// one refused line never aborts the rest of the paste.
+export interface PastedImportResult extends ImportResult {
+  refused: number;
+}
+
+export function importPasted(body: { text: string; scope?: string; tags?: string[] }): Promise<PastedImportResult> {
+  return request<PastedImportResult>("POST", "/api/import/pasted", body);
+}
+
+// `refused` mirrors PastedImportResult's above: the store's strict privacy
+// mode blocked that field outright (a detected secret), distinct from
+// `skipped` ("deduped"). Each field is its own store.remember call, so one
+// refused field never aborts the other.
+export interface ImportChatGptResult extends ImportResult {
+  refused: number;
+  // How many of the two known custom-instruction fields (about-user,
+  // about-model) the export actually contained -- lets the panel say
+  // "found 1 of 2 fields" even when both ended up deduped, not just
+  // "imported 0".
+  found: number;
+}
+
+// `conversations` is the parsed JSON array from a ChatGPT
+// conversations.json export -- unknown here because
+// extractCustomInstructions (src/portability/importers/chatgpt.ts) does its
+// own loose shape check server-side and answers 400 with a descriptive
+// message rather than this client pre-validating it.
+export function importChatGpt(body: { conversations: unknown; scope?: string }): Promise<ImportChatGptResult> {
+  return request<ImportChatGptResult>("POST", "/api/import/chatgpt", body);
 }
 
 // The event bus payload (src/mcp/events.ts): only ever "updated" or

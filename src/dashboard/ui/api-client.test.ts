@@ -4,9 +4,74 @@
 // producer to use CRLF, so the parser must handle it too rather than only
 // being exercisable through a live connection to our own daemon.
 
-import { test } from "node:test";
+import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { createSseFrameParser, parseSseEvent } from "./api-client.js";
+import { createSseFrameParser, parseSseEvent, getTimeline, getAudit, deleteEverything, putPrivacy } from "./api-client.js";
+
+// The data-layer functions above all go through request(), which reads
+// getToken() (backed by sessionStorage) and calls the global fetch() --
+// neither exists in the node:test environment by default, so both are
+// stubbed here for the duration of this file and restored afterward.
+let originalFetch: typeof fetch;
+let originalSessionStorage: Storage | undefined;
+
+before(() => {
+  originalFetch = globalThis.fetch;
+  originalSessionStorage = globalThis.sessionStorage;
+  globalThis.sessionStorage = {
+    getItem: () => null,
+    setItem: () => {},
+    removeItem: () => {},
+    clear: () => {},
+    key: () => null,
+    length: 0,
+  } as Storage;
+});
+
+after(() => {
+  globalThis.fetch = originalFetch;
+  globalThis.sessionStorage = originalSessionStorage as Storage;
+});
+
+test("getTimeline puts at in the query string", async () => {
+  let capturedUrl = "";
+  globalThis.fetch = (async (url: string | URL) => {
+    capturedUrl = String(url);
+    return new Response(JSON.stringify({ items: [] }), { status: 200 });
+  }) as typeof fetch;
+  await getTimeline({ at: 12345 });
+  assert.ok(capturedUrl.includes("at=12345"), capturedUrl);
+});
+
+test("an omitted optional parameter never becomes the literal string undefined", async () => {
+  let capturedUrl = "";
+  globalThis.fetch = (async (url: string | URL) => {
+    capturedUrl = String(url);
+    return new Response(JSON.stringify({ items: [], nextCursor: null }), { status: 200 });
+  }) as typeof fetch;
+  await getAudit({ action: "remember" });
+  assert.ok(!capturedUrl.includes("undefined"), capturedUrl);
+});
+
+test("deleteEverything sends confirm: true", async () => {
+  let capturedBody: unknown;
+  globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+    capturedBody = init?.body ? JSON.parse(String(init.body)) : undefined;
+    return new Response(JSON.stringify({ memories: 0, episodes: 0, vectors: 0 }), { status: 200 });
+  }) as typeof fetch;
+  await deleteEverything();
+  assert.deepEqual(capturedBody, { confirm: true });
+});
+
+test("putPrivacy sends the mode in the body", async () => {
+  let capturedBody: unknown;
+  globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+    capturedBody = init?.body ? JSON.parse(String(init.body)) : undefined;
+    return new Response(JSON.stringify({ mode: "on", source: "settings" }), { status: 200 });
+  }) as typeof fetch;
+  await putPrivacy("on");
+  assert.deepEqual(capturedBody, { mode: "on" });
+});
 
 // A CRLF-framed heartbeat followed by a CRLF-framed real event -- a
 // hypothetical CRLF producer, not a shape our own daemon emits.

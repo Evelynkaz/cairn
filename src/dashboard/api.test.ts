@@ -283,36 +283,50 @@ test("PATCH on a superseded memory is a 409 conflict with no message leak", asyn
   ctx.store.supersede(memory.id, { text: "already superseded replacement" }, { sourceClient: "other" });
   const res = await call(ctx, "PATCH", `/api/memories/${memory.id}`, { body: { text: "edited" } });
   assert.equal(res.status, 409);
-  assert.deepEqual(res.body, { error: "conflict" });
+  assert.deepEqual(res.body, { error: "conflict", reason: "superseded" });
 });
 
-test("a supersede whose text collides with a live memory is a 409 conflict with no message leak", async () => {
-  const a = ctx.store.remember({ content: "alpha collision text" }, { sourceClient: "other" }).memory;
+// The concrete failure this guards: a PATCH that collides with a different
+// LIVE memory's text (not a superseded one) must say "duplicate_text", never
+// "superseded" -- the two reasons are otherwise indistinguishable at 409.
+test("PATCH on a live memory whose new text collides is a 409 conflict with reason duplicate_text", async () => {
+  ctx.store.remember({ content: "I use Postgres" }, { sourceClient: "other" });
+  const b = ctx.store.remember({ content: "I use MySQL" }, { sourceClient: "other" }).memory;
+  const res = await call(ctx, "PATCH", `/api/memories/${b.id}`, { body: { text: "I use Postgres" } });
+  assert.equal(res.status, 409);
+  assert.deepEqual(res.body, { error: "conflict", reason: "duplicate_text" });
+
+  const unchanged = ctx.store.get(b.id, {}, { sourceClient: "other" });
+  assert.equal(unchanged?.text, "I use MySQL");
+});
+
+test("a supersede whose text collides with a live memory is a 409 conflict with reason duplicate_text", async () => {
+  ctx.store.remember({ content: "alpha collision text" }, { sourceClient: "other" });
   const b = ctx.store.remember({ content: "bravo collision text" }, { sourceClient: "other" }).memory;
   const res = await call(ctx, "POST", `/api/memories/${b.id}/supersede`, { body: { text: "alpha collision text" } });
   assert.equal(res.status, 409);
-  assert.deepEqual(res.body, { error: "conflict" });
+  assert.deepEqual(res.body, { error: "conflict", reason: "duplicate_text" });
 });
 
-test("PATCH whose text collides with a different live memory is a 409 conflict with no message leak", async () => {
-  const a = ctx.store.remember({ content: "alpha patch collision text" }, { sourceClient: "other" }).memory;
+test("PATCH whose text collides with a different live memory is a 409 conflict with reason duplicate_text", async () => {
+  ctx.store.remember({ content: "alpha patch collision text" }, { sourceClient: "other" });
   const b = ctx.store.remember({ content: "bravo patch collision text" }, { sourceClient: "other" }).memory;
   const res = await call(ctx, "PATCH", `/api/memories/${b.id}`, { body: { text: "alpha patch collision text" } });
   assert.equal(res.status, 409);
-  assert.deepEqual(res.body, { error: "conflict" });
+  assert.deepEqual(res.body, { error: "conflict", reason: "duplicate_text" });
 
   const unchanged = ctx.store.get(b.id, {}, { sourceClient: "other" });
   assert.equal(unchanged?.text, "bravo patch collision text");
 });
 
-test("restoring a memory whose text was re-remembered while deleted is a 409 conflict with no message leak", async () => {
+test("restoring a memory whose text was re-remembered while deleted is a 409 conflict with reason duplicate_text", async () => {
   const original = ctx.store.remember({ content: "restore collision text" }, { sourceClient: "other" }).memory;
   ctx.store.forget(original.id, { sourceClient: "other" });
   ctx.store.remember({ content: "restore collision text" }, { sourceClient: "other" });
 
   const res = await call(ctx, "POST", `/api/memories/${original.id}/restore`);
   assert.equal(res.status, 409);
-  assert.deepEqual(res.body, { error: "conflict" });
+  assert.deepEqual(res.body, { error: "conflict", reason: "duplicate_text" });
 });
 
 test("bulk restore where the middle id collides reports that id ok:false and actually restores the others", async () => {
@@ -717,7 +731,7 @@ test("POST /api/import/pasted imports a realistic pasted blob, findable via stor
 
   const res = await call(ctx, "POST", "/api/import/pasted", { body: { text: blob } });
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { imported: 4, skipped: 0 });
+  assert.deepEqual(res.body, { imported: 4, skipped: 0, refused: 0 });
 
   const list = ctx.store.list({});
   const texts = list.items.map((m) => m.text);
@@ -732,11 +746,11 @@ test("re-posting the same pasted text imports nothing the second time (content-h
 
   const first = await call(ctx, "POST", "/api/import/pasted", { body: { text: blob } });
   assert.equal(first.status, 200);
-  assert.deepEqual(first.body, { imported: 2, skipped: 0 });
+  assert.deepEqual(first.body, { imported: 2, skipped: 0, refused: 0 });
 
   const second = await call(ctx, "POST", "/api/import/pasted", { body: { text: blob } });
   assert.equal(second.status, 200);
-  assert.deepEqual(second.body, { imported: 0, skipped: 2 });
+  assert.deepEqual(second.body, { imported: 0, skipped: 2, refused: 0 });
 });
 
 test("POST /api/import/pasted applies scope and tags", async () => {
@@ -744,7 +758,7 @@ test("POST /api/import/pasted applies scope and tags", async () => {
     body: { text: "A scoped-and-tagged import fixture", scope: "import-scope", tags: ["from-paste"] },
   });
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { imported: 1, skipped: 0 });
+  assert.deepEqual(res.body, { imported: 1, skipped: 0, refused: 0 });
 
   const list = ctx.store.list({ scope: "import-scope" });
   const item = list.items.find((m) => m.text === "A scoped-and-tagged import fixture");
@@ -765,6 +779,35 @@ test("POST /api/import/pasted publishes a list_changed event on the bus", async 
   }
 });
 
+test("POST /api/import/pasted in strict privacy mode refuses only the offending lines, not a 500", async () => {
+  const put = await call(ctx, "PUT", "/api/privacy", { body: { mode: "strict" } });
+  assert.equal(put.status, 200);
+  try {
+    const blob = [
+      "A perfectly ordinary first memory",
+      "Another ordinary memory",
+      "My AWS key is AKIAABCDEFGHIJKLMNOP",
+      "A perfectly ordinary last memory",
+    ].join("\n");
+
+    const res = await call(ctx, "POST", "/api/import/pasted", { body: { text: blob } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { imported: 3, skipped: 0, refused: 1 });
+
+    const list = ctx.store.list({});
+    const texts = list.items.map((m) => m.text);
+    assert.ok(texts.includes("A perfectly ordinary first memory"));
+    assert.ok(texts.includes("Another ordinary memory"));
+    assert.ok(texts.includes("A perfectly ordinary last memory"));
+    assert.ok(!texts.some((t) => t.includes("AKIA")));
+  } finally {
+    // Reset to "off" so later tests in this file that write memories are not
+    // subject to strict-mode refusal.
+    const reset = await call(ctx, "PUT", "/api/privacy", { body: { mode: "off" } });
+    assert.equal(reset.status, 200);
+  }
+});
+
 test("POST /api/import/chatgpt imports found custom instructions", async () => {
   const conversations = [
     chatGptConversationWithCustomInstructions({
@@ -775,7 +818,7 @@ test("POST /api/import/chatgpt imports found custom instructions", async () => {
 
   const res = await call(ctx, "POST", "/api/import/chatgpt", { body: { conversations } });
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { imported: 2, skipped: 0, found: 2 });
+  assert.deepEqual(res.body, { imported: 2, skipped: 0, refused: 0, found: 2 });
 
   const list = ctx.store.list({});
   const texts = list.items.map((m) => m.text);
@@ -795,7 +838,34 @@ test("POST /api/import/chatgpt with no custom instructions returns found: 0, not
 
   const res = await call(ctx, "POST", "/api/import/chatgpt", { body: { conversations } });
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { imported: 0, skipped: 0, found: 0 });
+  assert.deepEqual(res.body, { imported: 0, skipped: 0, refused: 0, found: 0 });
+});
+
+test("POST /api/import/chatgpt in strict privacy mode refuses only the offending field, not a 500", async () => {
+  const put = await call(ctx, "PUT", "/api/privacy", { body: { mode: "strict" } });
+  assert.equal(put.status, 200);
+  try {
+    const conversations = [
+      chatGptConversationWithCustomInstructions({
+        about_user_message: "My AWS key is AKIAABCDEFGHIJKLMNOP",
+        about_model_message: "A distinct strict-mode-clean model instruction.",
+      }),
+    ];
+
+    const res = await call(ctx, "POST", "/api/import/chatgpt", { body: { conversations } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { imported: 1, skipped: 0, refused: 1, found: 2 });
+
+    const list = ctx.store.list({});
+    const texts = list.items.map((m) => m.text);
+    assert.ok(texts.includes("A distinct strict-mode-clean model instruction."));
+    assert.ok(!texts.some((t) => t.includes("AKIA")));
+  } finally {
+    // Reset to "off" so later tests in this file that write memories are not
+    // subject to strict-mode refusal.
+    const reset = await call(ctx, "PUT", "/api/privacy", { body: { mode: "off" } });
+    assert.equal(reset.status, 200);
+  }
 });
 
 test("POST /api/import/chatgpt with a non-export body returns 400 and echoes none of the input", async () => {

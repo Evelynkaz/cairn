@@ -7,6 +7,7 @@
   --border: #e2e4e8;
   --accent: #3562d6;
   --accent-fg: #ffffff;
+  --accent-bg: #e8edfc;
   --danger: #b3261e;
   --danger-bg: #fbeceb;
   --warn: #92620a;
@@ -15,6 +16,10 @@
   --row-hover: #f2f4f8;
   --shadow: 0 4px 16px rgba(20, 20, 30, 0.12);
   --radius: 8px;
+  /* Shared by .cell-text (the <td>) and .text-toggle (the clipped element
+     inside it) -- they must always match, or the toggle's ellipsis clips
+     past the cell's own edge and overlaps the next column. */
+  --cell-text-width: 22rem;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -26,6 +31,7 @@
     --border: #2b2e33;
     --accent: #7ba0ff;
     --accent-fg: #10131c;
+    --accent-bg: #1e2740;
     --danger: #ff8f87;
     --danger-bg: #3a1f1d;
     --warn: #e3b464;
@@ -235,6 +241,26 @@ a {
   min-width: 12rem;
 }
 
+/* Toolbar controls shared across memories/timeline/audit: same min-width so
+   several of them side by side line up instead of each sizing to its own
+   content. */
+.scope-select,
+.audit-action-select,
+.audit-refused-select,
+.source-client-select {
+  min-width: 9rem;
+}
+
+.at-input,
+.since-input,
+.until-input {
+  min-width: 11rem;
+}
+
+.limit-input {
+  width: 5rem;
+}
+
 input,
 select,
 textarea,
@@ -370,7 +396,12 @@ textarea {
 
 .memories-table {
   width: 100%;
-  border-collapse: collapse;
+  /* `collapse` makes sticky positioning on cells unreliable -- borders on
+     sticky cells fail to paint and the cell mispositions, which is why the
+     pinned Actions column was overlapping Updated. `separate` with zero
+     spacing keeps the grid looking identical while sticky works. */
+  border-collapse: separate;
+  border-spacing: 0;
   min-width: 60rem;
 }
 
@@ -388,6 +419,21 @@ textarea {
   top: 0;
   font-weight: 600;
   white-space: nowrap;
+  z-index: 1;
+}
+
+/* Only tables with an actions-like trailing column (memories, clients) get
+   their last header cell pinned -- :has() lets this stay scoped to those two
+   from CSS alone, since the header cell itself carries no class to hook. */
+.memories-table:has(td.cell-actions) thead th:last-child {
+  position: sticky;
+  right: 0;
+  /* Sticky on both axes at once: needs a higher z-index than the plain
+     top-sticky header cells and the plain right-sticky body cells, or the
+     corner gets painted under whichever one scrolls past it last. */
+  z-index: 2;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
 }
 
 .memories-table tbody tr:hover {
@@ -403,14 +449,17 @@ textarea {
 }
 
 .cell-text {
-  max-width: 28rem;
+  max-width: var(--cell-text-width);
 }
 
 .text-toggle {
   all: unset;
   cursor: pointer;
   display: block;
-  max-width: 28rem;
+  /* Must equal .cell-text's max-width -- this is what gets clipped by the
+     overflow/text-overflow below, so a wider value here clips past the
+     cell's own edge and overlaps the next column. */
+  max-width: var(--cell-text-width);
 }
 
 .text-toggle:focus-visible {
@@ -426,19 +475,45 @@ textarea {
 
 .text-toggle.expanded {
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .cell-tags {
   max-width: 14rem;
+  min-width: 8rem;
   white-space: normal;
-  word-break: break-word;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.cell-timestamp {
+  white-space: nowrap;
+}
+
+.cell-source {
+  white-space: nowrap;
 }
 
 .cell-actions {
+  white-space: nowrap;
+  /* Pinned to the right edge of .table-scroll so Edit/Delete stay reachable
+     at any table width -- an opaque background is required because sticky
+     cells don't clip to the row, so scrolled-under cells would show through
+     otherwise. */
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+}
+
+.memories-table tbody tr:hover .cell-actions {
+  background: var(--row-hover);
+}
+
+.cell-actions-inner {
   display: flex;
   gap: 0.35rem;
-  white-space: nowrap;
 }
 
 .badge {
@@ -512,6 +587,51 @@ textarea {
   gap: 0.5rem;
 }
 
+.supersede-hint {
+  margin: 0;
+}
+
+/* ---- import panel --------------------------------------------------- */
+
+.import-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.import-panel-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1 1 20rem;
+  min-width: 16rem;
+}
+
+.import-panel-section h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.import-textarea {
+  color: var(--fg);
+  min-height: 6rem;
+  resize: vertical;
+}
+
+.import-scope,
+.import-tags {
+  color: var(--fg);
+}
+
+.import-result {
+  color: var(--fg);
+  margin: 0;
+}
+
 /* ---- toast --------------------------------------------------------------- */
 
 .toast {
@@ -546,4 +666,180 @@ textarea {
 .toast-close:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
+}
+
+/* ---- privacy view -------------------------------------------------------- */
+
+.privacy-view {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.privacy-view section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: 40rem;
+}
+
+.privacy-view h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+/* Must out-specify `.privacy-view section` above (0,1,1), which sets the
+   reading width for the prose sections -- a lone class selector (0,1,0)
+   loses to it and the override silently does nothing. */
+.privacy-view section.privacy-view-section-wide {
+  max-width: none;
+}
+
+.mode-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  text-align: left;
+}
+
+.mode-option-active {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.mode-option-current {
+  margin-left: auto;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* The delete-everything escape hatch (BUILD_BRIEF §10): must read as
+   unmistakably dangerous and clearly separated from the rest of the page. */
+.danger-zone {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem;
+  border: 1px solid var(--danger);
+  background: var(--danger-bg);
+  border-radius: var(--radius);
+}
+
+.danger-button {
+  align-self: flex-start;
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--bg);
+}
+
+.danger-button:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+/* ---- stats view ----------------------------------------------------------- */
+
+.stats-view {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.stats-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.stats-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.stats-section h3 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.stats-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 1rem;
+}
+
+.stats-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1.5rem;
+}
+
+.stats-rank-list,
+.stats-health-list,
+.stats-redaction-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.stats-rank-row {
+  display: grid;
+  grid-template-columns: 8rem 1fr 2.5rem;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.stats-rank-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stats-rank-count {
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The view sets each fill's WIDTH inline as data (a percentage of the max
+   count in the list) -- this only supplies the track's backdrop and the
+   fill's colour/height/radius, and must never set a width itself or it
+   would fight that contract. */
+.stats-bar-track {
+  display: block;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--bg-raised);
+  overflow: hidden;
+}
+
+.stats-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.stats-redaction-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.stats-redaction-kind {
+  font-weight: 600;
+}
+
+@media (max-width: 720px) {
+  .stats-rank-row {
+    grid-template-columns: 6rem 1fr 2rem;
+  }
 }

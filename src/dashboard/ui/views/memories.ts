@@ -10,6 +10,9 @@ import {
   patchMemory,
   deleteMemory,
   restoreMemory,
+  supersedeMemory,
+  importPasted,
+  importChatGpt,
   bulkOp,
   subscribeToEvents,
   ApiError,
@@ -23,7 +26,10 @@ const TOAST_DURATION_MS = 8000;
 // hard-capped there regardless of the requested page size, so a result set
 // at this size must say so rather than silently look complete.
 const SEARCH_RESULT_CAP = 50;
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
+// Mirrors MAX_REQUEST_BODY_BYTES in src/daemon/http.ts -- the daemon rejects
+// anything bigger with a 413 regardless of what this panel does, so a file
+// over this size must never even be read, let alone sent.
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
 // A normalized shape both list-mode Memory rows and search-mode SearchHit
 // rows render through, so the table body has one code path instead of two.
@@ -77,7 +83,7 @@ function hitToRow(h: SearchHit): Row {
 
 function formatDate(ms: number | null): string {
   if (ms === null) return "—";
-  return new Date(ms).toLocaleString();
+  return new Date(ms).toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
 }
 
 // Date inputs hand back a bare "YYYY-MM-DD" with no timezone attached --
@@ -86,6 +92,17 @@ function formatDate(ms: number | null): string {
 function startOfLocalDay(dateStr: string): number {
   const [y, m, d] = dateStr.split("-").map(Number);
   return new Date(y ?? 1970, (m ?? 1) - 1, d ?? 1).getTime();
+}
+
+// The calendar day AFTER dateStr's, at local midnight. Deliberately not
+// `startOfLocalDay(dateStr) + 24*60*60*1000`: a DST fall-back day (e.g.
+// Europe/Berlin, 2026-10-25) is 25 hours long, so adding a fixed 24h lands
+// an hour before next midnight and silently drops that hour's entries.
+// Letting the Date constructor roll `d + 1` over into the next month/year
+// itself is what makes this correct across a month or DST boundary.
+function startOfNextLocalDay(dateStr: string): number {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y ?? 1970, (m ?? 1) - 1, (d ?? 1) + 1).getTime();
 }
 
 interface Toast {
@@ -153,6 +170,14 @@ export function mountMemoriesView(container: HTMLElement): () => void {
   let editRowNode: HTMLElement | null = null;
   let editRowErrorSlot: HTMLElement | null = null;
 
+  let supersedingId: string | null = null;
+  let supersedeDraft: { text: string; tags: string; importance: string } | null = null;
+  let supersedeError: string | null = null;
+  // Same rationale as editRowNode/editRowErrorSlot above -- see
+  // renderSupersedeRow.
+  let supersedeRowNode: HTMLElement | null = null;
+  let supersedeRowErrorSlot: HTMLElement | null = null;
+
   let toast: Toast | null = null;
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -210,7 +235,7 @@ export function mountMemoriesView(container: HTMLElement): () => void {
         // `until` is exclusive (see ListMemoriesParams), so a "to" date
         // picked by the user must reach one day past midnight to include
         // that whole day's memories.
-        until: untilDate ? startOfLocalDay(untilDate) + MS_PER_DAY : undefined,
+        until: untilDate ? startOfNextLocalDay(untilDate) : undefined,
         limit: pageSize,
         cursor,
         includeDeleted,
@@ -335,7 +360,24 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     }
   }
 
+  function resetEditState(): void {
+    editingId = null;
+    editDraft = null;
+    editError = null;
+    editRowNode = null;
+    editRowErrorSlot = null;
+  }
+
+  function resetSupersedeState(): void {
+    supersedingId = null;
+    supersedeDraft = null;
+    supersedeError = null;
+    supersedeRowNode = null;
+    supersedeRowErrorSlot = null;
+  }
+
   function startEdit(row: Row): void {
+    resetSupersedeState();
     editingId = row.id;
     editError = null;
     editDraft = {
@@ -349,11 +391,7 @@ export function mountMemoriesView(container: HTMLElement): () => void {
   }
 
   function cancelEdit(): void {
-    editingId = null;
-    editDraft = null;
-    editError = null;
-    editRowNode = null;
-    editRowErrorSlot = null;
+    resetEditState();
     render();
   }
 
@@ -371,19 +409,69 @@ export function mountMemoriesView(container: HTMLElement): () => void {
       .filter((t) => t.length > 0);
     try {
       await patchMemory(id, { text: editDraft.text, tags, importance: importanceNum });
-      editingId = null;
-      editDraft = null;
-      editError = null;
-      editRowNode = null;
-      editRowErrorSlot = null;
+      resetEditState();
       await load();
     } catch (err) {
       editError =
         err instanceof ApiError
           ? err.status === 409
-            ? "This memory has been superseded and can no longer be edited."
+            ? err.reason === "superseded"
+              ? "This memory has been superseded and can no longer be edited."
+              : "A live memory with that exact text already exists."
             : err.message
           : "Could not save that edit.";
+      render();
+    }
+  }
+
+  function startSupersede(row: Row): void {
+    resetEditState();
+    supersedingId = row.id;
+    supersedeError = null;
+    supersedeDraft = {
+      text: row.text,
+      tags: row.tags.join(", "),
+      importance: String(row.importance),
+    };
+    supersedeRowNode = null;
+    supersedeRowErrorSlot = null;
+    render();
+  }
+
+  function cancelSupersede(): void {
+    resetSupersedeState();
+    render();
+  }
+
+  async function saveSupersede(id: string): Promise<void> {
+    if (!supersedeDraft) return;
+    const importanceNum = Number(supersedeDraft.importance);
+    if (!Number.isFinite(importanceNum) || importanceNum < 0 || importanceNum > 1) {
+      supersedeError = "Importance must be a number between 0 and 1.";
+      render();
+      return;
+    }
+    const replacementText = supersedeDraft.text.trim();
+    if (replacementText.length === 0) {
+      supersedeError = "Replacement text is required.";
+      render();
+      return;
+    }
+    const tags = supersedeDraft.tags
+      .split(",")
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
+    try {
+      await supersedeMemory(id, { text: replacementText, tags, importance: importanceNum });
+      resetSupersedeState();
+      await load();
+    } catch (err) {
+      supersedeError =
+        err instanceof ApiError
+          ? err.status === 409
+            ? "A live memory with that exact text already exists."
+            : err.message
+          : "Could not supersede that memory.";
       render();
     }
   }
@@ -395,7 +483,7 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     // background refresh entirely while an inline edit is open, rather
     // than reconciling a partial merge. The next SSE event (or the user's
     // own save/cancel) resumes normal refreshing.
-    if (editingId !== null) return;
+    if (editingId !== null || supersedingId !== null) return;
     void load();
   });
 
@@ -512,6 +600,172 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     resetPagingAndLoad();
   });
 
+  // --- import panel (BUILD_BRIEF §1/§12) -------------------------------
+  // A panel inside this view, not a new nav section (the nav stays at six).
+
+  let importPanelOpen = false;
+
+  const importToggleBtn = el("button", { type: "button", class: "btn" }, ["Import memories"]);
+  importToggleBtn.addEventListener("click", () => {
+    importPanelOpen = !importPanelOpen;
+    updateImportPanelVisibility();
+  });
+
+  const pastedTextArea = el("textarea", {
+    class: "import-textarea",
+    "aria-label": "Pasted memory text, one memory per line",
+    rows: "6",
+  }) as HTMLTextAreaElement;
+  const pastedScopeInput = el("input", {
+    type: "text",
+    class: "import-scope",
+    "aria-label": "Scope for the imported memories (optional)",
+    placeholder: "Scope (optional)",
+  }) as HTMLInputElement;
+  const pastedTagsInput = el("input", {
+    type: "text",
+    class: "import-tags",
+    "aria-label": "Tags for the imported memories, comma-separated (optional)",
+    placeholder: "Tags, comma-separated (optional)",
+  }) as HTMLInputElement;
+  const pastedSubmitBtn = el("button", { type: "button", class: "btn" }, ["Import pasted text"]);
+  const pastedResultSlot = el("div", { class: "field-error-slot" }, []);
+  pastedSubmitBtn.addEventListener("click", () => void handlePastedImport());
+
+  async function handlePastedImport(): Promise<void> {
+    const rawText = pastedTextArea.value;
+    if (rawText.trim() === "") return;
+    const scope = pastedScopeInput.value.trim() || undefined;
+    const tags = pastedTagsInput.value
+      .split(",")
+      .map((t) => t.trim())
+      .filter((t) => t.length > 0);
+    pastedSubmitBtn.disabled = true;
+    clear(pastedResultSlot);
+    try {
+      const result = await importPasted({ text: rawText, scope, tags: tags.length > 0 ? tags : undefined });
+      pastedTextArea.value = "";
+      pastedScopeInput.value = "";
+      pastedTagsInput.value = "";
+      const parts = [`Imported ${result.imported}, skipped ${result.skipped} as duplicate.`];
+      if (result.refused > 0) {
+        parts.push(` ${result.refused} line${result.refused === 1 ? "" : "s"} refused by strict redaction mode.`);
+      }
+      pastedResultSlot.appendChild(el("p", { class: "import-result" }, [parts.join("")]));
+      await load();
+    } catch (err) {
+      pastedResultSlot.appendChild(
+        el("p", { class: "field-error" }, [err instanceof ApiError ? err.message : "Could not import that text."]),
+      );
+    } finally {
+      pastedSubmitBtn.disabled = false;
+    }
+  }
+
+  const chatgptFileInput = el("input", {
+    type: "file",
+    accept: "application/json,.json",
+    class: "import-file",
+    "aria-label": "ChatGPT conversations.json export file",
+  }) as HTMLInputElement;
+  const chatgptScopeInput = el("input", {
+    type: "text",
+    class: "import-scope",
+    "aria-label": "Scope for the imported memories (optional)",
+    placeholder: "Scope (optional)",
+  }) as HTMLInputElement;
+  const chatgptSubmitBtn = el("button", { type: "button", class: "btn" }, ["Import ChatGPT export"]);
+  const chatgptResultSlot = el("div", { class: "field-error-slot" }, []);
+  chatgptSubmitBtn.addEventListener("click", () => void handleChatGptImport());
+
+  async function handleChatGptImport(): Promise<void> {
+    const file = chatgptFileInput.files?.[0];
+    if (!file) return;
+    chatgptSubmitBtn.disabled = true;
+    clear(chatgptResultSlot);
+    // Checked BEFORE reading the file: the daemon caps a request body at 4MB
+    // (src/daemon/http.ts) and a real ChatGPT export is typically 5-100MB,
+    // so every upload past this limit would fail with a 413 anyway -- but
+    // only after paying for file.text() + JSON.parse + JSON.stringify, up to
+    // three copies of the file in memory. Reject it here instead and point
+    // the user at the paste path, which has no such ceiling.
+    if (file.size > MAX_UPLOAD_BYTES) {
+      chatgptResultSlot.appendChild(
+        el("p", { class: "field-error" }, [
+          `That file is larger than the ${(MAX_UPLOAD_BYTES / (1024 * 1024)).toFixed(0)}MB upload limit. ` +
+            "Copy the custom-instructions text out of ChatGPT's settings and use \"Paste memories\" above instead.",
+        ]),
+      );
+      chatgptSubmitBtn.disabled = false;
+      return;
+    }
+    try {
+      const raw = await file.text();
+      let conversations: unknown;
+      try {
+        conversations = JSON.parse(raw);
+      } catch {
+        chatgptResultSlot.appendChild(el("p", { class: "field-error" }, ["That file is not valid JSON."]));
+        return;
+      }
+      const scope = chatgptScopeInput.value.trim() || undefined;
+      const result = await importChatGpt({ conversations, scope });
+      chatgptFileInput.value = "";
+      chatgptScopeInput.value = "";
+      const parts = [
+        `Found ${result.found} of 2 known fields. Imported ${result.imported}, skipped ${result.skipped} as duplicate.`,
+      ];
+      if (result.refused > 0) {
+        parts.push(` ${result.refused} field${result.refused === 1 ? "" : "s"} refused by strict redaction mode.`);
+      }
+      chatgptResultSlot.appendChild(el("p", { class: "import-result" }, [parts.join("")]));
+      await load();
+    } catch (err) {
+      chatgptResultSlot.appendChild(
+        el("p", { class: "field-error" }, [err instanceof ApiError ? err.message : "Could not import that export."]),
+      );
+    } finally {
+      chatgptSubmitBtn.disabled = false;
+    }
+  }
+
+  const importPanelEl = el("div", { class: "import-panel" }, [
+    el("div", { class: "import-panel-section" }, [
+      el("h3", {}, ["Paste memories"]),
+      el("p", { class: "muted" }, [
+        "One memory per line; leading bullets and numbered-list markers are stripped. Neither ChatGPT nor Claude includes memory in its data export, so copying the text out of the product's own settings screen is the only way to get it today. Up to 500 lines, 2000 characters each.",
+      ]),
+      el("label", { class: "field-label" }, ["Text", pastedTextArea]),
+      el("div", { class: "edit-form-row" }, [
+        el("label", { class: "field-label" }, ["Scope", pastedScopeInput]),
+        el("label", { class: "field-label" }, ["Tags", pastedTagsInput]),
+      ]),
+      pastedResultSlot,
+      pastedSubmitBtn,
+    ]),
+    el("div", { class: "import-panel-section" }, [
+      el("h3", {}, ["ChatGPT export"]),
+      el("p", { class: "muted" }, [
+        "Upload a conversations.json file up to 4MB from a ChatGPT data export. Only its custom-instructions fields (about you, about the model) are imported -- no conversation content is read. A real export is often much larger than 4MB; if yours is rejected, copy the custom-instructions text out of ChatGPT's settings and use \"Paste memories\" instead.",
+      ]),
+      el("label", { class: "field-label" }, ["conversations.json", chatgptFileInput]),
+      el("label", { class: "field-label" }, ["Scope", chatgptScopeInput]),
+      chatgptResultSlot,
+      chatgptSubmitBtn,
+    ]),
+  ]);
+  const importPanelSlot = el("div", {}, []);
+
+  function updateImportPanelVisibility(): void {
+    clear(importToggleBtn);
+    importToggleBtn.appendChild(text(importPanelOpen ? "Hide import" : "Import memories"));
+    if (importPanelOpen) {
+      if (!importPanelEl.parentNode) importPanelSlot.appendChild(importPanelEl);
+    } else if (importPanelEl.parentNode) {
+      importPanelSlot.removeChild(importPanelEl);
+    }
+  }
+
   const toolbarEl = el("div", { class: "toolbar" }, [
     searchInput,
     scopeSelect,
@@ -521,6 +775,7 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     includeDeletedLabel,
     includeSupersededLabel,
     pageSizeSelect,
+    importToggleBtn,
   ]);
 
   function updateScopeOptions(): void {
@@ -604,7 +859,7 @@ export function mountMemoriesView(container: HTMLElement): () => void {
   const toastSlot = el("div", {});
 
   container.appendChild(
-    el("div", { class: "memories-view" }, [toolbarEl, bulkBarSlot, tableContainerEl, toastSlot]),
+    el("div", { class: "memories-view" }, [toolbarEl, importPanelSlot, bulkBarSlot, tableContainerEl, toastSlot]),
   );
 
   // --- rendering ---------------------------------------------------------
@@ -700,8 +955,78 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     return editRowNode;
   }
 
+  function updateSupersedeRowError(): void {
+    if (!supersedeRowErrorSlot) return;
+    clear(supersedeRowErrorSlot);
+    if (supersedeError) supersedeRowErrorSlot.appendChild(el("p", { class: "field-error" }, [supersedeError]));
+  }
+
+  // Same caching rationale as renderEditRow above.
+  function renderSupersedeRow(row: Row): HTMLElement {
+    const draft = supersedeDraft;
+    if (!draft) return el("tr");
+    if (!supersedeRowNode) {
+      const textArea = el(
+        "textarea",
+        { class: "edit-text", "aria-label": "Replacement memory text" },
+        [draft.text],
+      ) as HTMLTextAreaElement;
+      textArea.value = draft.text;
+      textArea.addEventListener("input", () => {
+        draft.text = textArea.value;
+      });
+      const tagsInput = el("input", {
+        type: "text",
+        class: "edit-tags",
+        "aria-label": "Comma-separated tags",
+        value: draft.tags,
+      }) as HTMLInputElement;
+      tagsInput.addEventListener("input", () => {
+        draft.tags = tagsInput.value;
+      });
+      const importanceInput = el("input", {
+        type: "number",
+        class: "edit-importance",
+        min: "0",
+        max: "1",
+        step: "0.01",
+        "aria-label": "Importance, 0 to 1",
+        value: draft.importance,
+      }) as HTMLInputElement;
+      importanceInput.addEventListener("input", () => {
+        draft.importance = importanceInput.value;
+      });
+      const saveBtn = el("button", { type: "button", class: "btn" }, ["Supersede"]);
+      saveBtn.addEventListener("click", () => void saveSupersede(row.id));
+      const cancelBtn = el("button", { type: "button", class: "btn btn-quiet" }, ["Cancel"]);
+      cancelBtn.addEventListener("click", cancelSupersede);
+
+      supersedeRowErrorSlot = el("div", { class: "field-error-slot" }, []);
+      supersedeRowNode = el("tr", { class: "editing-row" }, [
+        el("td", {}, []),
+        el("td", { colspan: "9" }, [
+          el("div", { class: "edit-form" }, [
+            el("p", { class: "muted supersede-hint" }, [
+              "Superseding keeps this memory as history (marked with a valid-until date) instead of deleting it, and adds a new one in its place.",
+            ]),
+            el("label", { class: "field-label" }, ["Replacement text", textArea]),
+            el("div", { class: "edit-form-row" }, [
+              el("label", { class: "field-label" }, ["Tags (comma-separated)", tagsInput]),
+              el("label", { class: "field-label" }, ["Importance", importanceInput]),
+            ]),
+            supersedeRowErrorSlot,
+            el("div", { class: "edit-form-actions" }, [saveBtn, cancelBtn]),
+          ]),
+        ]),
+      ]);
+    }
+    updateSupersedeRowError();
+    return supersedeRowNode;
+  }
+
   function renderRow(row: Row): HTMLElement[] {
     if (editingId === row.id) return [renderEditRow(row)];
+    if (supersedingId === row.id) return [renderSupersedeRow(row)];
 
     const checkbox = el("input", {
       type: "checkbox",
@@ -739,10 +1064,20 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     deleteBtn.addEventListener("click", () => void handleDelete(row.id));
     const restoreBtn = el("button", { type: "button", class: "btn btn-quiet btn-small" }, ["Restore"]);
     restoreBtn.addEventListener("click", () => void handleRestore(row.id));
+    const supersedeBtn = el("button", { type: "button", class: "btn btn-quiet btn-small" }, ["Supersede"]);
+    supersedeBtn.addEventListener("click", () => startSupersede(row));
 
     const actions: HTMLElement[] = [editBtn];
-    if (row.deletedAt !== null) actions.push(restoreBtn);
-    else actions.push(deleteBtn);
+    if (row.deletedAt !== null) {
+      actions.push(restoreBtn);
+    } else {
+      actions.push(deleteBtn);
+      // Superseding a row that's already superseded or deleted makes no
+      // sense (only a live memory has this action) -- rowStatus above is
+      // exactly the same "deleted or superseded" check used to pick the
+      // status badge.
+      if (row.validUntil === null) actions.push(supersedeBtn);
+    }
 
     const tr = el(
       "tr",
@@ -753,11 +1088,11 @@ export function mountMemoriesView(container: HTMLElement): () => void {
         el("td", {}, [row.scope]),
         el("td", { class: "cell-tags" }, [row.tags.join(", ") || "—"]),
         el("td", {}, [row.importance.toFixed(2)]),
-        el("td", {}, [row.sourceClient ?? "—"]),
-        el("td", {}, [formatDate(row.createdAt)]),
-        el("td", {}, [formatDate(row.updatedAt)]),
+        el("td", { class: "cell-source" }, [row.sourceClient ?? "—"]),
+        el("td", { class: "cell-timestamp" }, [formatDate(row.createdAt)]),
+        el("td", { class: "cell-timestamp" }, [formatDate(row.updatedAt)]),
         el("td", {}, [status ? el("span", { class: status.className }, [status.label]) : text("—")]),
-        el("td", { class: "cell-actions" }, actions),
+        el("td", { class: "cell-actions" }, [el("div", { class: "cell-actions-inner" }, actions)]),
       ],
     );
     return [tr];
@@ -911,6 +1246,7 @@ export function mountMemoriesView(container: HTMLElement): () => void {
   updateTagOptions();
   updateSourceClientOptions();
   updateSearchModeUI();
+  updateImportPanelVisibility();
   render();
   void loadFilterOptions();
   void loadClientOptions();

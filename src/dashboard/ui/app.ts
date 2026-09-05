@@ -8,6 +8,11 @@ import { getToken, setToken, clearToken } from "./state.js";
 import { getStats, setUnauthorizedHandler } from "./api-client.js";
 import type { StatsResult } from "./api-client.js";
 import { mountMemoriesView } from "./views/memories.js";
+import { mountTimelineView } from "./views/timeline.js";
+import { mountAuditView } from "./views/audit.js";
+import { mountClientsView } from "./views/clients.js";
+import { mountPrivacyView } from "./views/privacy.js";
+import { mountStatsView } from "./views/stats.js";
 
 const SECTIONS = [
   { id: "memories", label: "Memories" },
@@ -61,15 +66,14 @@ function renderNoToken(root: HTMLElement): void {
   );
 }
 
-function renderComingSoon(container: HTMLElement, label: string): void {
-  clear(container);
-  container.appendChild(
-    el("div", { class: "state-panel" }, [
-      el("p", {}, [`${label} is coming in the next step.`]),
-      el("p", { class: "muted" }, ["This section is not implemented yet, but it will use the same store as Memories."]),
-    ]),
-  );
-}
+const VIEW_MOUNTERS: Record<SectionId, (container: HTMLElement) => () => void> = {
+  memories: mountMemoriesView,
+  timeline: mountTimelineView,
+  "access-log": mountAuditView,
+  clients: mountClientsView,
+  privacy: mountPrivacyView,
+  stats: mountStatsView,
+};
 
 function renderHeaderStats(headerStats: HTMLElement, stats: StatsResult | null): void {
   clear(headerStats);
@@ -129,11 +133,7 @@ function renderApp(root: HTMLElement): void {
     const section = currentSection();
     setActiveLink(section);
     clear(viewOutlet);
-    if (section === "memories") {
-      unmountCurrentView = mountMemoriesView(viewOutlet);
-    } else {
-      renderComingSoon(viewOutlet, SECTIONS.find((s) => s.id === section)?.label ?? section);
-    }
+    unmountCurrentView = VIEW_MOUNTERS[section](viewOutlet);
   }
 
   window.addEventListener("hashchange", renderRoute);

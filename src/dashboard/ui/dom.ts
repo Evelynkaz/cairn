@@ -4,7 +4,12 @@
 // here goes through createElement/textContent/setAttribute, never
 // innerHTML, so nothing from the API is ever parsed as HTML.
 
-type Attrs = Record<string, string | boolean | undefined>;
+// The daemon serves this dashboard with a strict CSP (`style-src 'self'`, no
+// 'unsafe-inline'), so a `style="..."` attribute is parsed and silently dropped --
+// no error, just a broken layout. Ban `style` here at the type level so that
+// mistake is a compile error instead of a runtime trap; set `.style.<prop>` on
+// the element `el()` returns instead.
+type Attrs = Record<string, string | boolean | undefined> & { style?: never };
 type Child = Node | string | null | undefined;
 
 export function el<K extends keyof HTMLElementTagNameMap>(
