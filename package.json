@@ -9,6 +9,14 @@
   "bin": {
     "cairn": "dist/cli/index.js"
   },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/dashboard/ui/**/*.html",
+    "dist/dashboard/ui/**/*.css",
+    "!dist/**/*.test.js",
+    "!dist/**/*.test.d.ts"
+  ],
   "engines": {
     "node": ">=22.13"
   },

@@ -22,4 +22,6 @@ jobs:
       - run: npm run build
       - name: Verify sqlite-vec loadable extension
         run: node dist/scripts/smoke-vec.js
+      - name: Verify published package contents
+        run: node dist/scripts/verify-package.js
       - run: npm test
