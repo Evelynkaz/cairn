@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cairn</title>
+    <!-- Root-absolute: the daemon serves this page at /ui with no trailing
+         slash, so a document-relative "./" URL resolves against "/" instead
+         and 404s. The daemon always mounts the UI at /ui, so absolute is
+         correct regardless of the request URL's trailing slash. -->
+    <link rel="stylesheet" href="/ui/styles.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/ui/app.js"></script>
+  </body>
+</html>

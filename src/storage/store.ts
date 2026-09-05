@@ -36,6 +36,8 @@ import { search, getContext } from "../retrieval/index.js";
 import type { SearchDeps, SearchOptions, SearchResult, ContextOptions, ContextBlock } from "../retrieval/index.js";
 import type { EmbeddingProvider } from "../embeddings/types.js";
 import { clampLimit } from "./repositories/paging.js";
+import { memoryStats } from "./repositories/stats.js";
+import type { StoreStats, StoreStatsOptions } from "./repositories/stats.js";
 import { redactText } from "../privacy/index.js";
 import type { Finding, SecretKind } from "../privacy/index.js";
 import { resolvePrivacyMode } from "./privacy-settings.js";
@@ -127,6 +129,11 @@ export interface Store {
   // than a page of rows, so /health never has to reach past this facade
   // into the internal `db` handle to answer "how many memories".
   countMemories(options?: { scope?: string }): number;
+
+  /** Bounded aggregates for the dashboard's stats panel (BUILD_BRIEF §9). Read-only:
+      it is not gated or audited, because it returns counts only and never memory
+      content — same reasoning as countMemories() above it. */
+  stats(options?: StoreStatsOptions): StoreStats;
 
   // BUILD_BRIEF §7/§8 hybrid retrieval, wrapped here rather than left to
   // the MCP layer, so the client-pause gate and the access-log audit trail
@@ -423,6 +430,10 @@ export function openStore(options: StoreOptions = {}): Store {
       }
       const row = db.q(`SELECT COUNT(*) AS c FROM memories WHERE valid_until IS NULL AND deleted_at IS NULL`).get();
       return row ? Number(row["c"]) : 0;
+    },
+
+    stats(options) {
+      return memoryStats(db, options);
     },
 
     async recall(query, options = {}, ctx) {

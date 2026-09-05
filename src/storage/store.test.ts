@@ -162,6 +162,12 @@ const GATED_METHODS: Record<string, GatedInvoke> = {
 //   countMemories    - the daemon's unauthenticated /health probe (server.ts);
 //                      it never receives a ctx.sourceClient to gate on, by
 //                      design (see /health's own no-auth comment)
+//   stats            - the dashboard's stats panel: returns counts plus
+//                      user-authored scope and tag names, not memory text,
+//                      and is reachable only from the dashboard's own
+//                      loopback-bound, token-authenticated HTTP route, never
+//                      from MCP client traffic, which is why it carries no
+//                      ctx.sourceClient to gate on
 // Adding a name here is a conscious call that the member is not client
 // traffic; it is not a place to silently exempt a new read/write method.
 const DELIBERATELY_UNGATED = new Set([
@@ -173,6 +179,7 @@ const DELIBERATELY_UNGATED = new Set([
   "auditLog",
   "clientStats",
   "countMemories",
+  "stats",
 ]);
 
 test("the gated-method table matches the store's actual surface exactly", () => {
