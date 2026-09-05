@@ -7,6 +7,11 @@ build/
 *.db
 *.db-wal
 *.db-shm
+# The daemon's runtime file holds the bearer token. It normally lives in
+# CAIRN_HOME, outside the repo -- this is belt and braces for anyone who
+# points CAIRN_HOME at a checkout while developing.
+daemon.json
+daemon.log
 *.sqlite
 .DS_Store
 coverage/
