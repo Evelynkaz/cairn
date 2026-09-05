@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -18,5 +18,25 @@ export function ensureHome(home: string = resolveCairnHome()): string {
   // mode is a no-op on Windows filesystems (no POSIX permission bits) but
   // still correct and idempotent there; it matters on macOS/Linux.
   mkdirSync(home, { recursive: true, mode: 0o700 });
+
+  // `mkdirSync`'s mode is a no-op when the directory already existed (e.g. a
+  // CAIRN_HOME pointed at a synced/shared folder), so a pre-existing loose
+  // mode survives untouched. Tighten it explicitly rather than trust
+  // creation-time permissions alone -- the whole memory store lives here.
+  try {
+    const { mode } = statSync(home);
+    if ((mode & 0o077) !== 0) {
+      chmodSync(home, 0o700);
+      // stdout is the MCP transport in some code paths; diagnostics must
+      // only ever go to stderr.
+      process.stderr.write(
+        `cairn: tightened permissions on ${home} to 0700 (it was world- or group-readable)\n`,
+      );
+    }
+  } catch {
+    // Best-effort: if we can't stat/chmod it, ensureHome still returns the
+    // path rather than failing the caller.
+  }
+
   return home;
 }

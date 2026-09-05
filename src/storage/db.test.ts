@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { unlinkSync } from "node:fs";
+import { statSync, unlinkSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { withTempDir, withTempDirAsync, tempDbPath } from "../testing/tmp.js";
 import { openDb } from "./db.js";
@@ -510,6 +510,24 @@ test("the statement cache is bounded at 200 entries", () => {
       const recent = db.q("select 249 as x");
       const recentAgain = db.q("select 249 as x");
       assert.equal(recent, recentAgain);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+test("a freshly created database file is 0600, and its -wal/-shm sidecars too once WAL is enabled", (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX file mode bits are not meaningful on Windows");
+    return;
+  }
+  withTempDir((dir) => {
+    const path = tempDbPath(dir);
+    const db = openDb({ path });
+    try {
+      assert.equal(statSync(path).mode & 0o777, 0o600);
+      assert.equal(statSync(`${path}-wal`).mode & 0o777, 0o600);
+      assert.equal(statSync(`${path}-shm`).mode & 0o777, 0o600);
     } finally {
       db.close();
     }

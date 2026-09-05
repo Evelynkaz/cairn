@@ -33,7 +33,7 @@ import {
   runtimeFilePath,
   writeRuntimeFile,
 } from "./runtime-file.js";
-import { PayloadTooLargeError, readJsonBody, sendJson, tokenMatches } from "./http.js";
+import { MAX_REQUEST_BODY_BYTES, PayloadTooLargeError, readJsonBody, sendJson, tokenMatches } from "./http.js";
 
 export const DEFAULT_PORT = 8787;
 const DAEMON_VERSION = "0.1.0";
@@ -81,6 +81,11 @@ export interface DaemonOptions {
   sessionIdleTimeoutMs?: number;
   sessionSweepIntervalMs?: number;
   maxSessions?: number;
+  // Test-only escape hatch: the /health memory count is memoized behind
+  // this TTL (production default a few seconds -- see the comment on
+  // countMemoriesCached below); a test asserting the count changed right
+  // after a write sets this to 0 so it observes the real value every time.
+  healthMemoryCountTtlMs?: number;
   // Test-only escape hatch: lets a test give the dashboard API (stats'
   // recency math, in particular) a deterministic clock instead of the real
   // Date.now, the same reason sessionIdleTimeoutMs etc. exist above.
@@ -124,6 +129,26 @@ function isLoopbackOrigin(origin: string): boolean {
   } catch {
     return false;
   }
+}
+
+// DNS-rebinding closes only halfway with the Origin check above: after a
+// rebind, the attacker's page is same-origin with the daemon, so its
+// requests carry no Origin header at all (a real MCP client sends none
+// either, which is why Origin absence is allowed) and sail past it. Host is
+// the second half -- a rebound page's Host header still names the attacker's
+// domain, not this loopback address, so requiring it to be one of the
+// addresses the daemon actually bound closes the gap the Origin check alone
+// cannot.
+function isAllowedHost(hostHeader: string, port: number): boolean {
+  const host = hostHeader.toLowerCase();
+  return (
+    host === `127.0.0.1:${port}` ||
+    host === `localhost:${port}` ||
+    host === `[::1]:${port}` ||
+    host === "127.0.0.1" ||
+    host === "localhost" ||
+    host === "[::1]"
+  );
 }
 
 function resolvePort(explicit: number | undefined): number {
@@ -182,33 +207,61 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     sendJson(res, 503, { error: "daemon is still starting" });
   }
 
-  function handleHealth(res: ServerResponse): void {
+  function hasValidToken(req: IncomingMessage): boolean {
+    const header = req.headers.authorization;
+    const prefix = "Bearer ";
+    const provided = typeof header === "string" && header.startsWith(prefix) ? header.slice(prefix.length) : null;
+    return provided !== null && tokenMatches(provided, token);
+  }
+
+  // /health is reachable with no Origin at all from an ordinary web page
+  // (an <img> tag sends none), so an unauthenticated hit must never trigger
+  // a real table scan -- memoize countMemories() for a few seconds behind a
+  // timestamp comparison, not a timer (a timer here would be one more thing
+  // close() must remember to clear, and CONTRIBUTING.md forbids
+  // --test-force-exit).
+  const healthMemoryCountTtlMs = options.healthMemoryCountTtlMs ?? 5000;
+  let cachedMemoryCount: number | null = null;
+  let cachedMemoryCountAt = 0;
+
+  function countMemoriesCached(store: Store): number {
+    const now = Date.now();
+    if (cachedMemoryCount === null || now - cachedMemoryCountAt > healthMemoryCountTtlMs) {
+      cachedMemoryCount = store.countMemories();
+      cachedMemoryCountAt = now;
+    }
+    return cachedMemoryCount;
+  }
+
+  function handleHealth(req: IncomingMessage, res: ServerResponse): void {
     if (!ready) {
       // A health check that lies about readiness is worse than one that
       // says "not yet" -- never report ok:true before the store is real.
       sendNotReady(res);
       return;
     }
-    // No auth on this route by design: it must be usable to detect a live
-    // daemon before the caller has read the bearer token off disk. It must
-    // therefore leak nothing beyond these fields -- no memory content, no
-    // token, no paths.
-    sendJson(res, 200, {
+    // No auth REQUIRED on this route by design: it must be usable to detect
+    // a live daemon before the caller has read the bearer token off disk.
+    // But an unauthenticated hit must leak nothing beyond these fields -- no
+    // memory content, no token, no paths, and (see below) no memory count,
+    // which is itself sensitive and otherwise driveable at will by any page
+    // the user has open.
+    const body: Record<string, unknown> = {
       ok: true,
       pid: process.pid,
       version: DAEMON_VERSION,
       uptimeMs: Date.now() - startedAt,
-      memories: ready.store.countMemories(),
       vectors: ready.store.capabilities.vectors,
       journalMode: ready.store.capabilities.journalMode,
-    });
+    };
+    if (hasValidToken(req)) {
+      body.memories = countMemoriesCached(ready.store);
+    }
+    sendJson(res, 200, body);
   }
 
   function authorizeMcp(req: IncomingMessage, res: ServerResponse): boolean {
-    const header = req.headers.authorization;
-    const prefix = "Bearer ";
-    const provided = typeof header === "string" && header.startsWith(prefix) ? header.slice(prefix.length) : null;
-    if (provided === null || !tokenMatches(provided, token)) {
+    if (!hasValidToken(req)) {
       sendJson(res, 401, { error: "unauthorized" });
       return false;
     }
@@ -227,12 +280,39 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     const existing = sessionId ? sessions.get(sessionId) : undefined;
 
     if (existing) {
+      // MAX_REQUEST_BODY_BYTES only bounds readJsonBody, below, on the
+      // *initialize* path -- once a session exists, handleRequest hands the
+      // socket straight to the SDK's own transport, which reads the whole
+      // body itself with no limit of its own. One request from a
+      // compromised client could otherwise OOM the daemon every client on
+      // the machine shares. Content-Length is checked first (cheap, and
+      // catches the common case before a single byte is read), but it can
+      // be absent on a chunked upload, so a running byte counter backs it up
+      // and destroys the socket if the real body outgrows the cap regardless
+      // of what the client claimed.
+      const contentLengthHeader = req.headers["content-length"];
+      if (contentLengthHeader !== undefined && Number(contentLengthHeader) > MAX_REQUEST_BODY_BYTES) {
+        sendJson(res, 413, { error: "request body too large" });
+        return;
+      }
+      let bytesRead = 0;
+      const enforceBodyCap = (chunk: Buffer): void => {
+        bytesRead += chunk.length;
+        if (bytesRead > MAX_REQUEST_BODY_BYTES) {
+          req.destroy();
+        }
+      };
+      req.on("data", enforceBodyCap);
       // Resuming (or terminating, on DELETE) an established session: the
       // SDK's own session handling takes it from here. Touching lastSeen on
       // every handled request (not just at creation) is what makes the idle
       // eviction sweep below measure actual idleness, not session age.
       existing.lastSeen = Date.now();
-      await existing.transport.handleRequest(req, res);
+      try {
+        await existing.transport.handleRequest(req, res);
+      } finally {
+        req.off("data", enforceBodyCap);
+      }
       return;
     }
 
@@ -328,6 +408,11 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
   }, sessionSweepIntervalMs);
   sessionEvictionTimer.unref();
 
+  // Filled in once listen() below resolves; read by the Host check via
+  // closure, never copied, so it reflects the port actually bound even when
+  // `port` was 0 (ephemeral).
+  let boundPort = port;
+
   const httpServer: HttpServer = createServer((req, res) => {
     void (async () => {
       try {
@@ -344,11 +429,18 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
           return;
         }
 
+        // Second half of the DNS-rebinding defence: see isAllowedHost above.
+        const hostHeader = req.headers.host;
+        if (typeof hostHeader !== "string" || !isAllowedHost(hostHeader, boundPort)) {
+          sendJson(res, 403, { error: "host not allowed" });
+          return;
+        }
+
         const url = new URL(req.url ?? "/", `http://${host}`);
         const pathname = url.pathname;
 
         if (pathname === "/health" && req.method === "GET") {
-          handleHealth(res);
+          handleHealth(req, res);
           return;
         }
 
@@ -414,6 +506,25 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
     })();
   });
 
+  // Node's own defaults (60s headersTimeout, no requestTimeout cap, no
+  // connection cap) are the only slowloris/flood bound otherwise, and an
+  // unauthenticated local process could hold thousands of sockets against a
+  // shared daemon. Chosen to still let a legitimate slow client through:
+  //   - headersTimeout: Node's own default (60s) -- long enough for a
+  //     loopback client on a loaded machine to finish sending headers, short
+  //     enough to bound a client that trickles them on purpose.
+  //   - requestTimeout: 10 minutes -- a large but legal import POST
+  //     (export_memories/import_memories, §6) must be able to fully arrive
+  //     even over a slow disk/CPU-bound JSON parse; an MCP tool call is
+  //     otherwise done in milliseconds.
+  //   - maxConnections: 256 -- no zero-config deployment this project
+  //     targets holds anywhere near this many concurrent loopback
+  //     connections (one or two per client: Claude Desktop, Claude Code,
+  //     Cursor, one dashboard tab), so this only bites a connection flood.
+  httpServer.headersTimeout = 60_000;
+  httpServer.requestTimeout = 10 * 60_000;
+  httpServer.maxConnections = 256;
+
   // Claim the port FIRST: on the fixed port production uses, this is what
   // decides who wins the two-clients-launch-together race (§4). A process
   // that loses fails here, with EADDRINUSE, having never opened the
@@ -426,6 +537,7 @@ export async function startDaemon(options: DaemonOptions = {}): Promise<DaemonHa
 
   const address = httpServer.address();
   const actualPort = typeof address === "object" && address !== null ? address.port : port;
+  boundPort = actualPort;
   const url = `http://${host}:${actualPort}`;
 
   // BUILD_BRIEF §2/§3: resolve the embedding config and build a provider

@@ -6,6 +6,7 @@
 
 import { pathToFileURL } from "node:url";
 import { startDaemon } from "./server.js";
+import type { DaemonHandle } from "./server.js";
 
 function readPort(): number | undefined {
   const raw = process.env.CAIRN_PORT;
@@ -17,23 +18,59 @@ function readPort(): number | undefined {
 }
 
 export async function main(): Promise<void> {
-  // CAIRN_HOME is not read here directly: it is picked up by startDaemon's
-  // own dependencies (openStore/runtime-file) via resolveCairnHome(), which
-  // reads process.env.CAIRN_HOME itself. CAIRN_DB overrides the db file
-  // path within that home; CAIRN_PORT overrides the bind port.
-  const handle = await startDaemon({ port: readPort(), dbPath: process.env.CAIRN_DB });
-
+  // Installed BEFORE startDaemon() is even called: openStore and its
+  // migrations run inside startDaemon() after the port is already bound
+  // (measured at 200-400ms), and a signal landing in that window must not
+  // leave the port claimed with no runtime file for a polling client to
+  // find. `handle` is undefined for exactly that window; `closeRequested`
+  // is how a signal that arrives during it gets honoured once startDaemon()
+  // finally resolves, instead of being lost.
+  let handle: DaemonHandle | undefined;
   let shuttingDown = false;
+  let closeRequested = false;
+
+  async function closeAndExit(h: DaemonHandle): Promise<void> {
+    try {
+      await h.close();
+    } catch (err) {
+      // stdout is the MCP transport on some code paths -- every diagnostic,
+      // including one from a failed shutdown, goes to stderr only.
+      process.stderr.write(
+        `cairn daemon: error while shutting down: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`,
+      );
+    }
+    process.exit(0);
+  }
+
   async function shutdown(): Promise<void> {
     if (shuttingDown) {
       return;
     }
+    if (!handle) {
+      closeRequested = true;
+      return;
+    }
     shuttingDown = true;
-    await handle.close();
-    process.exit(0);
+    await closeAndExit(handle);
   }
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+  // SIGHUP: the detached daemon's parent terminal closing. Handled the same
+  // as SIGINT/SIGTERM so the runtime file is always removed on exit, never
+  // left behind naming a pid that is no longer running.
+  process.on("SIGHUP", () => void shutdown());
+
+  // CAIRN_HOME is not read here directly: it is picked up by startDaemon's
+  // own dependencies (openStore/runtime-file) via resolveCairnHome(), which
+  // reads process.env.CAIRN_HOME itself. CAIRN_DB overrides the db file
+  // path within that home; CAIRN_PORT overrides the bind port.
+  handle = await startDaemon({ port: readPort(), dbPath: process.env.CAIRN_DB });
+
+  if (closeRequested) {
+    shuttingDown = true;
+    await closeAndExit(handle);
+    return;
+  }
 
   // Exactly one line, to stderr only: the shim (and any developer watching
   // the daemon's log file) needs this to know the daemon is up and where,

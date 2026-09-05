@@ -1,18 +1,21 @@
 import {
   accessSync,
+  closeSync,
   constants,
   existsSync,
+  fchmodSync,
   mkdirSync,
+  openSync,
   readFileSync,
-  writeFileSync,
   copyFileSync,
   renameSync,
   statSync,
   lstatSync,
   realpathSync,
-  chmodSync,
   unlinkSync,
+  writeSync,
 } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 import type { ClientTarget } from "./clients.js";
 // BLOCKED (see setup builder receipt): src/daemon/server.ts owns the
@@ -21,6 +24,22 @@ import type { ClientTarget } from "./clients.js";
 // redeclaring the number, per spec -- this import will not resolve until
 // DEFAULT_PORT is exported from ../daemon/server.js.
 import { DEFAULT_PORT } from "../daemon/server.js";
+
+// New configs and directories are created with a restrictive default so a
+// user's later-added server credentials never inherit a world-readable
+// mode; an *existing* file's own mode is always preserved instead (see
+// writeConfig below).
+const NEW_FILE_MODE = 0o600;
+const NEW_DIR_MODE = 0o700;
+
+// Test-only seam: forces the temp-file suffix so a test can plant a symlink
+// at the exact path the code will try to open and prove O_EXCL|O_NOFOLLOW
+// refuses it. Not used by any production call path -- the whole point of
+// randomising the suffix is that it is normally unguessable.
+let tmpSuffixForTesting: string | undefined;
+export function __setTmpSuffixForTesting(suffix: string | undefined): void {
+  tmpSuffixForTesting = suffix;
+}
 
 export interface ServerEntry {
   command?: string;
@@ -64,13 +83,27 @@ function deepEqual(a: unknown, b: unknown): boolean {
 // Config is written with two-space indent and a trailing newline; existing
 // unrelated content is round-tripped through JSON.parse/stringify, which
 // normalises formatting (e.g. key order, spacing) but preserves values.
-// The write itself goes to a sibling `.cairn-tmp` file and is renamed onto
-// the target, so a crash or a full disk mid-write cannot leave a truncated
+// The write itself goes to a sibling temp file and is renamed onto the
+// target, so a crash or a full disk mid-write cannot leave a truncated
 // config -- the rename is atomic and either lands the whole new file or
 // nothing changes. If configPath is a symlink, we write through it (to the
 // real target) instead of letting renameSync replace the link itself with
 // a plain file, which would silently break the symlink.
-function writeConfig(configPath: string, config: Record<string, unknown>): void {
+//
+// The temp name is randomised so it cannot be pre-planted by an attacker
+// who can create files in the same directory, and it is opened with
+// O_EXCL|O_NOFOLLOW so even a guessed/racing name refuses to write through
+// an existing path or a symlink there -- a fixed, predictable temp path
+// followed through a planted symlink was how a prior version of this
+// function could be made to write (and chmod, and rename) an attacker's
+// file instead of the real target. O_NOFOLLOW is POSIX; Node accepts the
+// flag on Windows too but it has no effect there (no symlink-following
+// distinction at this layer), so this degrades to "no worse than before"
+// on Windows rather than changing behaviour on POSIX. The file is written
+// and mode-set through the open file descriptor (fchmodSync, never
+// chmodSync on a path) so it is never briefly world-readable between
+// creation and the permission fix-up.
+function writeConfig(configPath: string, config: Record<string, unknown>, defaultMode = NEW_FILE_MODE): void {
   let target = configPath;
   try {
     if (lstatSync(configPath).isSymbolicLink()) {
@@ -80,21 +113,34 @@ function writeConfig(configPath: string, config: Record<string, unknown>): void 
     // configPath does not exist yet -- write it directly.
   }
 
-  let mode: number | undefined;
+  let mode = defaultMode;
   try {
     mode = statSync(target).mode;
   } catch {
-    // No existing file to inherit permissions from.
+    // No existing file to inherit permissions from -- use the restrictive default.
   }
 
-  const tmpPath = `${target}.cairn-tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+  const tmpPath = `${target}.cairn-tmp-${tmpSuffixForTesting ?? randomBytes(6).toString("hex")}`;
+  const fd = openSync(
+    tmpPath,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  let closed = false;
   try {
-    if (mode !== undefined) {
-      chmodSync(tmpPath, mode);
-    }
+    writeSync(fd, `${JSON.stringify(config, null, 2)}\n`, null, "utf8");
+    fchmodSync(fd, mode);
+    closeSync(fd);
+    closed = true;
     renameSync(tmpPath, target);
   } catch (err) {
+    if (!closed) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Best-effort close on the failure path.
+      }
+    }
     try {
       unlinkSync(tmpPath);
     } catch {
@@ -120,13 +166,24 @@ export function applyToClient(
   // strip it before parsing. An empty or whitespace-only file (e.g. a
   // `touch`ed config) has nothing to round-trip either, so treat it the
   // same as "no file" rather than reporting it unparsable.
-  const raw = exists ? readFileSync(target.configPath, "utf8").replace(/^﻿/, "") : undefined;
+  let raw: string | undefined;
+  if (exists) {
+    try {
+      raw = readFileSync(target.configPath, "utf8").replace(/^﻿/, "");
+    } catch (err) {
+      return {
+        target,
+        outcome: "failed",
+        detail: `${target.configPath}: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
   const isEmpty = raw !== undefined && raw.trim() === "";
 
   if (!exists || isEmpty) {
     if (!options.dryRun) {
       try {
-        mkdirSync(dirname(target.configPath), { recursive: true });
+        mkdirSync(dirname(target.configPath), { recursive: true, mode: NEW_DIR_MODE });
         writeConfig(target.configPath, { mcpServers: { cairn: entry } });
       } catch (err) {
         return {

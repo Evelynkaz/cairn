@@ -1,10 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { withTempDir } from "../testing/tmp.js";
 import type { ClientTarget } from "./clients.js";
-import { applyToClient, applyToClients, cairnServerEntry } from "./apply.js";
+import { __setTmpSuffixForTesting, applyToClient, applyToClients, cairnServerEntry } from "./apply.js";
 import { DEFAULT_PORT } from "../daemon/server.js";
 
 function target(configPath: string, overrides: Partial<ClientTarget> = {}): ClientTarget {
@@ -375,5 +385,84 @@ test("atomic write: mode of the original file is carried onto the replacement", 
 
     applyToClient(target(configPath));
     assert.equal(statSync(configPath).mode, modeBefore);
+  });
+});
+
+test("atomic write: a 0600 original file's mode is preserved across an update", () => {
+  withTempDir((dir) => {
+    const configPath = join(dir, "mcp.json");
+    writeFileSync(configPath, JSON.stringify({ mcpServers: { other: { command: "foo" } } }, null, 2), "utf8");
+    chmodSync(configPath, 0o600);
+
+    applyToClient(target(configPath));
+    assert.equal(statSync(configPath).mode & 0o777, 0o600);
+  });
+});
+
+test("created: a new config is 0600 and a newly created directory is 0700", () => {
+  withTempDir((dir) => {
+    const configPath = join(dir, "sub", "mcp.json");
+    const result = applyToClient(target(configPath));
+    assert.equal(result.outcome, "created");
+    assert.equal(statSync(configPath).mode & 0o777, 0o600);
+    assert.equal(statSync(join(dir, "sub")).mode & 0o777, 0o700);
+  });
+});
+
+test("symlink attack: a symlink planted at the temp path is refused, not followed", () => {
+  withTempDir((dir) => {
+    const configPath = join(dir, "mcp.json");
+    const attackerFile = join(dir, "attacker-owned.json");
+    const original = { mcpServers: { other: { command: "foo" } } };
+    writeFileSync(configPath, JSON.stringify(original, null, 2), "utf8");
+    writeFileSync(attackerFile, "not a cairn config", "utf8");
+
+    // The temp name is normally randomised precisely so this can't be
+    // pre-planted; pin it here only so the test can force the exact race
+    // the fix defends against (O_EXCL|O_NOFOLLOW), not to suggest the name
+    // is guessable in production.
+    const fixedSuffix = "deadbeefcafe";
+    const tmpPath = `${configPath}.cairn-tmp-${fixedSuffix}`;
+    symlinkSync(attackerFile, tmpPath);
+
+    __setTmpSuffixForTesting(fixedSuffix);
+    try {
+      const result = applyToClient(target(configPath));
+      assert.equal(result.outcome, "failed");
+    } finally {
+      __setTmpSuffixForTesting(undefined);
+    }
+
+    // The symlink itself must be untouched: not followed for the write, not
+    // chmod'd, not replaced by the rename.
+    assert.ok(lstatSync(tmpPath).isSymbolicLink());
+    assert.equal(readFileSync(attackerFile, "utf8"), "not a cairn config");
+    // The real config is either unchanged or a regular file, never the
+    // symlink itself landed on top of it.
+    assert.equal(lstatSync(configPath).isSymbolicLink(), false);
+    assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), original);
+  });
+});
+
+test("failed: an unreadable existing config yields 'failed' and later targets are still processed", (t) => {
+  if (permissionChecksAreBypassed()) {
+    t.skip("running as root bypasses the permission check, so the read refusal cannot be exercised");
+    return;
+  }
+  withTempDir((dir) => {
+    const unreadable = join(dir, "unreadable.json");
+    const ok = join(dir, "ok.json");
+    writeFileSync(unreadable, JSON.stringify({ mcpServers: {} }, null, 2), "utf8");
+    chmodSync(unreadable, 0o000);
+
+    try {
+      const results = applyToClients([target(unreadable, { id: "claude-desktop" }), target(ok, { id: "cursor" })]);
+      assert.equal(results[0]?.outcome, "failed");
+      assert.ok(results[0]?.detail);
+      assert.equal(results[1]?.outcome, "created");
+      assert.ok(existsSync(ok));
+    } finally {
+      chmodSync(unreadable, 0o644);
+    }
   });
 });

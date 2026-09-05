@@ -7,7 +7,7 @@
 
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { closeSync, openSync, readFileSync } from "node:fs";
+import { closeSync, fchmodSync, openSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureHome, resolveCairnHome } from "../config/paths.js";
@@ -117,7 +117,19 @@ export async function ensureDaemon(options: EnsureDaemonOptions = {}): Promise<E
   // to spawn the ephemeral-port race's eventual loser still returns the
   // file the actual last writer left behind, not a stale read from
   // mid-race.
-  const logFd = openSync(logPath, "a");
+  // The mode on openSync only applies when this call creates the file, so a
+  // pre-existing 0644 log (left by an older build, or pre-planted by another
+  // local account) would otherwise stay world-readable forever -- the daemon
+  // only ever appends to it, never recreates it. fchmodSync on the resulting
+  // fd (not chmodSync on the path) tightens it either way, and cannot be
+  // redirected by a symlink planted at logPath.
+  const logFd = openSync(logPath, "a", 0o600);
+  try {
+    fchmodSync(logFd, 0o600);
+  } catch {
+    // Best-effort, same rationale as storage/db.ts's tightenFileMode: an
+    // unsupported filesystem must not block the daemon from starting.
+  }
   let child: ChildProcess;
   try {
     child = spawn(process.execPath, [entrypoint], {
@@ -139,10 +151,18 @@ export async function ensureDaemon(options: EnsureDaemonOptions = {}): Promise<E
     const tailMessage = tail
       ? ` Last output from "${logPath}":\n${tail}`
       : ` Check the daemon's log at "${logPath}" for what went wrong.`;
-    throw new Error(
-      `cairn: the daemon did not become healthy within ${timeoutMs}ms. ` +
-        `Tried spawning "${entrypoint}" with CAIRN_HOME="${home}".` +
-        tailMessage,
+    // child.kill() above is fire-and-forget: the process it targets can
+    // still be alive (or bind late) after this throws. Attaching the pid
+    // here is what lets a caller (in practice, only the test suite) clean
+    // it up itself -- unlike the success path, there is no EnsureDaemonResult
+    // to carry it on.
+    throw Object.assign(
+      new Error(
+        `cairn: the daemon did not become healthy within ${timeoutMs}ms. ` +
+          `Tried spawning "${entrypoint}" with CAIRN_HOME="${home}".` +
+          tailMessage,
+      ),
+      { spawnedPid: child.pid },
     );
   }
   const owner = readRuntimeFile(home) ?? info;

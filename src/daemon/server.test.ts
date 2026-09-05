@@ -15,6 +15,7 @@ import { createFakeProvider } from "../embeddings/fake.js";
 import { startDaemon } from "./server.js";
 import type { DaemonHandle, DaemonOptions } from "./server.js";
 import { readRuntimeFile, writeRuntimeFile } from "./runtime-file.js";
+import { MAX_REQUEST_BODY_BYTES } from "./http.js";
 
 interface RememberResult {
   id: string;
@@ -105,6 +106,25 @@ function rawGet(handle: DaemonHandle, path: string): Promise<{ status: number }>
   });
 }
 
+// fetch() refuses to let a caller set a custom Host header (it is on the
+// Fetch spec's forbidden-header list, so setting it via `headers` is
+// silently dropped) -- node:http's request() has no such restriction, so it
+// is the only way to actually exercise the Host check over the wire.
+function rawGetWithHeaders(
+  handle: DaemonHandle,
+  path: string,
+  headers: Record<string, string>,
+): Promise<{ status: number }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ host: handle.host, port: handle.port, path, method: "GET", headers }, (res) => {
+      res.resume();
+      res.on("end", () => resolve({ status: res.statusCode ?? 0 }));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 function connectClient(handle: DaemonHandle, name = "daemon-test-client"): { client: Client; transport: StreamableHTTPClientTransport } {
   const transport = new StreamableHTTPClientTransport(new URL(`${handle.url}/mcp`), {
     requestInit: { headers: { Authorization: `Bearer ${handle.token}` } },
@@ -129,37 +149,70 @@ async function callJson<T>(client: Client, name: string, args: Record<string, un
 }
 
 test("the daemon starts, /health reports ok and a live memory count, and the runtime file matches", async () => {
+  await withDaemon(
+    async (handle) => {
+      async function health(): Promise<{ ok: boolean; version: string; uptimeMs: number; memories: number; vectors: boolean }> {
+        const res = await fetch(`${handle.url}/health`, { headers: { Authorization: `Bearer ${handle.token}` } });
+        assert.equal(res.status, 200);
+        return (await res.json()) as { ok: boolean; version: string; uptimeMs: number; memories: number; vectors: boolean };
+      }
+
+      const before = await health();
+      assert.equal(before.ok, true);
+      assert.equal(before.memories, 0);
+      assert.equal(typeof before.uptimeMs, "number");
+      assert.equal(typeof before.vectors, "boolean");
+
+      // The count must be observed to actually change, not just be zero at
+      // startup -- store.countMemories() is what /health calls (server.ts),
+      // and this is what proves that wiring, not a hardcoded value.
+      const { client, transport } = connectClient(handle);
+      await client.connect(transport);
+      try {
+        await callJson<RememberResult>(client, "remember", { content: "health count sanity check" });
+      } finally {
+        await client.close();
+      }
+      const after = await health();
+      assert.equal(after.memories, 1);
+
+      const info = readRuntimeFile();
+      assert.ok(info);
+      assert.equal(info?.pid, process.pid);
+      assert.equal(info?.port, handle.port);
+      assert.equal(info?.token, handle.token);
+    },
+    // A test asserting the exact count immediately after a write must not
+    // be fooled by the health-count memoization TTL production uses.
+    { healthMemoryCountTtlMs: 0 },
+  );
+});
+
+test("/health without a token does not disclose the memory count, but does with a valid one", async () => {
   await withDaemon(async (handle) => {
-    async function health(): Promise<{ ok: boolean; version: string; uptimeMs: number; memories: number; vectors: boolean }> {
-      const res = await fetch(`${handle.url}/health`);
-      assert.equal(res.status, 200);
-      return (await res.json()) as { ok: boolean; version: string; uptimeMs: number; memories: number; vectors: boolean };
-    }
-
-    const before = await health();
-    assert.equal(before.ok, true);
-    assert.equal(before.memories, 0);
-    assert.equal(typeof before.uptimeMs, "number");
-    assert.equal(typeof before.vectors, "boolean");
-
-    // The count must be observed to actually change, not just be zero at
-    // startup -- store.countMemories() is what /health calls (server.ts),
-    // and this is what proves that wiring, not a hardcoded value.
     const { client, transport } = connectClient(handle);
     await client.connect(transport);
     try {
-      await callJson<RememberResult>(client, "remember", { content: "health count sanity check" });
+      await callJson<RememberResult>(client, "remember", { content: "unauthenticated health count check" });
     } finally {
       await client.close();
     }
-    const after = await health();
-    assert.equal(after.memories, 1);
 
-    const info = readRuntimeFile();
-    assert.ok(info);
-    assert.equal(info?.pid, process.pid);
-    assert.equal(info?.port, handle.port);
-    assert.equal(info?.token, handle.token);
+    const noToken = await fetch(`${handle.url}/health`);
+    assert.equal(noToken.status, 200);
+    const noTokenBody = (await noToken.json()) as Record<string, unknown>;
+    assert.equal(noTokenBody.ok, true);
+    assert.ok(!("memories" in noTokenBody), "unauthenticated /health must not disclose the memory count");
+
+    const wrongToken = await fetch(`${handle.url}/health`, { headers: { Authorization: "Bearer wrong-token-value" } });
+    assert.equal(wrongToken.status, 200);
+    const wrongTokenBody = (await wrongToken.json()) as Record<string, unknown>;
+    assert.ok(!("memories" in wrongTokenBody), "a wrong token must not disclose the memory count either");
+
+    const withToken = await fetch(`${handle.url}/health`, { headers: { Authorization: `Bearer ${handle.token}` } });
+    assert.equal(withToken.status, 200);
+    const withTokenBody = (await withToken.json()) as { memories: number };
+    assert.equal(withTokenBody.memories, 1);
   });
 });
 
@@ -330,6 +383,140 @@ test("a request body over the size cap is rejected with 413 before being parsed"
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { oversized } }),
     });
     assert.equal(res.status, 413);
+  });
+});
+
+test("an over-cap body on an ESTABLISHED MCP session (post-initialize) is rejected with 413", async () => {
+  await withDaemon(async (handle) => {
+    const { client, transport } = connectClient(handle);
+    await client.connect(transport);
+    const sessionId = transport.sessionId;
+    assert.ok(sessionId);
+    try {
+      const oversized = "x".repeat(5 * 1024 * 1024); // over MAX_REQUEST_BODY_BYTES (4 MiB)
+      const res = await fetch(`${handle.url}/mcp`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${handle.token}`,
+          "Content-Type": "application/json",
+          "Mcp-Session-Id": sessionId,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/list", params: { oversized } }),
+      });
+      assert.equal(res.status, 413);
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+test("a chunked request with no Content-Length that exceeds the cap on an established session is cut off", async () => {
+  await withDaemon(async (handle) => {
+    const { client, transport } = connectClient(handle);
+    await client.connect(transport);
+    const sessionId = transport.sessionId;
+    assert.ok(sessionId);
+    try {
+      // "response" if the whole oversized body was accepted and a normal
+      // HTTP response came back (the bug this test exists to catch);
+      // "connection-error" if the connection was torn down first, which is
+      // the only correct outcome once the byte-counting safeguard fires.
+      let outcome: "response" | "connection-error" = "response";
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const done = () => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        const req = httpRequest(
+          {
+            host: handle.host,
+            port: handle.port,
+            path: "/mcp",
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${handle.token}`,
+              "Content-Type": "application/json",
+              // The SDK's own transport 406s a request missing this before
+              // ever reading the body -- without it, the test would "pass"
+              // by getting a fast, unrelated rejection instead of actually
+              // exercising the byte-counting safeguard.
+              Accept: "application/json, text/event-stream",
+              "Mcp-Session-Id": sessionId,
+              // Deliberately no Content-Length: node:http then sends this as
+              // a chunked request, the case the header check alone cannot
+              // catch -- the byte-counting safeguard must cut it off instead.
+            },
+          },
+          (res) => {
+            res.resume();
+            res.on("end", () => {
+              outcome = "response";
+              done();
+            });
+          },
+        );
+        req.on("error", () => {
+          outcome = "connection-error";
+          done();
+        });
+        const chunk = Buffer.alloc(1024 * 1024, "a");
+        const totalChunks = Math.ceil((MAX_REQUEST_BODY_BYTES + 5 * 1024 * 1024) / chunk.length);
+        let sent = 0;
+        function pump(): void {
+          if (settled || sent >= totalChunks) {
+            if (!settled) req.end();
+            return;
+          }
+          sent += 1;
+          // Stop pumping the moment a write itself reports failure (the
+          // destroyed-socket case this test exists to trigger) instead of
+          // writing again -- a further write on a torn-down socket fires its
+          // error asynchronously, after this promise has already settled,
+          // which read back as an uncaught exception rather than a clean
+          // pass/fail.
+          req.write(chunk, (err) => {
+            if (err) {
+              outcome = "connection-error";
+              done();
+              return;
+            }
+            pump();
+          });
+        }
+        pump();
+      });
+      assert.equal(
+        outcome,
+        "connection-error",
+        "an oversized chunked body with no Content-Length must have its connection cut, not complete as a normal response",
+      );
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+test("Host header enforcement: a foreign Host is refused while loopback forms are accepted", async () => {
+  await withDaemon(async (handle) => {
+    const evilHost = await rawGetWithHeaders(handle, "/health", { Host: "evil.example" });
+    assert.equal(evilHost.status, 403);
+
+    const loopbackIp = await rawGetWithHeaders(handle, "/health", { Host: `127.0.0.1:${handle.port}` });
+    assert.equal(loopbackIp.status, 200);
+
+    const loopbackName = await rawGetWithHeaders(handle, "/health", { Host: `localhost:${handle.port}` });
+    assert.equal(loopbackName.status, 200);
+  });
+});
+
+test("/api responses carry cache-control: no-store", async () => {
+  await withDaemon(async (handle) => {
+    const res = await fetch(`${handle.url}/api/stats`, { headers: { Authorization: `Bearer ${handle.token}` } });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("cache-control"), "no-store");
   });
 });
 

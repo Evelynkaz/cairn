@@ -16,7 +16,11 @@ import { timingSafeEqual } from "node:crypto";
 export const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
 
 export function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  // no-store: an /api response can carry full memory text, and without this
+  // it is only heuristically non-cacheable -- a browser may still write it
+  // to its on-disk HTTP cache, outliving the sessionStorage-scoped token the
+  // dashboard deliberately confines to one tab.
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   res.end(JSON.stringify(body));
 }
 

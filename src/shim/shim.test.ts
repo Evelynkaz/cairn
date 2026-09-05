@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -386,6 +386,20 @@ function isPortCollision(err: unknown): boolean {
   return err instanceof Error && err.message.includes("EADDRINUSE");
 }
 
+// Promise.all rejects the moment ONE of the two calls below hits its own
+// timeout -- routine when many test files race for machine resources -- and
+// at that instant the OTHER call's spawned daemon can still be mid-startup,
+// with nothing yet naming its pid. ensureDaemon() now attaches spawnedPid to
+// that timeout error for exactly this reason (see ensure-daemon.ts); a
+// fulfilled call carries it on its result instead.
+function pidFromSettled(result: PromiseSettledResult<EnsureDaemonResult>): number | undefined {
+  if (result.status === "fulfilled") {
+    return result.value.spawnedPid;
+  }
+  const reason = result.reason as { spawnedPid?: unknown } | undefined;
+  return typeof reason?.spawnedPid === "number" ? reason.spawnedPid : undefined;
+}
+
 async function attemptConcurrentEnsureDaemonRace(): Promise<"success" | "collision"> {
   const home = makeTempDir();
   const port = await freePort();
@@ -397,27 +411,35 @@ async function attemptConcurrentEnsureDaemonRace(): Promise<"success" | "collisi
     // On the fixed port both calls share, only one spawned child can ever
     // actually bind it -- the loser is expected to hit EADDRINUSE in its own
     // process and exit unaided (see the comment in ensure-daemon.ts).
-    let a: EnsureDaemonResult;
-    let b: EnsureDaemonResult;
-    try {
-      [a, b] = await Promise.all([
-        ensureDaemon({ home, env, timeoutMs: 15_000 }),
-        ensureDaemon({ home, env, timeoutMs: 15_000 }),
-      ]);
-    } catch (err) {
-      if (isPortCollision(err)) {
-        return "collision";
-      }
-      throw err;
-    }
-    // Tracking BOTH spawned pids here, not just the eventual owner's, is
-    // what catches it if that assumption ever doesn't hold: a loser that
-    // somehow stays alive would otherwise be referenced by nobody once this
-    // test returns.
-    aPid = a.spawnedPid;
-    bPid = b.spawnedPid;
+    // Promise.allSettled (not Promise.all) is what lets both pids below be
+    // recorded even when one call rejects on its own timeout instead of on
+    // EADDRINUSE -- otherwise the other call's daemon, which can still bind
+    // and write daemon.json after this function has already returned and
+    // deleted `home`, is orphaned with nothing tracking it.
+    const [aSettled, bSettled] = await Promise.allSettled([
+      ensureDaemon({ home, env, timeoutMs: 15_000 }),
+      ensureDaemon({ home, env, timeoutMs: 15_000 }),
+    ]);
+
+    // Tracking both spawned pids -- and whatever daemon.json already names --
+    // BEFORE looking at whether either call rejected is what catches a
+    // daemon that a timed-out call's own kill() missed.
+    aPid = pidFromSettled(aSettled);
+    bPid = pidFromSettled(bSettled);
     trackPid(aPid);
     trackPid(bPid);
+    trackPid(readRuntimeFile(home)?.pid);
+
+    if (aSettled.status === "rejected" || bSettled.status === "rejected") {
+      const reason = aSettled.status === "rejected" ? aSettled.reason : (bSettled as PromiseRejectedResult).reason;
+      if (isPortCollision(reason)) {
+        return "collision";
+      }
+      throw reason;
+    }
+
+    const a = aSettled.value;
+    const b = bSettled.value;
     assert.equal(a.url, `http://127.0.0.1:${port}`);
     assert.equal(a.url, b.url);
     assert.equal(a.token, b.token);
@@ -431,6 +453,12 @@ async function attemptConcurrentEnsureDaemonRace(): Promise<"success" | "collisi
     await killPid(daemonPid ?? readRuntimeFile(home)?.pid);
     await killPid(aPid);
     await killPid(bPid);
+    // One short grace poll: a daemon that binds late can still write
+    // daemon.json (or still be alive) after the kills above have already
+    // run -- see the Promise.allSettled comment on why that is routine, not
+    // rare, under concurrent test load.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await killPid(readRuntimeFile(home)?.pid);
     cleanupDir(home);
   }
 }
@@ -491,6 +519,47 @@ test("ensureDaemon does not leak the daemon.log file descriptor across repeated 
     for (const home of homes) {
       cleanupDir(home);
     }
+  }
+});
+
+test("ensureDaemon creates daemon.log at mode 0600", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX file mode bits are not meaningful on Windows");
+    return;
+  }
+  const home = makeTempDir();
+  const env = { ...process.env, CAIRN_PORT: "0" };
+  let pid: number | undefined;
+  try {
+    const result = await ensureDaemon({ home, env, timeoutMs: 15_000 });
+    trackPid(result.spawnedPid);
+    pid = readRuntimeFile(home)?.pid;
+    assert.equal(statSync(join(home, "daemon.log")).mode & 0o777, 0o600);
+  } finally {
+    await killPid(pid ?? readRuntimeFile(home)?.pid);
+    cleanupDir(home);
+  }
+});
+
+test("ensureDaemon tightens a pre-existing 0644 daemon.log to 0600", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX file mode bits are not meaningful on Windows");
+    return;
+  }
+  const home = makeTempDir();
+  const logPath = join(home, "daemon.log");
+  writeFileSync(logPath, "");
+  chmodSync(logPath, 0o644);
+  const env = { ...process.env, CAIRN_PORT: "0" };
+  let pid: number | undefined;
+  try {
+    const result = await ensureDaemon({ home, env, timeoutMs: 15_000 });
+    trackPid(result.spawnedPid);
+    pid = readRuntimeFile(home)?.pid;
+    assert.equal(statSync(logPath).mode & 0o777, 0o600);
+  } finally {
+    await killPid(pid ?? readRuntimeFile(home)?.pid);
+    cleanupDir(home);
   }
 });
 

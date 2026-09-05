@@ -1,3 +1,4 @@
+import { chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import { getLoadablePath } from "sqlite-vec";
 import { dbPath, ensureHome } from "../config/paths.js";
@@ -65,6 +66,19 @@ function isLockError(error: unknown): boolean {
   return error instanceof Error && /database is locked|SQLITE_BUSY/i.test(error.message);
 }
 
+// Best-effort: `path` (or a `-wal`/`-shm` sidecar) may not exist yet -- the
+// sidecars only appear once WAL mode actually takes -- or the filesystem may
+// refuse chmod entirely (read-only mount, some network filesystems).
+// openDb must still succeed either way; the directory (0700, see
+// config/paths.ts ensureHome) is the fallback boundary if this can't apply.
+function tightenFileMode(path: string): void {
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    // See comment above: absence or an unsupported filesystem is fine.
+  }
+}
+
 // Synchronous blocking sleep: openDb is called synchronously all over this
 // codebase (CLI commands, every test in this file, driver open itself), so
 // the retry below cannot become async without breaking every one of those
@@ -111,7 +125,25 @@ export function openDb(options: OpenDbOptions = {}): CairnDb {
 }
 
 function openOnce(driverFactory: DriverFactory, path: string, readOnly: boolean): CairnDb {
-  const driver = driverFactory({ path, allowExtension: true, readOnly });
+  // The driver's own create call uses the process umask, which on a looser
+  // default (e.g. 022) leaves a fresh database file world- or
+  // group-readable -- the memory store, secrets and all, would then be
+  // protected only by the 0700 home directory (config/paths.ts
+  // ensureHome), not by the file itself. Restricting the umask for the
+  // duration of this call means the file is born at 0600 rather than
+  // created loose and tightened after the fact; the chmodSync below is a
+  // backstop for a file that already existed (a pre-existing CAIRN_HOME, a
+  // restored backup) rather than the primary defence.
+  const previousUmask = process.umask(0o077);
+  let driver: SqliteDriver;
+  try {
+    driver = driverFactory({ path, allowExtension: true, readOnly });
+  } finally {
+    process.umask(previousUmask);
+  }
+  if (path !== ":memory:") {
+    tightenFileMode(path);
+  }
 
   try {
     // busy_timeout must be set FIRST, before any statement that can
@@ -146,6 +178,15 @@ function openOnce(driverFactory: DriverFactory, path: string, readOnly: boolean)
       const row = driver.prepare("PRAGMA journal_mode").get();
       const value = row?.["journal_mode"];
       journalMode = typeof value === "string" ? value : null;
+    }
+    // The `-wal`/`-shm` sidecars are created by the pragma above (when it
+    // actually settles on `wal`), not by the driver's initial open, so they
+    // can only be tightened here -- and like the main file, they inherit the
+    // process umask unless it was restricted at the moment SQLite created
+    // them, which the block above did not do.
+    if (path !== ":memory:") {
+      tightenFileMode(`${path}-wal`);
+      tightenFileMode(`${path}-shm`);
     }
     driver.exec("PRAGMA foreign_keys=ON");
     // Without this, `INSERT OR REPLACE INTO memories` does not fire the

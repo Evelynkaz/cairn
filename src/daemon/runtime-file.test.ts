@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createServer as createNetServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
@@ -65,6 +65,42 @@ test("the runtime file is mode 0600 on POSIX; on Windows the mode bit is a no-op
       // the protection there is the user profile directory, not this mode.
       assert.ok(stat.isFile());
     }
+  });
+});
+
+test("writeRuntimeFile tightens a pre-existing 0644 file to 0600", (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX file mode bits are not meaningful on Windows");
+    return;
+  }
+  withTempDir((dir) => {
+    const path = runtimeFilePath(dir);
+    writeFileSync(path, "{}");
+    chmodSync(path, 0o644);
+
+    writeRuntimeFile(sampleInfo(), dir);
+
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+  });
+});
+
+test("writeRuntimeFile does not write the token through a symlink planted at the runtime file path", (t) => {
+  if (process.platform === "win32") {
+    t.skip("symlinks require elevated privilege to create on Windows by default");
+    return;
+  }
+  withTempDir((dir) => {
+    const path = runtimeFilePath(dir);
+    const attackerTarget = join(dir, "attacker-target.json");
+    writeFileSync(attackerTarget, "not touched");
+    symlinkSync(attackerTarget, path);
+
+    const info = sampleInfo();
+    writeRuntimeFile(info, dir);
+
+    assert.equal(readFileSync(attackerTarget, "utf8"), "not touched");
+    assert.ok(!lstatSync(path).isSymbolicLink());
+    assert.deepEqual(readRuntimeFile(dir), info);
   });
 });
 

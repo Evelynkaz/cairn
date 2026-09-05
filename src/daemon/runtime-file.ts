@@ -3,7 +3,7 @@
 // is the rendezvous point for the §4 "one daemon, many clients" story --
 // nothing here talks to the database.
 
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fchmodSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { ensureHome, resolveCairnHome } from "../config/paths.js";
@@ -31,11 +31,34 @@ export function generateToken(): string {
 // bit. Either way the token is defence-in-depth, not the primary boundary --
 // the primary boundary is binding the daemon to loopback only (see
 // server.ts), which keeps the token off the network entirely.
+//
+// `{ mode }` on writeFileSync only applies when the call CREATES the file --
+// a `daemon.json` planted in advance (by a co-resident attacker, or just
+// left behind at a looser mode from an older Cairn) keeps its existing mode
+// forever, silently, no matter how many times the token is rotated. To
+// actually guarantee 0600 on every write, this always creates a brand-new
+// file under a temp name with `wx` (fails if that exact name exists, so it
+// can't be tricked into writing through a pre-planted symlink), forces the
+// mode with `fchmodSync` on the open descriptor (belt-and-suspenders against
+// a loose umask), and only then renames it over the real path --
+// `renameSync` replaces whatever is at the destination, including a symlink,
+// without ever opening or following it, so a symlink planted at
+// `daemon.json` is inert. The rename is also atomic, so `readRuntimeFile`
+// never observes a half-written file.
 const RUNTIME_FILE_MODE = 0o600;
 
 export function writeRuntimeFile(info: RuntimeInfo, home: string = resolveCairnHome()): void {
   ensureHome(home);
-  writeFileSync(runtimeFilePath(home), JSON.stringify(info, null, 2), { mode: RUNTIME_FILE_MODE });
+  const path = runtimeFilePath(home);
+  const tmpPath = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+  const fd = openSync(tmpPath, "wx", RUNTIME_FILE_MODE);
+  try {
+    fchmodSync(fd, RUNTIME_FILE_MODE);
+    writeSync(fd, JSON.stringify(info, null, 2));
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmpPath, path);
 }
 
 function isRuntimeInfo(value: unknown): value is RuntimeInfo {
