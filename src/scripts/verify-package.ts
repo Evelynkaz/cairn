@@ -71,8 +71,28 @@ interface NpmPackEntry {
   files: { path: string }[];
 }
 
-function packedFiles(): string[] {
-  const output = execFileSync("npm", ["pack", "--dry-run", "--json"], {
+// `execFileSync("npm", ...)` fails on Windows with `spawnSync npm ENOENT`,
+// because there the executable on PATH is `npm.cmd`, not `npm` -- unlike a
+// shell, execFile does not consult PATHEXT to resolve a bare name. Prefer
+// `npm_execpath`, which npm sets to its own JS entrypoint when it invokes a
+// script; running that through `process.execPath` sidesteps executable
+// name resolution (and any shell) entirely. Fall back to a platform-picked
+// binary name when npm_execpath isn't set, e.g. when this script is run
+// directly with `node`, as CI does.
+export function resolveNpmCommand(
+  platform: NodeJS.Platform,
+  npmExecPath: string | undefined,
+  execPath: string,
+): { command: string; args: string[] } {
+  if (npmExecPath) {
+    return { command: execPath, args: [npmExecPath] };
+  }
+  return { command: platform === "win32" ? "npm.cmd" : "npm", args: [] };
+}
+
+export function packedFiles(): string[] {
+  const { command, args } = resolveNpmCommand(process.platform, process.env.npm_execpath, process.execPath);
+  const output = execFileSync(command, [...args, "pack", "--dry-run", "--json"], {
     cwd: repoRoot,
     encoding: "utf8",
   });
@@ -81,7 +101,10 @@ function packedFiles(): string[] {
   if (!entry) {
     throw new Error("verify-package: npm pack --dry-run --json returned no entries");
   }
-  return entry.files.map((f) => f.path);
+  // `npm pack --dry-run --json` reports `files[].path` with forward
+  // slashes on every platform (npm normalizes internally), but normalize
+  // any stray backslash here too so the checks below never depend on it.
+  return entry.files.map((f) => f.path.replace(/\\/g, "/"));
 }
 
 function main(): void {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { checkPackageFiles } from "./verify-package.js";
+import { checkPackageFiles, packedFiles, resolveNpmCommand } from "./verify-package.js";
 
 const BIN = "dist/cli/index.js";
 const GOOD_FILES = [
@@ -40,4 +40,29 @@ test("checkPackageFiles flags a leaked src/ tree", () => {
   const files = [...GOOD_FILES, "src/daemon/main.ts"];
   const problems = checkPackageFiles(files, BIN);
   assert.ok(problems.some((p) => p.includes("src/daemon/main.ts")));
+});
+
+test("resolveNpmCommand prefers npm_execpath via process.execPath when set", () => {
+  const result = resolveNpmCommand("win32", "/fake/npm-cli.js", "/fake/node.exe");
+  assert.deepEqual(result, { command: "/fake/node.exe", args: ["/fake/npm-cli.js"] });
+});
+
+test("resolveNpmCommand falls back to npm.cmd on win32 without npm_execpath", () => {
+  const result = resolveNpmCommand("win32", undefined, "/fake/node.exe");
+  assert.deepEqual(result, { command: "npm.cmd", args: [] });
+});
+
+test("resolveNpmCommand falls back to npm on non-win32 without npm_execpath", () => {
+  const result = resolveNpmCommand("linux", undefined, "/fake/node");
+  assert.deepEqual(result, { command: "npm", args: [] });
+});
+
+// Exercises the actual spawn, not just the predicate -- this is the case
+// that broke Windows CI with `spawnSync npm ENOENT`. ~2s on this repo, which
+// is fine for the unit suite; if that ever changes, keep the pure
+// resolveNpmCommand tests above as the fast substitute.
+test("packedFiles spawns npm pack for real and lists package.json", () => {
+  const files = packedFiles();
+  assert.ok(files.length > 0);
+  assert.ok(files.includes("package.json"));
 });
