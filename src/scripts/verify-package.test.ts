@@ -16,6 +16,11 @@ const GOOD_FILES = [
   "dist/dashboard/ui/state.js",
   "dist/dashboard/ui/api-client.js",
   "dist/dashboard/ui/views/memories.js",
+  "dist/dashboard/ui/views/timeline.js",
+  "dist/dashboard/ui/views/audit.js",
+  "dist/dashboard/ui/views/clients.js",
+  "dist/dashboard/ui/views/privacy.js",
+  "dist/dashboard/ui/views/stats.js",
 ];
 const DASHBOARD_ASSETS = GOOD_FILES.filter((f) => f.startsWith("dist/dashboard/ui/"));
 

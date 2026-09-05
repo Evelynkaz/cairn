@@ -27,3 +27,114 @@ jobs:
         # falls back to a bare executable name and Windows fails.
         run: npm run verify-package
       - run: npm test
+
+  # Proves BUILD_BRIEF §13's "cross-platform smoke test": that the tarball
+  # `npm pack` actually produces installs and runs on all three OSes, not
+  # just that its file list looks right (the `build` job's verify-package
+  # step) or that the working tree's unit tests pass. It installs the
+  # packed tarball into a scratch directory outside the repo, then invokes
+  # the CLI by its resolved path inside that install
+  # (`node <tmp>/node_modules/<package name>/dist/cli/index.js`) rather than via the
+  # `bin` shim on PATH -- a shim depends on how npm wires executables on
+  # each platform (a symlink on POSIX, a generated .cmd/.ps1 shim on
+  # Windows), which is exactly the kind of platform difference this job
+  # exists to route around, not depend on. It never runs `cairn setup`:
+  # that command writes into real client config files outside CAIRN_HOME
+  # (see CONTRIBUTING.md) and is out of scope here.
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run build
+      - name: Pack and install the tarball outside the repo
+        shell: bash
+        run: |
+          set -e
+          # On windows-latest, $RUNNER_TEMP is a native Windows path (e.g. D:\a\_temp)
+          # even under bash; normalise it to POSIX so mkdir/cd/npm see a consistent
+          # form. cygpath exists only on Windows runners, so this is a no-op elsewhere.
+          RUNNER_TEMP=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")
+          mkdir -p "$RUNNER_TEMP/pack" "$RUNNER_TEMP/install"
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+          cd "$RUNNER_TEMP/install"
+          npm init -y
+          TARBALL=$(node -e "const fs=require('node:fs');const path=require('node:path');const dir=process.argv[1];const file=fs.readdirSync(dir).find(f=>f.endsWith('.tgz'));console.log(path.join(dir,file));" "$RUNNER_TEMP/pack")
+          npm install "$TARBALL"
+      - name: Run --version and status through the installed CLI's real path
+        shell: bash
+        env:
+          CAIRN_PORT: "0"
+        run: |
+          set -e
+          # On windows-latest, $RUNNER_TEMP is a native Windows path (e.g. D:\a\_temp)
+          # even under bash; normalise it to POSIX so it's safe to build paths from.
+          # cygpath exists only on Windows runners, so this is a no-op elsewhere.
+          RUNNER_TEMP=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")
+          # CAIRN_HOME is derived here (not in the step's `env:` block) so the
+          # normalised $RUNNER_TEMP above is what it's built from.
+          export CAIRN_HOME="$RUNNER_TEMP/cairn-home"
+          # The npm package name is an open question (BUILD_BRIEF; the name "cairn" is
+          # already taken on npm), so derive the install directory from package.json's
+          # `name` at run time instead of hardcoding it -- that also does the right
+          # thing for a scoped name like `@scope/pkg`. Export it so the next step,
+          # which can't call node from an `env:` value, can reuse it.
+          PKG_DIR=$(node -p "require('./package.json').name")
+          CLI="$RUNNER_TEMP/install/node_modules/$PKG_DIR/dist/cli/index.js"
+          echo "CLI_PATH=$CLI" >> "$GITHUB_ENV"
+          EXPECTED_VERSION=$(node -e "console.log(require('./package.json').version)")
+          ACTUAL_VERSION=$(node "$CLI" --version)
+          node -e "
+            const [expected, actual] = process.argv.slice(1);
+            if (actual.trim() !== expected.trim()) {
+              throw new Error('cairn --version printed ' + JSON.stringify(actual) + ', expected ' + JSON.stringify(expected));
+            }
+            console.log('version ok:', actual.trim());
+          " "$EXPECTED_VERSION" "$ACTUAL_VERSION"
+          node "$CLI" status
+      - name: Start the installed daemon, poll /health, then stop it
+        shell: bash
+        env:
+          CAIRN_PORT: "0"
+        run: |
+          set -e
+          # On windows-latest, $RUNNER_TEMP is a native Windows path (e.g. D:\a\_temp)
+          # even under bash; normalise it to POSIX so it's safe to build paths from.
+          # cygpath exists only on Windows runners, so this is a no-op elsewhere.
+          RUNNER_TEMP=$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")
+          # CAIRN_HOME is derived here (not in the step's `env:` block) so the
+          # normalised $RUNNER_TEMP above is what it's built from, and matches the
+          # previous step's value.
+          export CAIRN_HOME="$RUNNER_TEMP/cairn-home"
+          node "$CLI_PATH" start
+          node <<'EOF'
+          const { execFileSync } = require("node:child_process");
+          const cli = process.env.CLI_PATH;
+          const status = JSON.parse(execFileSync(process.execPath, [cli, "status", "--json"], { encoding: "utf8" }));
+          const healthUrl = `${status.daemon.url}/health`;
+          const deadline = Date.now() + 30000;
+          (async () => {
+            while (Date.now() < deadline) {
+              try {
+                const res = await fetch(healthUrl);
+                if (res.status === 200) {
+                  console.log("health ok:", await res.text());
+                  process.exit(0);
+                }
+              } catch {
+                // daemon not accepting connections yet; keep polling
+              }
+              await new Promise((r) => setTimeout(r, 500));
+            }
+            console.error(`daemon at ${healthUrl} never answered /health within 30s`);
+            process.exit(1);
+          })();
+          EOF
+          node "$CLI_PATH" stop

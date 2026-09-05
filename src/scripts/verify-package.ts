@@ -15,16 +15,21 @@ const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
 // Every file the dashboard actually loads at runtime, not just its entry
 // points: index.html loads app.js, which statically imports dom.js,
-// state.js, api-client.js, and views/memories.js -- each is fetched by the
-// browser as its own ES module (this build is not bundled), so a `files`
-// edit that dropped any one of them would pass a check that only looked at
-// index.html/app.js/styles.css and break the dashboard on its first route.
+// state.js, api-client.js, and all six view modules under views/ -- each is
+// fetched by the browser as its own ES module (this build is not bundled),
+// so a `files` edit that dropped any one of them would pass a check that
+// only looked at index.html/app.js/styles.css and break the dashboard.
 // The daemon itself loads no other on-disk assets at runtime (no migrations
 // directory, no template files) -- everything else it needs is compiled
 // into dist/**/*.js, already covered by the package.json `files` glob and
 // this script's test-artifact/src leak checks below -- so this list plus
 // the bin-entry check above is the complete runtime surface, not a
 // speculative addition.
+//
+// Every view module app.js's router imports must be listed here too: a
+// missing one is invisible to every other check (tsc, the other tests, npm
+// pack itself) and only fails in the user's browser, on whichever route they
+// click first.
 const REQUIRED_DASHBOARD_FILES = [
   "dist/dashboard/ui/index.html",
   "dist/dashboard/ui/app.js",
@@ -33,6 +38,11 @@ const REQUIRED_DASHBOARD_FILES = [
   "dist/dashboard/ui/state.js",
   "dist/dashboard/ui/api-client.js",
   "dist/dashboard/ui/views/memories.js",
+  "dist/dashboard/ui/views/timeline.js",
+  "dist/dashboard/ui/views/audit.js",
+  "dist/dashboard/ui/views/clients.js",
+  "dist/dashboard/ui/views/privacy.js",
+  "dist/dashboard/ui/views/stats.js",
 ];
 
 const TEST_ARTIFACT_RE = /\.test\.(js|d\.ts)(\.map)?$/;
