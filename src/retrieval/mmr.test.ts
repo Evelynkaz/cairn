@@ -77,3 +77,56 @@ test("a mix of null and non-null vectors: null candidates are neither promoted n
   const result = mmr([a, aLike, noVec], 3, 0.7);
   assert.deepEqual(result, ["a", "noVec", "aLike"]);
 });
+
+// ALSO FIX regression: `maxSim` used to have no floor at 0, so an
+// anti-correlated (negative cosine similarity) candidate scored a BONUS in
+// `-(1-lambda)*maxSim` instead of a penalty. Fails without the fix: the
+// anti-correlated candidate is picked ahead of an equally-relevant,
+// genuinely-unrelated (orthogonal, similarity 0) one.
+test("a negative (anti-correlated) similarity is floored at 0, never rewarded as a diversity bonus", () => {
+  const a: MmrCandidate = { id: "a", relevance: 0.9, vector: new Float32Array([1, 0]) };
+  // Equal relevance, one orthogonal (similarity 0) and one opposite
+  // (similarity -1) to `a`. An un-floored maxSim would let the opposite
+  // one's negative similarity flip sign into a BONUS once `a` is selected,
+  // ranking it ahead of the orthogonal one purely for being anti-correlated.
+  const orthogonal: MmrCandidate = { id: "orthogonal", relevance: 0.5, vector: new Float32Array([0, 1]) };
+  const opposite: MmrCandidate = { id: "opposite", relevance: 0.5, vector: new Float32Array([-1, 0]) };
+
+  const result = mmr([a, orthogonal, opposite], 3, 0.5);
+  assert.deepEqual(result, ["a", "orthogonal", "opposite"]);
+});
+
+// ALSO FIX, documented rather than changed (see mmr.ts's module comment for
+// why the alternative -- estimating a null pairing from observed real-vs-
+// real similarities -- was tried and rejected as fragile on small samples):
+// a null vector is scored at a flat 0 similarity against every other
+// candidate, which is EXPLICITLY NOT NEUTRAL once real embeddings are in
+// the mix (real unrelated pairs already sit around 0.6-0.75 similarity
+// here), so an un-embedded candidate is favoured for diversity purposes
+// over an equally- or more-relevant embedded one, purely for lacking a
+// vector. This pins that documented behaviour so a future change to it is
+// deliberate, not accidental.
+test("a null vector is favoured for diversity over an embedded one of higher relevance (documented, not neutral)", () => {
+  const a: MmrCandidate = { id: "a", relevance: 0.9, vector: new Float32Array([1, 0]) };
+  // Simulates the "real unrelated pairs still sit around 0.6-0.75
+  // similarity" baseline this project's local embeddings exhibit.
+  const related: MmrCandidate = { id: "related", relevance: 0.6, vector: new Float32Array([0.7, 0.714142843]) };
+  const noVec: MmrCandidate = { id: "noVec", relevance: 0.55, vector: null };
+
+  const result = mmr([a, related, noVec], 3, 0.5);
+  assert.deepEqual(result, ["a", "noVec", "related"]);
+});
+
+// ALSO FIX regression: `lambda` was never clamped, so `NaN` made every
+// `mmrScore` comparison false, leaving `bestIndex` at -1 and throwing on
+// `remaining[-1]`, and a negative lambda inverted the relevance/diversity
+// trade-off instead of just mis-weighting it.
+test("lambda is clamped to [0, 1]: NaN and out-of-range values never throw or invert ranking", () => {
+  const candidates: MmrCandidate[] = [
+    { id: "high", relevance: 0.9, vector: null },
+    { id: "low", relevance: 0.1, vector: null },
+  ];
+  assert.deepEqual(mmr(candidates, 2, Number.NaN), ["high", "low"]);
+  assert.deepEqual(mmr(candidates, 2, -1), ["high", "low"]);
+  assert.deepEqual(mmr(candidates, 2, 2), ["high", "low"]);
+});

@@ -5,8 +5,14 @@ import { makeTempDir, tempDbPath } from "../testing/tmp.js";
 import { openDb } from "../storage/db.js";
 import type { CairnDb } from "../storage/db.js";
 import { createMemory } from "../storage/repositories/memories.js";
-import { getContext, estimateTokens, DEFAULT_CONTEXT_MIN_RELEVANCE, DEFAULT_CONTEXT_MIN_COVERAGE } from "./context.js";
-import { DEFAULT_MIN_RELEVANCE, DEFAULT_MIN_COVERAGE } from "./search.js";
+import {
+  getContext,
+  estimateTokens,
+  DEFAULT_CONTEXT_MIN_RELEVANCE,
+  DEFAULT_CONTEXT_MIN_COVERAGE,
+  DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE,
+} from "./context.js";
+import { search, DEFAULT_MIN_RELEVANCE, DEFAULT_MIN_COVERAGE, DEFAULT_MAX_VECTOR_DISTANCE } from "./search.js";
 
 async function withDbAsync<T>(fn: (db: CairnDb) => Promise<T>): Promise<T> {
   const dir = makeTempDir();
@@ -70,7 +76,13 @@ test("getContext: never exceeds the token budget across several budgets, on a co
     seedLongCorpus(db, 40);
 
     for (const tokenBudget of [200, 800, 4000]) {
-      const block = await getContext(db, "project status update", { tokenBudget }, {});
+      // minRelevance: 0 -- this test is pinning the token-budget loop, not
+      // the relevance floor; with 40 near-identical candidates fused from a
+      // single branch, min-max normalisation (search.ts) legitimately gives
+      // the tail of that ranking a relevance near/at 0, which
+      // DEFAULT_CONTEXT_MIN_RELEVANCE would otherwise filter well before
+      // the budget loop ever gets a chance to truncate.
+      const block = await getContext(db, "project status update", { tokenBudget, minRelevance: 0 }, {});
       assert.ok(estimateTokens(block.text) <= tokenBudget, `budget ${tokenBudget}: text exceeded budget`);
       assert.ok(block.tokensEstimated <= tokenBudget, `budget ${tokenBudget}: tokensEstimated exceeded budget`);
       assert.equal(block.truncated, true, `budget ${tokenBudget}: expected truncation on an oversized corpus`);
@@ -184,10 +196,17 @@ test("getContext: an oversized memory ranked first no longer empties the whole b
 
     // Weights pin ranking to importance alone, so the huge memory is
     // deterministically rank 1 regardless of BM25/relevance nuance.
+    // minRelevance: 0 -- weights.relevance: 0 only zeroes relevance's
+    // contribution to the BLENDED score, not the independent minRelevance
+    // FILTER; with 6 fused candidates, min-max normalisation (search.ts)
+    // spreads their raw relevance across the full 0..1 range regardless of
+    // weights, which DEFAULT_CONTEXT_MIN_RELEVANCE would otherwise use to
+    // cut some of the shorts before the budget loop this test is pinning
+    // ever sees them.
     const block = await getContext(
       db,
       "keyword",
-      { tokenBudget: 400, weights: { relevance: 0, recency: 0, importance: 1, access: 0 } },
+      { tokenBudget: 400, weights: { relevance: 0, recency: 0, importance: 1, access: 0 }, minRelevance: 0 },
       {},
     );
 
@@ -219,13 +238,19 @@ test("getContext: a widened candidate pool surfaces a low-FTS-rank, high-importa
       importance: 1,
     }).memory;
 
-    const wide = await getContext(db, query, { tokenBudget: 20000 }, {});
+    // minRelevance: 0 -- `target` is deliberately the WORST-fused-rank
+    // candidate in this pool (that is what makes it a candidateLimit-widening
+    // probe); min-max normalisation (search.ts) gives it a very low, possibly
+    // 0, relevance regardless of candidateLimit, which
+    // DEFAULT_CONTEXT_MIN_RELEVANCE would otherwise filter before the
+    // importance re-rank this test is pinning ever gets a chance to run.
+    const wide = await getContext(db, query, { tokenBudget: 20000, minRelevance: 0 }, {});
     assert.ok(
       wide.memories.some((m) => m.id === target.id),
       "expected the default (widened) candidate pool to surface the low-FTS-rank, high-importance memory",
     );
 
-    const narrow = await getContext(db, query, { tokenBudget: 20000, candidateLimit: 50 }, {});
+    const narrow = await getContext(db, query, { tokenBudget: 20000, candidateLimit: 50, minRelevance: 0 }, {});
     assert.equal(
       narrow.memories.some((m) => m.id === target.id),
       false,
@@ -382,4 +407,85 @@ test("getContext: a genuinely on-topic multi-word query still surfaces the match
     const block = await getContext(db, "kubernetes deployment rollback procedure", { tokenBudget: 800 }, {});
     assert.ok(block.memories.some((m) => m.id === target.id));
   });
+});
+
+// CRITICAL 1 regression (audit reproduction): the empty-query "what matters
+// right now" pool used to be recency-only (listMemories ordered by
+// created_at DESC), so importance could only ever re-rank INSIDE the newest
+// EMPTY_QUERY_POOL_LIMIT memories -- a single very old but critically
+// important memory never got a seat in the pool to be re-ranked within, no
+// matter how high its importance. This is the exact path the SessionStart
+// hook uses (get_context called with no query). Fails without the fix: the
+// allergy memory is entirely absent from a 200-limit pool once 250 newer,
+// routine memories exist.
+test("getContext (empty query): a single very old, critically important memory is never starved out of the pool by 250 newer routine ones", async () => {
+  await withDbAsync(async (db) => {
+    const now = Date.now();
+    const allergy = createMemory(db, {
+      text: "I am allergic to penicillin",
+      importance: 1.0,
+    }).memory;
+    db.q("UPDATE memories SET created_at = ? WHERE id = ?").run(now - 400 * 24 * 60 * 60 * 1000, allergy.id);
+
+    db.tx(() => {
+      for (let i = 0; i < 250; i++) {
+        const routine = createMemory(db, {
+          text: `routine note number ${i} about lunch or the weather`,
+          importance: 0.1,
+        }).memory;
+        db.q("UPDATE memories SET created_at = ? WHERE id = ?").run(now - i * 60 * 60 * 1000, routine.id);
+      }
+    });
+
+    // Weights pin ranking to importance alone: this isolates whether the
+    // memory even gets a SEAT in the pool to be re-ranked within (the
+    // actual defect) from the separate, expected effect of recency decay
+    // eventually pushing a 400-day-old memory below a generous but finite
+    // output `limit` even once it IS a candidate.
+    const block = await getContext(
+      db,
+      "",
+      { tokenBudget: 20000, weights: { relevance: 0, recency: 0, importance: 1, access: 0 } },
+      {},
+    );
+    assert.ok(
+      block.memories.some((m) => m.id === allergy.id),
+      "the old, critically important memory must survive into the empty-query context block",
+    );
+  });
+});
+
+// CRITICAL 2 regression (audit reproduction): coverage used to divide by
+// the WHOLE query length (fts.ts's old `present.length / terms.length`),
+// making get_context's 0.4 floor unreachable for a long natural-language
+// question. The primary tool (`get_context`) must not be silently worse
+// than the secondary one (`recall`, floor 0.2) on the same query and
+// corpus. Fails without the fix: get_context returns zero memories here.
+test("getContext (FTS-only): a long natural-language question still surfaces the right memory, matching recall's success on the same corpus", async () => {
+  await withDbAsync(async (db) => {
+    const target = createMemory(db, {
+      text: "we decided last quarter that the mobile app release gets deployed to the app store only after the release manager signs off",
+    }).memory;
+    createMemory(db, { text: "the weather has been unusually warm this week" });
+    createMemory(db, { text: "remember to water the office plants on Fridays" });
+
+    const query =
+      "remind me what we decided last quarter about how the mobile app release should be deployed to the app store and who signs off on it";
+
+    const recallResult = await search(db, query, {}, {});
+    assert.ok(recallResult.hits.some((h) => h.id === target.id), "sanity: recall must find the target");
+
+    const block = await getContext(db, query, { tokenBudget: 800 }, {});
+    assert.ok(
+      block.memories.some((m) => m.id === target.id),
+      "get_context must not be silently worse than recall on the same long question",
+    );
+  });
+});
+
+test("getContext's default maxVectorDistance floor is strictly stricter (smaller) than search()'s default", () => {
+  assert.ok(
+    DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE < DEFAULT_MAX_VECTOR_DISTANCE,
+    "get_context is injected unrequested at session start (BUILD_BRIEF §8); its default vector-distance ceiling must stay below recall's",
+  );
 });

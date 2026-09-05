@@ -28,7 +28,10 @@ export interface FtsHit {
       FTS5 tokenizer (see migrations/001-init.ts). This is the
       corpus-independent complement to `bm25`: a rank/score says how this
       hit compares to OTHERS in the same result set, coverage says how
-      much of the QUESTION it actually answers. */
+      much of the QUESTION it actually answers. The denominator is capped
+      (see `COVERAGE_DENOMINATOR_CAP` in `hitCoverage`) so a long
+      natural-language question does not make a fixed coverage floor
+      (e.g. `get_context`'s) unreachable in practice. */
   coverage: number;
 }
 
@@ -118,6 +121,19 @@ function foldForCoverage(value: string): string {
   return value.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase();
 }
 
+// Caps how many query terms the coverage FRACTION is divided by. Without a
+// cap, `present.length / terms.length` divides by the WHOLE query length, so
+// a caller's fixed coverage floor (e.g. get_context's 0.4) becomes
+// unreachable for a long natural-language question — a 20-word question
+// that hits every one of its 6 content terms would score coverage 0.3 and
+// get rejected, even though it is a strictly BETTER match than a 4-word
+// query hitting 2 of 4 terms (coverage 0.5). Capping the denominator makes
+// the floor mean "how much of a SHORT question (or the first few content
+// words of a long one) is covered", not "how much of an arbitrarily long
+// question is covered word-for-word" — the latter is not what a coverage
+// floor is meant to test. Not a tuned result (§14): a starting point.
+const COVERAGE_DENOMINATOR_CAP = 5;
+
 // What fraction of `terms` (a query's content terms) appear as whole
 // tokens in `text`, folded per `foldForCoverage`. Tokenizing `text` with
 // the same TOKEN_RE the query itself was split on is what makes this
@@ -127,12 +143,17 @@ function foldForCoverage(value: string): string {
 // would wrongly zero out every hit for a query with no content terms at
 // all (a case `ftsSearch` never actually reaches, since `toMatchQuery`
 // already returns null and short-circuits before any row is scored).
+// The denominator is `min(terms.length, COVERAGE_DENOMINATOR_CAP)`, so the
+// floor stays reachable regardless of query length; the result is clamped
+// to 1 so a hit matching MORE than the capped denominator's worth of terms
+// still reads as "fully covered", not as a coverage over 100%.
 function hitCoverage(terms: string[], text: string): number {
   if (terms.length === 0) return 1;
   const textTokens = text.match(TOKEN_RE);
   const textTermSet = new Set((textTokens ?? []).map(foldForCoverage));
   const present = terms.filter((term) => textTermSet.has(foldForCoverage(term)));
-  return present.length / terms.length;
+  const denominator = Math.min(terms.length, COVERAGE_DENOMINATOR_CAP);
+  return Math.min(1, present.length / denominator);
 }
 
 // Starting-point ratio, NOT a tuned result (§14 warns against presenting

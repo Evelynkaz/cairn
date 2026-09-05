@@ -6,10 +6,12 @@
 // matter how big the store is.
 
 import type { CairnDb } from "../storage/db.js";
+import type { SqlValue } from "../storage/driver/index.js";
+import { num, numOrNull, str } from "../storage/repositories/row.js";
 import { listMemories } from "../storage/repositories/memories.js";
 import { rerank } from "./rerank.js";
 import type { RerankItem } from "./rerank.js";
-import { search } from "./search.js";
+import { search, fetchTagsByIds } from "./search.js";
 import type { SearchDeps, SearchHit, SearchOptions, SearchResult } from "./search.js";
 
 export interface ContextOptions extends SearchOptions {
@@ -48,10 +50,12 @@ const MAX_CONTEXT_CANDIDATES = 50;
 // something to actually rank.
 const CONTEXT_CANDIDATE_LIMIT = 200;
 
-// The pool size used for the empty-query (recency+importance) fallback
-// below. Matches the storage layer's own page-size ceiling
+// The pool size used for EACH of the two bounded queries the empty-query
+// (recency+importance) fallback below unions together (see
+// emptyQueryFallback). Matches the storage layer's own page-size ceiling
 // (paging.ts MAX_PAGE_LIMIT) — this is a bounded "what matters right now"
-// index, not an exhaustive scan.
+// index, not an exhaustive scan; the merged pool is at most 2x this, never
+// unbounded.
 const EMPTY_QUERY_POOL_LIMIT = 200;
 
 // `search()`'s own SearchOptions.minRelevance defaults to
@@ -86,14 +90,35 @@ export const DEFAULT_CONTEXT_MIN_RELEVANCE = 0.15;
 // explicit, deliberate query. `get_context` needs the stricter value for
 // the same asymmetry argument as DEFAULT_CONTEXT_MIN_RELEVANCE above — and
 // unlike that floor, this one is genuinely absolute (not normalised
-// against this call's own top score), so it is what actually lets
-// `get_context` reject a result set where even the single best-ranked
-// candidate is a bare incidental word-overlap (e.g. a pet-themed memory
-// store returning its one memory that happens to contain the word
-// "deployment" for the query "kubernetes deployment rollback procedure" —
-// one term out of four). Starting-point default, NOT a tuned result (§14):
-// needs tuning against real transcripts like every other floor here.
+// against this call's own top score) for an FTS-branch hit, so it is what
+// actually lets `get_context` reject a result set where even the
+// single best-ranked candidate is a bare incidental word-overlap (e.g. a
+// pet-themed memory store returning its one memory that happens to contain
+// the word "deployment" for the query "kubernetes deployment rollback
+// procedure" — one term out of four). Its denominator is capped
+// (see fts.ts's `COVERAGE_DENOMINATOR_CAP`) so this floor stays reachable
+// for a long natural-language question instead of silently requiring
+// every content word in it to match. A vector-branch hit has no coverage
+// signal at all and is EXEMPT from this floor (see search.ts's
+// SearchOptions.minCoverage) — search.ts's `maxVectorDistance` is that
+// branch's own, independent absolute floor, and `get_context` uses a
+// stricter default for it than `recall` for the same reason as this
+// constant (see `DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE` below). Starting-point
+// default, NOT a tuned result (§14): needs tuning against real transcripts
+// like every other floor here.
 export const DEFAULT_CONTEXT_MIN_COVERAGE = 0.4;
+
+// search()'s own SearchOptions.maxVectorDistance defaults to
+// search.ts's DEFAULT_MAX_VECTOR_DISTANCE, sized for `recall`. The vector
+// branch is exempt from DEFAULT_CONTEXT_MIN_COVERAGE above (a semantic
+// match's words legitimately differ from the query's), so THIS is that
+// branch's own absolute floor for `get_context` — without it, a store with
+// no memory genuinely related to the query still returns its k nearest
+// (however distant) neighbours, and BUILD_BRIEF §14's context pollution
+// happens in semantic mode instead of keyword mode. Stricter (a smaller
+// distance ceiling) than `recall`'s default for the same unrequested-
+// injection asymmetry as every other floor in this file.
+export const DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE = 0.15;
 
 /**
  * A script-aware approximation of token count: `ceil(utf8ByteLength(text) /
@@ -153,6 +178,63 @@ function tieBreak(aId: string, aScore: number, bId: string, bScore: number): num
   return aId < bId ? -1 : aId > bId ? 1 : 0;
 }
 
+// The subset of Memory's fields emptyQueryFallback actually needs. Both the
+// recency pool (listMemories, a Memory[]) and the importance pool below
+// (a raw query against memories_live) are read structurally against this,
+// so neither needs to construct a full Memory.
+interface PoolMemory {
+  id: string;
+  seq: number;
+  text: string;
+  scope: string;
+  tags: string[];
+  importance: number;
+  createdAt: number;
+  lastAccessed: number | null;
+  accessCount: number;
+}
+
+// The importance-ordered half of the empty-query pool (see
+// emptyQueryFallback below). Queries memories_live directly, the same
+// sanctioned view fts.ts and search.ts read through, rather than
+// listMemories — listMemories only orders by (created_at, id) for its
+// keyset pagination and has no importance-ordered mode. Bounded by `limit`
+// in SQL, same as the recency half; never an unbounded scan.
+function loadImportancePool(db: CairnDb, scope: string | undefined, limit: number): PoolMemory[] {
+  const conditions: string[] = [];
+  const params: SqlValue[] = [];
+  if (scope !== undefined) {
+    conditions.push("scope = ?");
+    params.push(scope);
+  }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const rows = db
+    .q(
+      `SELECT seq, id, text, scope, importance, created_at, last_accessed, access_count
+       FROM memories_live
+       ${where}
+       ORDER BY importance DESC, created_at DESC
+       LIMIT ?`,
+    )
+    .all(...params, limit);
+  const ids = rows.map((row) => str(row, "id"));
+  const tagsById = fetchTagsByIds(db, ids);
+  return rows.map((row) => {
+    const id = str(row, "id");
+    return {
+      id,
+      seq: num(row, "seq"),
+      text: str(row, "text"),
+      scope: str(row, "scope"),
+      tags: tagsById.get(id) ?? [],
+      importance: num(row, "importance"),
+      createdAt: num(row, "created_at"),
+      lastAccessed: numOrNull(row, "last_accessed"),
+      accessCount: num(row, "access_count"),
+    };
+  });
+}
+
 // An empty (or whitespace-only) query is a first-class case, not an error:
 // it is what a session-start hook sends when it wants a budgeted index of
 // "what matters" rather than an answer to a specific question. There is no
@@ -160,8 +242,27 @@ function tieBreak(aId: string, aScore: number, bId: string, bScore: number): num
 // all — it ranks the scope by recency and importance only (relevance
 // pinned to 0 for every candidate) and is therefore never "degraded": it is
 // a different, fully intended mode, not a fallback from a failure.
+//
+// The pool is the UNION of two independently bounded queries — the newest
+// EMPTY_QUERY_POOL_LIMIT by created_at DESC, and the top
+// EMPTY_QUERY_POOL_LIMIT by importance DESC, created_at DESC — deduped by
+// id, not just the recency query alone. A recency-only pool means
+// importance can only ever re-rank INSIDE the newest N memories: a single
+// very old but critically important memory (e.g. an allergy noted 400 days
+// ago) can never surface at all, no matter how high its importance weight
+// is set, because it never gets a seat in the pool to be re-ranked within.
+// Unioning in a second, importance-ordered query gives it that seat while
+// keeping both queries bounded — this is still a "what matters right now"
+// index, not an exhaustive scan of the store.
 function emptyQueryFallback(db: CairnDb, options: ContextOptions & { limit: number }, now: number): SearchResult {
-  const pool = listMemories(db, { scope: options.scope, limit: EMPTY_QUERY_POOL_LIMIT }).items;
+  const recencyPool = listMemories(db, { scope: options.scope, limit: EMPTY_QUERY_POOL_LIMIT }).items;
+  const importancePool = loadImportancePool(db, options.scope, EMPTY_QUERY_POOL_LIMIT);
+  const mergedById = new Map<string, PoolMemory>();
+  for (const memory of recencyPool) mergedById.set(memory.id, memory);
+  for (const memory of importancePool) {
+    if (!mergedById.has(memory.id)) mergedById.set(memory.id, memory);
+  }
+  const pool = Array.from(mergedById.values());
   const tags = options.tags ?? [];
   const filtered = tags.length > 0 ? pool.filter((memory) => tags.every((tag) => memory.tags.includes(tag))) : pool;
 
@@ -193,6 +294,7 @@ function emptyQueryFallback(db: CairnDb, options: ContextOptions & { limit: numb
       parts: r.parts,
       sources: { fts: null, vector: null },
       coverage: null,
+      vectorDistance: null,
     };
   });
 
@@ -244,16 +346,18 @@ export async function getContext(
           query,
           // A session-start block must never quietly inject weakly-related
           // memories the user never asked for (BUILD_BRIEF §14 context
-          // pollution) — see DEFAULT_CONTEXT_MIN_RELEVANCE and
-          // DEFAULT_CONTEXT_MIN_COVERAGE above for why both floors are
-          // stricter than search()'s own defaults, and why coverage is the
-          // one of the two that can actually empty a result set.
+          // pollution) — see DEFAULT_CONTEXT_MIN_RELEVANCE,
+          // DEFAULT_CONTEXT_MIN_COVERAGE and DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE
+          // above for why all three floors are stricter than search()'s own
+          // defaults, and why coverage/maxVectorDistance are the ones that
+          // can actually empty a result set (one per branch).
           {
             ...options,
             limit: searchLimit,
             candidateLimit: options.candidateLimit ?? CONTEXT_CANDIDATE_LIMIT,
             minRelevance: options.minRelevance ?? DEFAULT_CONTEXT_MIN_RELEVANCE,
             minCoverage: options.minCoverage ?? DEFAULT_CONTEXT_MIN_COVERAGE,
+            maxVectorDistance: options.maxVectorDistance ?? DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE,
           },
           deps,
         );

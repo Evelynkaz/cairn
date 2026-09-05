@@ -231,6 +231,28 @@ test("ftsSearch: coverage is the fraction of query content terms a hit's text co
   });
 });
 
+// CRITICAL 2 regression (audit reproduction): coverage used to divide by
+// the WHOLE query length (`present.length / terms.length`), making a fixed
+// coverage floor (get_context's 0.4) unreachable for a long natural-
+// language question -- a hit matching every one of the first several
+// content terms of a 15+ word question would still report a low fraction.
+// Fails without the fix: this long question's 15 content terms make a
+// full-match hit report coverage 6/15 = 0.4, not the capped 1.0.
+test("ftsSearch: coverage's denominator is capped, so a long question does not make a fixed floor unreachable", () => {
+  withDb((db) => {
+    const target = createMemory(db, {
+      text: "we decided last quarter that the mobile app release gets deployed to the app store only after the release manager signs off",
+    }).memory;
+    const query =
+      "remind me what we decided last quarter about how the mobile app release should be deployed to the app store and who signs off on it";
+
+    const hits = ftsSearch(db, query, { minBm25Ratio: 0 });
+    const hit = hits.find((h) => h.id === target.id);
+    assert.ok(hit, "the fully-answering memory must still be an FTS match");
+    assert.equal(hit?.coverage, 1, "a hit matching at least the capped denominator's worth of content terms reports full coverage");
+  });
+});
+
 test("ftsSearch: coverage is case- and diacritic-insensitive", () => {
   withDb((db) => {
     const memory = createMemory(db, { text: "the CAFÉ has a lovely ROLLBACK plan" }).memory;

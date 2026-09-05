@@ -312,7 +312,16 @@ test("search: minCoverage filters a weak FTS-branch match while a fully-covering
     const strong = createMemory(db, { text: "kubernetes deployment rollback procedure documented here" }).memory;
     const weak = createMemory(db, { text: "the garden deployment of new roses went well" }).memory;
 
-    const permissive = await search(db, "kubernetes deployment rollback procedure", { minCoverage: 0 }, {});
+    // minRelevance: 0 -- with only these two candidates fused, min-max
+    // normalisation (search.ts) gives the weaker-ranked one exactly 0
+    // relevance, which the default relevance floor would filter regardless
+    // of minCoverage; this test isolates minCoverage specifically.
+    const permissive = await search(
+      db,
+      "kubernetes deployment rollback procedure",
+      { minCoverage: 0, minRelevance: 0 },
+      {},
+    );
     assert.ok(permissive.hits.some((h) => h.id === strong.id));
     assert.ok(permissive.hits.some((h) => h.id === weak.id), "a loose, one-term-of-four match survives a floor of 0");
 
@@ -362,10 +371,19 @@ test("search: limit clamps to 50 and defaults to 10; candidateLimit clamps to 20
       }
     });
 
-    const defaulted = await search(db, "bulk clamp searchable memory", {}, {});
+    // minRelevance: 0 isolates the clamps under test from the (now
+    // correctly rank-spanning, see the min-max normalisation comment in
+    // search.ts) relevance floor, which would otherwise legitimately trim
+    // the tail of this single-branch, 60-candidate fused list on its own.
+    const defaulted = await search(db, "bulk clamp searchable memory", { minRelevance: 0 }, {});
     assert.equal(defaulted.hits.length, 10);
 
-    const clamped = await search(db, "bulk clamp searchable memory", { limit: 99999, candidateLimit: 99999 }, {});
+    const clamped = await search(
+      db,
+      "bulk clamp searchable memory",
+      { limit: 99999, candidateLimit: 99999, minRelevance: 0 },
+      {},
+    );
     assert.equal(clamped.hits.length, 50);
   });
 });
@@ -393,10 +411,15 @@ test("search: `now` is honoured -- the same pair ranks differently at two differ
 
     // weights.relevance: 0 isolates recency+importance from any BM25 rank
     // tie-break noise between the two near-identical documents above.
+    // minRelevance: 0 keeps the WORSE-fused-rank one of these two from
+    // being dropped by the relevance floor before re-ranking ever runs --
+    // with only two fused candidates, min-max normalisation (see search.ts)
+    // gives the worse one exactly 0 relevance, which the default floor
+    // would otherwise filter regardless of weights.relevance.
     const soon = await search(
       db,
       "chronotest",
-      { weights: { relevance: 0 }, now: setupNow },
+      { weights: { relevance: 0 }, minRelevance: 0, now: setupNow },
       {},
     );
     assert.equal(soon.hits[0]?.id, recentLowImportance.id);
@@ -404,7 +427,7 @@ test("search: `now` is honoured -- the same pair ranks differently at two differ
     const muchLater = await search(
       db,
       "chronotest",
-      { weights: { relevance: 0 }, now: setupNow + 400 * DAY_MS },
+      { weights: { relevance: 0 }, minRelevance: 0, now: setupNow + 400 * DAY_MS },
       {},
     );
     assert.equal(muchLater.hits[0]?.id, oldHighImportance.id);
@@ -453,7 +476,14 @@ test("search: a tag-filtered vector-only match is never starved by the branch's 
     for (let i = 0; i < 3; i++) {
       const memory = createMemory(db, { text: `ops tagged memory number ${i}`, tags: ["ops"] }).memory;
       taggedMemories.push({ id: memory.id, seq: memory.seq });
-      vectors.set(memory.text, vec(0, 1, 0, 0)); // far from the query -- ranks behind every filler memory
+      // Far enough to rank behind every filler memory (which sit almost
+      // exactly on the query vector) and outside the naive candidateLimit
+      // fan-out, but still within DEFAULT_MAX_VECTOR_DISTANCE (~0.85 cosine
+      // similarity here) -- this test is about the fan-out starvation fix,
+      // not the absolute vector-distance floor (see the maxVectorDistance
+      // tests below), so a fully orthogonal vector would be filtered by
+      // BOTH mechanisms and no longer isolate the one under test here.
+      vectors.set(memory.text, vec(0.85, 0.527, 0, 0));
     }
 
     const provider = createControlledProvider(vectors, dim);
@@ -474,7 +504,13 @@ test("search: a tag-filtered vector-only match is never starved by the branch's 
       );
     }
 
-    const result = await search(db, query, { tags: ["ops"], limit: 10, candidateLimit }, { provider, space });
+    // minRelevance: 0 -- the three tagged memories are given an identical
+    // vector on purpose (see above), which makes them a purely tied,
+    // exactly-3-item fused list; min-max normalisation (search.ts) always
+    // gives the last tie-broken one of an otherwise-flat list exactly 0
+    // relevance, which the default floor would filter regardless of the
+    // fan-out starvation fix this test actually pins.
+    const result = await search(db, query, { tags: ["ops"], limit: 10, candidateLimit, minRelevance: 0 }, { provider, space });
     assert.equal(result.degraded, false);
     assert.deepEqual(
       result.hits.map((h) => h.id).sort(),
@@ -581,15 +617,173 @@ test("search: candidateLimit actually controls per-branch fan-out, not just the 
     const targetRank = knn(db, space, queryVector!, { k: 50 }).findIndex((h) => h.memorySeq === target.seq) + 1;
     assert.ok(targetRank > 10 && targetRank <= 50, `expected target rank in (10, 50], got ${targetRank}`);
 
+    // minRelevance: 0 throughout -- `target` is deliberately the WORST-
+    // ranked vector candidate in this single-branch fused list (that is
+    // what makes it a fan-out probe), so min-max normalisation (search.ts)
+    // gives it exactly 0 relevance whenever it IS included; the default
+    // floor would filter it regardless of candidateLimit, which is not what
+    // this test is pinning.
     // Explicit candidateLimit smaller than target's true rank: excluded.
-    const tooNarrow = await search(db, query, { candidateLimit: 5, limit: 50 }, { provider, space });
+    const tooNarrow = await search(db, query, { candidateLimit: 5, limit: 50, minRelevance: 0 }, { provider, space });
     assert.equal(tooNarrow.hits.some((h) => h.id === target.id), false);
 
     // No candidateLimit given: search()'s OWN default (50) must be
     // substituted -- not left undefined for knn's much smaller default (10)
     // to kick in, which is exactly what breaks if clampCandidateLimit's
     // default-substitution branch is removed.
-    const defaulted = await search(db, query, { limit: 50 }, { provider, space });
+    const defaulted = await search(db, query, { limit: 50, minRelevance: 0 }, { provider, space });
     assert.ok(defaulted.hits.some((h) => h.id === target.id));
+  });
+});
+
+// CRITICAL 3 regression (audit reproduction): relevance used to be
+// normalised only against THIS call's own top fused score
+// (`score / maxScore`), which in a single-branch (FTS-only, the default)
+// result set compresses the WHOLE relevance spread into a curve that only
+// reaches ~0.55 by rank 10 -- less dynamic range than the recency term's
+// own span. That let a several-ranks-worse, half-covering, less important,
+// merely-fresher chaff memory outscore a fully-covering, more important,
+// slightly-older correct answer on the blended score. Fails without the
+// fix: `chaff` ranks ahead of `correct`.
+test("search: relevance keeps a real dynamic range across the top of a single-branch result set (BUILD_BRIEF §7 relevance-vs-recency regression)", async () => {
+  await withDbAsync(async (db) => {
+    const now = Date.now();
+    const correct = createMemory(db, {
+      text: "the kubernetes deployment rollback procedure is documented here for reference",
+      importance: 1.0,
+    }).memory;
+    ageMemory(db, correct.id, now - 7 * DAY_MS);
+
+    const chaff = createMemory(db, {
+      text: "deployment rollback deployment rollback quick fix deployment rollback",
+      importance: 0.5,
+    }).memory;
+    ageMemory(db, chaff.id, now);
+
+    // Distractors purely to give the fused list enough spread for the
+    // dynamic-range defect to bite -- see the module-level regression note
+    // above (a two-candidate list alone would already show the effect, but
+    // this is closer to the audit's reproduction, which used a 20-memory
+    // corpus).
+    const fillerTerms = ["kubernetes", "rollback", "procedure"];
+    for (let i = 0; i < 8; i++) {
+      const t = fillerTerms[i % fillerTerms.length];
+      const filler = createMemory(db, { text: `${t} ${t} ${t} ${t} filler note number ${i}` }).memory;
+      ageMemory(db, filler.id, now - 20 * DAY_MS);
+    }
+
+    const result = await search(db, "kubernetes deployment rollback procedure", {}, {});
+    const correctIndex = result.hits.findIndex((h) => h.id === correct.id);
+    const chaffIndex = result.hits.findIndex((h) => h.id === chaff.id);
+    assert.ok(correctIndex >= 0 && chaffIndex >= 0, "both must appear in the result");
+    assert.ok(
+      correctIndex < chaffIndex,
+      "the fully-covering, more important, only-slightly-older correct answer must outrank the fresher-but-worse chaff",
+    );
+  });
+});
+
+// CRITICAL 4 regression (audit reproduction): the vector branch had no
+// absolute distance floor, so KNN's k nearest neighbours entered fusion
+// however far away they actually were -- a store with no memory genuinely
+// related to the query still returned its k nearest (however distant)
+// neighbours, sometimes ranked at the very top. Fails without the fix: all
+// eight topically-unrelated (pet-themed) memories are returned for a
+// kubernetes query, undegraded.
+test("search: the vector branch has an absolute distance floor -- unrelated memories are not returned just for being the nearest available (BUILD_BRIEF §14 semantic-mode context-pollution regression)", async () => {
+  await withDbAsync(async (db) => {
+    const dim = 4;
+    const query = "kubernetes deployment rollback procedure";
+    const petTexts = [
+      "the cat needs a vet checkup next week",
+      "remember to buy more dog food this weekend",
+      "the parrot learned a new word today",
+      "fish tank filter needs cleaning",
+      "the hamster wheel is squeaking again",
+      "the rabbit hutch needs fresh bedding",
+      "the turtle tank water needs changing",
+      "the dog groomer appointment is on friday",
+    ];
+    const pets = petTexts.map((text) => createMemory(db, { text }).memory);
+
+    // Every pet memory is placed ORTHOGONAL to the query vector -- as
+    // semantically unrelated as two real embeddings from the local models
+    // this project ships get (see SearchOptions.maxVectorDistance's doc:
+    // even genuinely unrelated real pairs still sit at ~0.6-0.75 cosine
+    // similarity due to anisotropy, i.e. distance ~0.25-0.4 -- fully
+    // orthogonal, distance 1.0, is at least as unrelated as that).
+    const vectors = new Map<string, Float32Array>([[query, vec(1, 0, 0, 0)]]);
+    for (const pet of pets) {
+      vectors.set(pet.text, vec(0, 1, 0, 0));
+    }
+    const provider = createControlledProvider(vectors, dim);
+    const space = ensureVectorSpace(db, provider.modelId, dim);
+    const indexer = createIndexer(db, provider);
+    await indexer.drain();
+
+    const result = await search(db, query, {}, { provider, space });
+    assert.deepEqual(result.hits, [], "an entirely unrelated store must return nothing, not its nearest-however-far neighbours");
+    assert.equal(result.degraded, false, "a filtered-out vector branch is not a degradation -- see SearchOptions.maxVectorDistance");
+  });
+});
+
+test("search: a vector hit within maxVectorDistance still surfaces, carrying its distance on the hit", async () => {
+  await withDbAsync(async (db) => {
+    const dim = 4;
+    const query = "database backup schedule";
+    const target = createMemory(db, { text: "the archive rotation happens every night without fail" }).memory;
+    const vectors = new Map<string, Float32Array>([
+      [query, vec(1, 0, 0, 0)],
+      [target.text, vec(0.99, 0.01, 0, 0)],
+    ]);
+    const provider = createControlledProvider(vectors, dim);
+    const space = ensureVectorSpace(db, provider.modelId, dim);
+    const indexer = createIndexer(db, provider);
+    await indexer.drain();
+
+    const result = await search(db, query, {}, { provider, space });
+    const hit = result.hits.find((h) => h.id === target.id);
+    assert.ok(hit, "a genuinely close vector-only hit must survive the default floor");
+    assert.ok(typeof hit!.vectorDistance === "number" && hit!.vectorDistance < 0.01);
+  });
+});
+
+test("search: an explicit, permissive maxVectorDistance lets a distant vector hit back in", async () => {
+  await withDbAsync(async (db) => {
+    const dim = 4;
+    const query = "kubernetes deployment rollback procedure";
+    const pet = createMemory(db, { text: "the cat needs a vet checkup next week" }).memory;
+    const vectors = new Map<string, Float32Array>([
+      [query, vec(1, 0, 0, 0)],
+      [pet.text, vec(0, 1, 0, 0)], // orthogonal, distance 1.0
+    ]);
+    const provider = createControlledProvider(vectors, dim);
+    const space = ensureVectorSpace(db, provider.modelId, dim);
+    const indexer = createIndexer(db, provider);
+    await indexer.drain();
+
+    const strict = await search(db, query, {}, { provider, space });
+    assert.equal(strict.hits.length, 0);
+
+    const permissive = await search(db, query, { maxVectorDistance: 1.5 }, { provider, space });
+    assert.ok(permissive.hits.some((h) => h.id === pet.id));
+  });
+});
+
+// BUILD_BRIEF §3: never KNN across mismatched models. A provider and a
+// vector space that disagree on modelId (even at the same dim) must never
+// silently run KNN against each other's vectors.
+test("search: a provider/space model-id mismatch skips the vector branch and reports degraded, never running cross-model KNN", async () => {
+  await withDbAsync(async (db) => {
+    const dim = 4;
+    createMemory(db, { text: "a plain fact findable by keyword search alone" });
+    const space = ensureVectorSpace(db, "model-a", dim);
+    const provider = createControlledProvider(new Map(), dim);
+    Object.defineProperty(provider, "modelId", { value: "model-b", configurable: true });
+
+    const result = await search(db, "plain fact keyword", {}, { provider, space });
+    assert.equal(result.degraded, true);
+    assert.ok(typeof result.degradedReason === "string" && result.degradedReason.includes("model-a"));
+    assert.ok(result.hits.length > 0, "FTS branch must still return results");
   });
 });

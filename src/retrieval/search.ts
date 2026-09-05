@@ -34,12 +34,14 @@ export interface SearchOptions {
   mmrLambda?: number;
   now?: number;
   /** A RELATIVE floor on the normalised RRF relevance (0..1): each fused
-      candidate's score is normalised against the TOP fused score of THIS
-      call's own result set (see `maxScore` below), so the single
-      best-ranked candidate in any non-empty result always has relevance
-      exactly 1.0 and always clears this floor. That means minRelevance can
-      only ever SHRINK a result set, never EMPTY one — it is not, on its
-      own, an absolute quality gate, whatever its name suggests. Absolute
+      candidate's score is min-max normalised against the TOP and BOTTOM
+      fused scores of THIS call's own result set (see `maxScore`/`minScore`
+      below), so the single best-ranked candidate in any non-empty result
+      always has relevance exactly 1.0 and always clears this floor, and the
+      single worst-ranked one always has relevance exactly 0. That means
+      minRelevance can only ever SHRINK a result set, never EMPTY one — it
+      is not, on its own, an absolute quality gate, whatever its name
+      suggests. Absolute
       gating comes from other, independent layers instead: fts.ts's
       stopword filter (a query with no content words returns nothing at
       all), its relative bm25 floor within the FTS branch, and
@@ -69,6 +71,28 @@ export interface SearchOptions {
       match the user asked for — `get_context` uses a stricter value, see
       `DEFAULT_CONTEXT_MIN_COVERAGE` in context.ts. */
   minCoverage?: number;
+  /** A cosine-DISTANCE ceiling applied to the vector branch alone, before
+      fusion — the vector branch's own absolute floor, playing the same role
+      `minCoverage` plays for the FTS branch (see that option's doc for why
+      a vector hit is EXEMPT from `minCoverage`). Without it, `knn`'s k
+      nearest neighbours enter fusion however far away they actually are:
+      with no store memory genuinely related to the query, the "nearest"
+      neighbours are still returned and can still rank at the very top of
+      the fused, re-ranked result (§14 context pollution, in semantic mode).
+      The vec0 tables this project creates all use `distance_metric=cosine`
+      (repositories/vectors.ts), so distance here is `1 - cosine_similarity`
+      — 0 for an identical direction, up to 2 for an opposite one. Real,
+      semantically UNRELATED pairs from the local embedding models this
+      project ships do not sit near that theoretical worst case: anisotropy
+      in sentence embeddings means even unrelated pairs already share a
+      baseline cosine similarity of roughly 0.6-0.75 (see mmr.ts's
+      `cosineSimilarity` module doc), i.e. distance roughly 0.25-0.4.
+      `DEFAULT_MAX_VECTOR_DISTANCE` sits below the bottom of that band, and
+      `get_context`'s stricter default sits further below still — see
+      `DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE` in context.ts. Starting-point
+      default, NOT a tuned result (§14): needs tuning against real
+      transcripts and a real embedding model, like every other floor here. */
+  maxVectorDistance?: number;
 }
 
 export interface RerankParts {
@@ -101,6 +125,13 @@ export interface SearchHit {
       tuning script, not consumed further by the pipeline itself past the
       `minCoverage` filter already applied to the FTS branch. */
   coverage: number | null;
+  /** The vector branch's raw cosine distance for this hit (see
+      `SearchOptions.maxVectorDistance`), or null when the vector branch
+      never surfaced it at all (an FTS-only hit, or vector search was
+      unavailable/skipped/degraded for this call). Exposed for the same
+      reason `coverage` is: so a caller can see WHY a semantic hit was kept,
+      not just that it was. */
+  vectorDistance: number | null;
 }
 
 export interface SearchResult {
@@ -134,6 +165,14 @@ export const DEFAULT_MIN_RELEVANCE = 0.1;
 // value — see DEFAULT_CONTEXT_MIN_COVERAGE in context.ts.
 export const DEFAULT_MIN_COVERAGE = 0.2;
 
+// Starting-point default, NOT a tuned result (§14): see
+// SearchOptions.maxVectorDistance for the full reasoning (unrelated pairs
+// from the local embedding models this project ships sit at roughly
+// 0.25-0.4 cosine distance; this default sits just below that band).
+// `get_context` uses a stricter value — see
+// DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE in context.ts.
+export const DEFAULT_MAX_VECTOR_DISTANCE = 0.24;
+
 function clampSearchLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit) || limit < 1) return DEFAULT_LIMIT;
   return Math.min(Math.floor(limit), MAX_LIMIT);
@@ -158,6 +197,15 @@ function clampMinCoverage(value: number | undefined): number {
   return value;
 }
 
+// vec0 cosine distance ranges 0..2 in principle (see
+// SearchOptions.maxVectorDistance); this only guards finiteness and
+// non-negativity, not an upper bound, since a caller may deliberately pass
+// a high value to admit everything.
+function clampMaxVectorDistance(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value < 0) return DEFAULT_MAX_VECTOR_DISTANCE;
+  return value;
+}
+
 function matchesTags(rowTags: string[], required: string[]): boolean {
   return required.every((tag) => rowTags.includes(tag));
 }
@@ -174,7 +222,7 @@ interface LoadedRow {
   accessCount: number;
 }
 
-function fetchTagsByIds(db: CairnDb, ids: string[]): Map<string, string[]> {
+export function fetchTagsByIds(db: CairnDb, ids: string[]): Map<string, string[]> {
   const result = new Map<string, string[]>();
   if (ids.length === 0) return result;
   const placeholders = ids.map(() => "?").join(", ");
@@ -284,13 +332,17 @@ function tieBreak(aId: string, aScore: number, bId: string, bScore: number): num
  * order the last page happened to arrive in".
  *
  * The vector branch is optional and can never make search unavailable: it
- * is skipped outright when there is no provider, no space, or
- * `db.capabilities.vectors` is false (BUILD_BRIEF §2 makes keyword-only a
- * fully supported mode, not a degradation). If `provider.embed()` THROWS
- * (a hosted API down, a broken local runtime), the error is caught, the
- * vector branch is dropped for this call, and it is reported through
- * `degraded`/`degradedReason` — never propagated. A dead embedding
- * provider must degrade the QUALITY of search, not its availability.
+ * is skipped outright when there is no provider, no space, `db.capabilities.
+ * vectors` is false, or the provider and space disagree on `modelId`/`dim`
+ * (BUILD_BRIEF §3 forbids KNN across mismatched models; a mismatch is
+ * reported via `degraded`/`degradedReason`, same as any other skip). BUILD_
+ * BRIEF §2 makes keyword-only a fully supported mode, not a degradation, so
+ * a merely ABSENT provider/space leaves `degraded: false`. If
+ * `provider.embed()` THROWS (a hosted API down, a broken local runtime),
+ * the error is caught, the vector branch is dropped for this call, and it
+ * is reported through `degraded`/`degradedReason` — never propagated. A
+ * dead embedding provider must degrade the QUALITY of search, not its
+ * availability.
  */
 export async function search(
   db: CairnDb,
@@ -336,8 +388,25 @@ export async function search(
   // --- vector branch (optional; both filters applied — see module docs) ---
   const provider = deps.provider ?? null;
   const space = deps.space ?? null;
-  const vectorBranchAvailable = provider !== null && space !== null && db.capabilities.vectors;
+  let vectorBranchAvailable = provider !== null && space !== null && db.capabilities.vectors;
+  // BUILD_BRIEF §3: never KNN across mismatched models. `db.capabilities.
+  // vectors` and a non-null provider/space only prove a vector store and a
+  // provider both exist -- not that they are the SAME embedding space. A
+  // provider/space pair that disagrees on modelId or dim would otherwise
+  // run a full cross-model KNN silently (same dim, different model, is the
+  // dangerous case: it doesn't even throw a dimension-mismatch error).
+  if (vectorBranchAvailable && provider !== null && space !== null) {
+    if (provider.modelId !== space.modelId || provider.dim !== space.dim) {
+      vectorBranchAvailable = false;
+      degraded = true;
+      degradedReason =
+        `embedding provider "${provider.modelId}" (dim ${provider.dim}) does not match ` +
+        `vector space "${space.modelId}" (dim ${space.dim}); vector branch skipped`;
+    }
+  }
   const vectorIds: string[] = [];
+  const vectorDistanceById = new Map<string, number>();
+  const maxVectorDistance = clampMaxVectorDistance(options.maxVectorDistance);
 
   if (vectorBranchAvailable && provider !== null && space !== null) {
     try {
@@ -366,6 +435,10 @@ export async function search(
                 return vector ? { memorySeq: seq, distance: 1 - cosineSimilarity(queryVector, vector) } : null;
               })
               .filter((hit): hit is { memorySeq: number; distance: number } => hit !== null)
+              // maxVectorDistance is this branch's own absolute floor (see
+              // SearchOptions.maxVectorDistance) -- applied here, before a
+              // candidate ever reaches fusion, same as minCoverage for FTS.
+              .filter((hit) => hit.distance <= maxVectorDistance)
               .sort((a, b) => a.distance - b.distance);
             const loaded = loadRowsBySeq(
               db,
@@ -376,6 +449,7 @@ export async function search(
               if (!row) continue; // soft-deleted/superseded since indexing: never surfaces (§10)
               vectorIds.push(row.id);
               if (!rowsById.has(row.id)) rowsById.set(row.id, row);
+              vectorDistanceById.set(row.id, hit.distance);
             }
           } else {
             const knnHits = knn(db, space, queryVector, { k: MAX_CANDIDATE_LIMIT, scope });
@@ -384,11 +458,13 @@ export async function search(
               knnHits.map((hit) => hit.memorySeq),
             );
             for (const hit of knnHits) {
+              if (hit.distance > maxVectorDistance) continue;
               const row = loaded.get(hit.memorySeq);
               if (!row) continue;
               if (!matchesTags(row.tags, tags)) continue;
               vectorIds.push(row.id);
               if (!rowsById.has(row.id)) rowsById.set(row.id, row);
+              vectorDistanceById.set(row.id, hit.distance);
             }
           }
         } else {
@@ -398,10 +474,12 @@ export async function search(
             knnHits.map((hit) => hit.memorySeq),
           );
           for (const hit of knnHits) {
+            if (hit.distance > maxVectorDistance) continue;
             const row = loaded.get(hit.memorySeq);
             if (!row) continue; // soft-deleted/superseded since indexing: never surfaces (§10)
             vectorIds.push(row.id);
             if (!rowsById.has(row.id)) rowsById.set(row.id, row);
+            vectorDistanceById.set(row.id, hit.distance);
           }
         }
       } else {
@@ -430,11 +508,35 @@ export async function search(
   const ranksById = new Map(fused.map((item) => [item.id, item.ranks]));
   // `relevance` fed to rerank() is expected in 0..1: raw RRF scores are tiny
   // (they scale with 1/k and the number of lists) and carry no natural
-  // upper bound, so normalise by the top score. fused is sorted score-desc,
-  // so fused[0] IS the max; the `> 0` guard is defensive only (a nonempty
-  // fused list always has a positive top score).
+  // upper bound, so this needs SOME normalisation. Dividing by the top score
+  // alone (the previous approach) is the wrong normalisation: in a
+  // single-branch (FTS-only, the default zero-config mode) result set, the
+  // fused score at rank r is exactly `1/(RRF_K+r)`, so `score/maxScore` is
+  // `(RRF_K+1)/(RRF_K+r)` — a curve that only spans down to ~0.55 by rank
+  // 10, compressing the WHOLE top-10 relevance spread into less than the
+  // recency term's own span (rerank.ts's `w.recency` term alone covers a
+  // full week's exponential decay). That compression is what let a
+  // several-ranks-worse, barely-relevant FTS hit outscore a clearly better,
+  // slightly-older one on the blended score (a reproduced defect, see
+  // search.test.ts). Min-max normalising against BOTH ends of this call's
+  // own fused set instead restores the full 0..1 range regardless of branch
+  // count or fused-list size: the best candidate is exactly 1, the worst is
+  // exactly 0, and everything else falls proportionally between them, so a
+  // rank-position difference is never silently worth less than it should be
+  // relative to the other blend terms. This is the more principled of the
+  // two fixes precisely because it does not depend on how many branches
+  // fired or how deep the pool is — a max-only normalisation stays skewed
+  // by RRF_K no matter how the OTHER weights are re-tuned. fused is sorted
+  // score-desc, so fused[0]/fused[fused.length-1] are the max/min directly;
+  // the degenerate case (every fused score identical, including the
+  // single-candidate case) has no meaningful range to spread across, so it
+  // maps every candidate to 1 rather than dividing by zero.
   const maxScore = fused[0]!.score;
-  const relevanceById = new Map(fused.map((item) => [item.id, maxScore > 0 ? item.score / maxScore : 0]));
+  const minScore = fused[fused.length - 1]!.score;
+  const scoreRange = maxScore - minScore;
+  const relevanceById = new Map(
+    fused.map((item) => [item.id, scoreRange > 0 ? (item.score - minScore) / scoreRange : 1]),
+  );
 
   // --- re-rank (recency/importance/relevance/access blend) ---
   const rerankInput: RerankItem[] = fused.map((item) => {
@@ -502,6 +604,7 @@ export async function search(
       parts: r.parts,
       sources: { fts: ranks[0] ?? null, vector: ranks[1] ?? null },
       coverage: coverageById.get(id) ?? null,
+      vectorDistance: vectorDistanceById.get(id) ?? null,
     };
   });
 
