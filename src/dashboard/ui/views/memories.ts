@@ -11,14 +11,16 @@ import {
   deleteMemory,
   restoreMemory,
   supersedeMemory,
+  previewImportPasted,
   importPasted,
+  previewImportChatGpt,
   importChatGpt,
   bulkOp,
   approveMemory,
   subscribeToEvents,
   ApiError,
 } from "../api-client.js";
-import type { Memory, SearchHit, StatsResult, ClientInfo } from "../api-client.js";
+import type { Memory, SearchHit, StatsResult, ClientInfo, PastedImportPreview, ChatGptImportPreview } from "../api-client.js";
 
 const PAGE_SIZES = [25, 50, 100] as const;
 const SEARCH_DEBOUNCE_MS = 300;
@@ -668,11 +670,55 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     "aria-label": "Tags for the imported memories, comma-separated (optional)",
     placeholder: "Tags, comma-separated (optional)",
   }) as HTMLInputElement;
-  const pastedSubmitBtn = el("button", { type: "button", class: "btn" }, ["Import pasted text"]);
-  const pastedResultSlot = el("div", { class: "field-error-slot" }, []);
-  pastedSubmitBtn.addEventListener("click", () => void handlePastedImport());
+  // Preview-then-confirm (BUILD_BRIEF §6/§10, same shape as
+  // store.forgetWhere's query-shaped delete): neither vendor export format
+  // has ever been run against a real export, so a wrong parse must be shown
+  // before it becomes garbage in the store, not after. `pastedPreview` holds
+  // the exact inputs the preview was built from, so "Confirm import" sends
+  // exactly what was previewed rather than re-reading the (possibly since
+  // edited) form fields.
+  let pastedPreview: { preview: PastedImportPreview; text: string; scope?: string; tags?: string[] } | null = null;
 
-  async function handlePastedImport(): Promise<void> {
+  const pastedSubmitBtn = el("button", { type: "button", class: "btn" }, ["Preview import"]);
+  const pastedConfirmBtn = el("button", { type: "button", class: "btn" }, ["Confirm import"]);
+  const pastedCancelBtn = el("button", { type: "button", class: "btn" }, ["Cancel"]);
+  const pastedResultSlot = el("div", { class: "field-error-slot" }, []);
+  pastedSubmitBtn.addEventListener("click", () => void handlePastedPreview());
+  pastedConfirmBtn.addEventListener("click", () => void handlePastedConfirm());
+  pastedCancelBtn.addEventListener("click", () => {
+    pastedPreview = null;
+    clear(pastedResultSlot);
+  });
+
+  function renderPastedPreview(): void {
+    clear(pastedResultSlot);
+    if (!pastedPreview) return;
+    const { preview } = pastedPreview;
+    const summary = [`Parsed ${preview.totalParsed}. Would import ${preview.wouldImport}, skip ${preview.wouldSkipDuplicate} as duplicate.`];
+    if (preview.wouldRefuseStrict > 0) {
+      summary.push(` ${preview.wouldRefuseStrict} line${preview.wouldRefuseStrict === 1 ? "" : "s"} would be refused by strict redaction mode.`);
+    }
+    pastedResultSlot.appendChild(el("p", { class: "import-result" }, [summary.join("")]));
+    if (preview.entries.length > 0) {
+      pastedResultSlot.appendChild(
+        el(
+          "ul",
+          { class: "import-preview-list" },
+          preview.entries.map((entry) => el("li", {}, [entry.text])),
+        ),
+      );
+      if (preview.entriesTruncated) {
+        pastedResultSlot.appendChild(
+          el("p", { class: "muted" }, [
+            `Showing the first ${preview.entries.length} of ${preview.wouldImport} entries that would be created.`,
+          ]),
+        );
+      }
+    }
+    pastedResultSlot.appendChild(el("div", { class: "edit-form-row" }, [pastedConfirmBtn, pastedCancelBtn]));
+  }
+
+  async function handlePastedPreview(): Promise<void> {
     const rawText = pastedTextArea.value;
     if (rawText.trim() === "") return;
     const scope = pastedScopeInput.value.trim() || undefined;
@@ -683,10 +729,30 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     pastedSubmitBtn.disabled = true;
     clear(pastedResultSlot);
     try {
-      const result = await importPasted({ text: rawText, scope, tags: tags.length > 0 ? tags : undefined });
+      const preview = await previewImportPasted({ text: rawText, scope, tags: tags.length > 0 ? tags : undefined });
+      pastedPreview = { preview, text: rawText, scope, tags: tags.length > 0 ? tags : undefined };
+      renderPastedPreview();
+    } catch (err) {
+      pastedPreview = null;
+      pastedResultSlot.appendChild(
+        el("p", { class: "field-error" }, [err instanceof ApiError ? err.message : "Could not import that text."]),
+      );
+    } finally {
+      pastedSubmitBtn.disabled = false;
+    }
+  }
+
+  async function handlePastedConfirm(): Promise<void> {
+    if (!pastedPreview) return;
+    const { text: rawText, scope, tags } = pastedPreview;
+    pastedConfirmBtn.disabled = true;
+    try {
+      const result = await importPasted({ text: rawText, scope, tags });
+      pastedPreview = null;
       pastedTextArea.value = "";
       pastedScopeInput.value = "";
       pastedTagsInput.value = "";
+      clear(pastedResultSlot);
       const parts = [`Imported ${result.imported}, skipped ${result.skipped} as duplicate.`];
       if (result.refused > 0) {
         parts.push(` ${result.refused} line${result.refused === 1 ? "" : "s"} refused by strict redaction mode.`);
@@ -698,7 +764,7 @@ export function mountMemoriesView(container: HTMLElement): () => void {
         el("p", { class: "field-error" }, [err instanceof ApiError ? err.message : "Could not import that text."]),
       );
     } finally {
-      pastedSubmitBtn.disabled = false;
+      pastedConfirmBtn.disabled = false;
     }
   }
 
@@ -714,21 +780,68 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     "aria-label": "Scope for the imported memories (optional)",
     placeholder: "Scope (optional)",
   }) as HTMLInputElement;
-  const chatgptSubmitBtn = el("button", { type: "button", class: "btn" }, ["Import ChatGPT export"]);
-  const chatgptResultSlot = el("div", { class: "field-error-slot" }, []);
-  chatgptSubmitBtn.addEventListener("click", () => void handleChatGptImport());
+  // Same preview-then-confirm shape as the pasted panel above, and for the
+  // same reason: `conversations.json`'s shape is unverified against a real
+  // export (see importers/chatgpt.ts). The parsed JSON is kept here rather
+  // than re-read from the file input on confirm, since a <input type=file>
+  // cannot be trusted to still hold the same selection.
+  let chatgptPreview: { preview: ChatGptImportPreview; conversations: unknown; scope?: string } | null = null;
 
-  async function handleChatGptImport(): Promise<void> {
+  const chatgptSubmitBtn = el("button", { type: "button", class: "btn" }, ["Preview import"]);
+  const chatgptConfirmBtn = el("button", { type: "button", class: "btn" }, ["Confirm import"]);
+  const chatgptCancelBtn = el("button", { type: "button", class: "btn" }, ["Cancel"]);
+  const chatgptResultSlot = el("div", { class: "field-error-slot" }, []);
+  chatgptSubmitBtn.addEventListener("click", () => void handleChatGptPreview());
+  chatgptConfirmBtn.addEventListener("click", () => void handleChatGptConfirm());
+  chatgptCancelBtn.addEventListener("click", () => {
+    chatgptPreview = null;
+    clear(chatgptResultSlot);
+  });
+
+  function renderChatGptPreview(): void {
+    clear(chatgptResultSlot);
+    if (!chatgptPreview) return;
+    const { preview } = chatgptPreview;
+    const summary = [
+      `Found ${preview.found} of 2 known fields. Would import ${preview.wouldImport}, skip ${preview.wouldSkipDuplicate} as duplicate.`,
+    ];
+    if (preview.wouldRefuseStrict > 0) {
+      summary.push(` ${preview.wouldRefuseStrict} field${preview.wouldRefuseStrict === 1 ? "" : "s"} would be refused by strict redaction mode.`);
+    }
+    chatgptResultSlot.appendChild(el("p", { class: "import-result" }, [summary.join("")]));
+    if (preview.entries.length > 0) {
+      chatgptResultSlot.appendChild(
+        el(
+          "ul",
+          { class: "import-preview-list" },
+          preview.entries.map((entry) => el("li", {}, [entry.text])),
+        ),
+      );
+      if (preview.entriesTruncated) {
+        chatgptResultSlot.appendChild(
+          el("p", { class: "muted" }, [
+            `Showing the first ${preview.entries.length} of ${preview.wouldImport} entries that would be created.`,
+          ]),
+        );
+      }
+    }
+    chatgptResultSlot.appendChild(el("div", { class: "edit-form-row" }, [chatgptConfirmBtn, chatgptCancelBtn]));
+  }
+
+  async function handleChatGptPreview(): Promise<void> {
     const file = chatgptFileInput.files?.[0];
     if (!file) return;
     chatgptSubmitBtn.disabled = true;
+    chatgptPreview = null;
     clear(chatgptResultSlot);
     // Checked BEFORE reading the file: the daemon caps a request body at 4MB
     // (src/daemon/http.ts) and a real ChatGPT export is typically 5-100MB,
     // so every upload past this limit would fail with a 413 anyway -- but
     // only after paying for file.text() + JSON.parse + JSON.stringify, up to
     // three copies of the file in memory. Reject it here instead and point
-    // the user at the paste path, which has no such ceiling.
+    // the user at the paste path, which has no such ceiling. Applies to a
+    // preview exactly as it does to a confirmed import -- a too-large file
+    // must fail the same way either way.
     if (file.size > MAX_UPLOAD_BYTES) {
       chatgptResultSlot.appendChild(
         el("p", { class: "field-error" }, [
@@ -749,9 +862,29 @@ export function mountMemoriesView(container: HTMLElement): () => void {
         return;
       }
       const scope = chatgptScopeInput.value.trim() || undefined;
+      const preview = await previewImportChatGpt({ conversations, scope });
+      chatgptPreview = { preview, conversations, scope };
+      renderChatGptPreview();
+    } catch (err) {
+      chatgptPreview = null;
+      chatgptResultSlot.appendChild(
+        el("p", { class: "field-error" }, [err instanceof ApiError ? err.message : "Could not import that export."]),
+      );
+    } finally {
+      chatgptSubmitBtn.disabled = false;
+    }
+  }
+
+  async function handleChatGptConfirm(): Promise<void> {
+    if (!chatgptPreview) return;
+    const { conversations, scope } = chatgptPreview;
+    chatgptConfirmBtn.disabled = true;
+    try {
       const result = await importChatGpt({ conversations, scope });
+      chatgptPreview = null;
       chatgptFileInput.value = "";
       chatgptScopeInput.value = "";
+      clear(chatgptResultSlot);
       const parts = [
         `Found ${result.found} of 2 known fields. Imported ${result.imported}, skipped ${result.skipped} as duplicate.`,
       ];
@@ -765,7 +898,7 @@ export function mountMemoriesView(container: HTMLElement): () => void {
         el("p", { class: "field-error" }, [err instanceof ApiError ? err.message : "Could not import that export."]),
       );
     } finally {
-      chatgptSubmitBtn.disabled = false;
+      chatgptConfirmBtn.disabled = false;
     }
   }
 

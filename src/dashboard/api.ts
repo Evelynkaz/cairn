@@ -6,15 +6,18 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Store } from "../storage/index.js";
-import { VALID_PRIVACY_MODES } from "../storage/index.js";
+import { DEFAULT_SCOPE, VALID_PRIVACY_MODES } from "../storage/index.js";
 import type { PrivacyMode } from "../storage/index.js";
 import type { MemoryEvent, MemoryEventBus } from "../mcp/events.js";
 import { PayloadTooLargeError, readJsonBody, sendJson, tokenMatches } from "../daemon/http.js";
 import { DASHBOARD_CLIENT } from "../config/identity.js";
 import { LiveTextCollisionError } from "../storage/repositories/memories.js";
+import { DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT } from "../storage/repositories/paging.js";
 import { extractCustomInstructions, ImporterFormatError, parsePastedMemories } from "../portability/importers/index.js";
 import { toSafeDegradedReason } from "../retrieval/search.js";
 import { MAX_TAGS, MAX_TAG_LENGTH, MAX_SCOPE_LENGTH } from "../storage/limits.js";
+import { redactText } from "../privacy/redact.js";
+import { contentHash } from "../util/text.js";
 
 // Re-exported for callers that already import it from here.
 export { DASHBOARD_CLIENT };
@@ -194,6 +197,31 @@ function clampScope(scope: string): string {
     throw new HttpError(400, `scope exceeds the cap of ${MAX_SCOPE_LENGTH} characters`);
   }
   return scope;
+}
+
+// How many of a preview's would-be-created entries are shown, same bound
+// as list_memories's own default page (paging.ts's DEFAULT_PAGE_LIMIT) --
+// a preview is a read like any other and must stay just as bounded as one
+// (BUILD_BRIEF §12), even though the underlying paste can hold up to
+// MAX_PASTED_ENTRIES (pasted.ts). `wouldImport` still reports the true
+// total; only the entry TEXT list is capped.
+const IMPORT_PREVIEW_ENTRY_LIMIT = DEFAULT_PAGE_LIMIT;
+
+// Bounds how many pages of the store's own list() this module will walk
+// to build a duplicate-check hash set for one preview -- list()'s own
+// per-page cap (MAX_PAGE_LIMIT) times this is the most live memories in one
+// scope a single preview will ever compare against; beyond that, a
+// duplicate against a memory outside this window is simply reported as new
+// rather than blocking the preview on an unbounded scan (BUILD_BRIEF §12
+// bounds every tool's output, and this is a read on every one of them).
+const IMPORT_PREVIEW_HASH_SCAN_PAGE_CAP = 50;
+
+interface ImportPreview {
+  entries: { text: string }[];
+  entriesTruncated: boolean;
+  wouldImport: number;
+  wouldSkipDuplicate: number;
+  wouldRefuseStrict: number;
 }
 
 function asRecord(body: unknown): Record<string, unknown> {
@@ -599,6 +627,79 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     sendJson(res, 200, result);
   }
 
+  // Read-only mirror of store.remember's own dedupe lookup (see
+  // repositories/memories.ts's createMemory: `memories_live` keyed on
+  // scope + content_hash), rebuilt from store.list() rather than a second
+  // index -- there is no public Store method that answers "does this hash
+  // already live in this scope" without also writing, and this module has
+  // no business reaching past Store into raw SQL for one. Paged the same
+  // way list_memories itself pages, and audited the same way (list_memories
+  // reads), which is why a preview leaves list_memories audit rows behind
+  // but never a remember/import one.
+  function collectLiveContentHashes(scope: string): Set<string> {
+    const hashes = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < IMPORT_PREVIEW_HASH_SCAN_PAGE_CAP; page++) {
+      const { items, nextCursor } = store.list(
+        { scope, includeDeleted: false, includeSuperseded: false, limit: MAX_PAGE_LIMIT, cursor },
+        CTX,
+      );
+      for (const item of items) hashes.add(item.contentHash);
+      if (!nextCursor) break;
+      cursor = nextCursor;
+    }
+    return hashes;
+  }
+
+  // Shared by handleImportPasted and handleImportChatGpt: runs each
+  // candidate entry through the exact same redaction rule store.remember
+  // applies (../privacy/redact.js's redactText, the same pure function, not
+  // a reimplementation) and the same content-hash dedupe rule createMemory
+  // applies, WITHOUT calling store.remember -- so nothing is written, no
+  // episode is appended, and no redaction row is recorded (§10: a redaction
+  // row is only ever recorded for a write that actually happened). A
+  // duplicate within the pasted/found entries themselves (not just against
+  // what is already live) is also caught, mirroring how a real confirmed
+  // import's second occurrence would dedupe against the first entry's
+  // just-created row.
+  function buildImportPreview(texts: string[], scope: string | undefined): ImportPreview {
+    const { mode } = store.privacy();
+    const effectiveScope = scope ?? DEFAULT_SCOPE;
+    const existingHashes = collectLiveContentHashes(effectiveScope);
+    const pendingHashes = new Set<string>();
+
+    let wouldImport = 0;
+    let wouldSkipDuplicate = 0;
+    let wouldRefuseStrict = 0;
+    const entries: { text: string }[] = [];
+
+    for (const raw of texts) {
+      const redaction = redactText(raw, mode);
+      if (mode === "strict" && redaction.blocked) {
+        wouldRefuseStrict++;
+        continue;
+      }
+      const hash = contentHash(redaction.text);
+      if (existingHashes.has(hash) || pendingHashes.has(hash)) {
+        wouldSkipDuplicate++;
+        continue;
+      }
+      pendingHashes.add(hash);
+      wouldImport++;
+      if (entries.length < IMPORT_PREVIEW_ENTRY_LIMIT) {
+        entries.push({ text: redaction.text });
+      }
+    }
+
+    return {
+      entries,
+      entriesTruncated: wouldImport > entries.length,
+      wouldImport,
+      wouldSkipDuplicate,
+      wouldRefuseStrict,
+    };
+  }
+
   // §1/§12's lock-in-escape hook, wired to the dashboard rather than a
   // ninth MCP tool (§2's ≤7 ceiling): a deliberate, user-initiated,
   // one-time paste. Writes through store.remember under IMPORT_CTX (not
@@ -610,6 +711,15 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
   // excludeUnapproved). These are new memories with no id of their own, so
   // minting fresh ones (not the id-preserving importMemory path) is
   // correct here.
+  //
+  // Without `confirm: true`, this PARSES and returns what would be created
+  // without writing anything (see buildImportPreview above) -- the real
+  // export formats have never been run against a genuine vendor export, so
+  // an importer that writes immediately turns a wrong parse into silent
+  // garbage in the store. Preview is the DEFAULT specifically because the
+  // failure being mitigated is a caller who did not realise a write was
+  // about to happen; `confirm: true` behaves exactly as this route always
+  // has.
   async function handleImportPasted(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = asRecord(await readBody(req));
     const text = body["text"];
@@ -618,8 +728,27 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     }
     const scope = typeof body["scope"] === "string" ? clampScope(body["scope"]) : undefined;
     const tags = Array.isArray(body["tags"]) ? clampTags(body["tags"]) : undefined;
+    const confirm = body["confirm"] === true;
 
     const parsed = parsePastedMemories(text);
+
+    if (!confirm) {
+      const preview = buildImportPreview(
+        parsed.map((entry) => entry.text),
+        scope,
+      );
+      sendJson(res, 200, {
+        preview: true,
+        totalParsed: parsed.length,
+        entries: preview.entries,
+        entriesTruncated: preview.entriesTruncated,
+        wouldImport: preview.wouldImport,
+        wouldSkipDuplicate: preview.wouldSkipDuplicate,
+        wouldRefuseStrict: preview.wouldRefuseStrict,
+      });
+      return;
+    }
+
     let imported = 0;
     let skipped = 0;
     let refused = 0;
@@ -657,9 +786,15 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
   // which by construction never echoes the input -- so no further
   // scrubbing is needed here, unlike the no-echo rule elsewhere in this
   // file that guards against exactly that.
+  //
+  // Same preview-then-confirm shape as handleImportPasted above, and for
+  // the same reason: `conversations.json`'s shape is unverified against a
+  // real export (see importers/chatgpt.ts), so preview is the default here
+  // too.
   async function handleImportChatGpt(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = asRecord(await readBody(req));
     const scope = typeof body["scope"] === "string" ? clampScope(body["scope"]) : undefined;
+    const confirm = body["confirm"] === true;
 
     let instructions;
     try {
@@ -676,6 +811,23 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       { value: instructions.aboutModel, tag: "chatgpt-about-model" },
     ];
     const found = fields.filter((f) => f.value !== undefined && f.value.length > 0).length;
+
+    if (!confirm) {
+      const preview = buildImportPreview(
+        fields.filter((f) => f.value !== undefined && f.value.length > 0).map((f) => f.value as string),
+        scope,
+      );
+      sendJson(res, 200, {
+        preview: true,
+        found,
+        entries: preview.entries,
+        entriesTruncated: preview.entriesTruncated,
+        wouldImport: preview.wouldImport,
+        wouldSkipDuplicate: preview.wouldSkipDuplicate,
+        wouldRefuseStrict: preview.wouldRefuseStrict,
+      });
+      return;
+    }
 
     let imported = 0;
     let skipped = 0;

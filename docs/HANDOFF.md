@@ -31,7 +31,7 @@ time, and the fixes for those in turn needed a rework pass of their own. Read
 §1a before touching `src/privacy`, `src/retrieval`, `src/daemon`, or
 `src/portability`.
 
-Current test count: **971 tests, 965 pass, 0 fail, 6 skipped**, verified
+Current test count: **977 tests, 971 pass, 0 fail, 6 skipped**, verified
 locally on Linux (`27d5b03`). This project has been burned twice on
 trusting a raw pass/skip count without reading what changed it (§5) — the
 6th skip (up from 5) is a new `ensureHome` test added in `27d5b03` that
@@ -164,8 +164,8 @@ The exact `node --test` summary (tests/pass/fail/skipped counts) is
 deliberately not pasted here anymore. It drifted five times in one day —
 every count in this document is a snapshot of one commit, not a live
 value, and a transcript that looks like a terminal invites trust a stale
-number hasn't earned. Run `npm test` yourself; at `27d5b03` it was 971
-tests, 965 pass, 0 fail, 6 skipped (see §1).
+number hasn't earned. Run `npm test` yourself; when this line was written it was 977
+tests, 971 pass, 0 fail, 6 skipped (see §1).
 
 The build is still three `tsc` invocations plus one asset-copy step, not
 one: `tsconfig.json` (Node-only root project), `tsconfig.ui.json` (the

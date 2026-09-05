@@ -684,6 +684,19 @@ textarea {
   margin: 0;
 }
 
+.import-preview-list {
+  max-height: 12rem;
+  overflow-y: auto;
+  margin: 0;
+  padding-left: 1.25rem;
+  color: var(--fg);
+  font-size: 0.9rem;
+}
+
+.import-preview-list li {
+  overflow-wrap: anywhere;
+}
+
 /* ---- toast --------------------------------------------------------------- */
 
 .toast {

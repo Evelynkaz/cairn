@@ -455,8 +455,35 @@ export interface PastedImportResult extends ImportResult {
   refused: number;
 }
 
-export function importPasted(body: { text: string; scope?: string; tags?: string[] }): Promise<PastedImportResult> {
-  return request<PastedImportResult>("POST", "/api/import/pasted", body);
+// Neither vendor export format has ever been run against a real export
+// (README's own honest caveat), so both import routes are preview-then-
+// confirm, the same shape as store.forgetWhere's query-shaped delete: a
+// plain POST (no `confirm`) PARSES and returns this instead of writing
+// anything, so a wrong parse is visible before it becomes garbage in the
+// store. `entries` is the actual text of each entry that WOULD be created,
+// bounded server-side (see api.ts's IMPORT_PREVIEW_ENTRY_LIMIT) --
+// `entriesTruncated` says whether `wouldImport` exceeds what's shown.
+export interface ImportPreview {
+  preview: true;
+  entries: Array<{ text: string }>;
+  entriesTruncated: boolean;
+  wouldImport: number;
+  wouldSkipDuplicate: number;
+  wouldRefuseStrict: number;
+}
+
+export interface PastedImportPreview extends ImportPreview {
+  totalParsed: number;
+}
+
+export function previewImportPasted(body: { text: string; scope?: string; tags?: string[] }): Promise<PastedImportPreview> {
+  return request<PastedImportPreview>("POST", "/api/import/pasted", body);
+}
+
+export function importPasted(
+  body: { text: string; scope?: string; tags?: string[] },
+): Promise<PastedImportResult> {
+  return request<PastedImportResult>("POST", "/api/import/pasted", { ...body, confirm: true });
 }
 
 // `refused` mirrors PastedImportResult's above: the store's strict privacy
@@ -472,13 +499,21 @@ export interface ImportChatGptResult extends ImportResult {
   found: number;
 }
 
+export interface ChatGptImportPreview extends ImportPreview {
+  found: number;
+}
+
 // `conversations` is the parsed JSON array from a ChatGPT
 // conversations.json export -- unknown here because
 // extractCustomInstructions (src/portability/importers/chatgpt.ts) does its
 // own loose shape check server-side and answers 400 with a descriptive
 // message rather than this client pre-validating it.
+export function previewImportChatGpt(body: { conversations: unknown; scope?: string }): Promise<ChatGptImportPreview> {
+  return request<ChatGptImportPreview>("POST", "/api/import/chatgpt", body);
+}
+
 export function importChatGpt(body: { conversations: unknown; scope?: string }): Promise<ImportChatGptResult> {
-  return request<ImportChatGptResult>("POST", "/api/import/chatgpt", body);
+  return request<ImportChatGptResult>("POST", "/api/import/chatgpt", { ...body, confirm: true });
 }
 
 // The event bus payload (src/mcp/events.ts): only ever "updated" or
