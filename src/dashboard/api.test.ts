@@ -277,6 +277,22 @@ test("PATCH with importance outside 0..1 is 400, not 500", async () => {
   assert.equal(res.status, 400);
 });
 
+test("PATCH with a tags array over the cap is 400, not applied", async () => {
+  const memory = ctx.store.remember({ content: "patch tags cap target" }, { sourceClient: "other" }).memory;
+  const manyTags = Array.from({ length: 2000 }, (_, i) => `tag-${i}`);
+  const res = await call(ctx, "PATCH", `/api/memories/${memory.id}`, { body: { tags: manyTags } });
+  assert.equal(res.status, 400);
+});
+
+test("POST /api/memories/:id/supersede with a tags array over the cap is 400, not applied", async () => {
+  const memory = ctx.store.remember({ content: "supersede tags cap target" }, { sourceClient: "other" }).memory;
+  const manyTags = Array.from({ length: 2000 }, (_, i) => `tag-${i}`);
+  const res = await call(ctx, "POST", `/api/memories/${memory.id}/supersede`, {
+    body: { text: "replacement text", tags: manyTags },
+  });
+  assert.equal(res.status, 400);
+});
+
 test("PATCH on a superseded memory is a 409 conflict with no message leak", async () => {
   const memory = ctx.store.remember({ content: "will be superseded via api test" }, { sourceClient: "other" })
     .memory;
@@ -765,6 +781,31 @@ test("POST /api/import/pasted applies scope and tags", async () => {
   assert.ok(item);
   assert.equal(item?.scope, "import-scope");
   assert.ok(item?.tags.includes("from-paste"));
+});
+
+test("POST /api/import/pasted refuses a tags array over the cap with 400 rather than amplifying it across every entry", async () => {
+  const manyTags = Array.from({ length: 2000 }, (_, i) => `tag-${i}`);
+  const res = await call(ctx, "POST", "/api/import/pasted", {
+    body: { text: "A line one\nA line two\nA line three", tags: manyTags },
+  });
+  assert.equal(res.status, 400);
+  const list = ctx.store.list({});
+  assert.ok(!list.items.some((m) => m.text === "A line one"), "nothing should have been written on refusal");
+});
+
+test("POST /api/import/pasted refuses a single over-long tag", async () => {
+  const res = await call(ctx, "POST", "/api/import/pasted", {
+    body: { text: "An over-long-tag fixture", tags: ["x".repeat(65)] },
+  });
+  assert.equal(res.status, 400);
+});
+
+test("POST /api/import/pasted with a handful of short tags still succeeds", async () => {
+  const res = await call(ctx, "POST", "/api/import/pasted", {
+    body: { text: "A normal-tags fixture", tags: ["work", "berlin", "vim"] },
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { imported: 1, skipped: 0, refused: 0 });
 });
 
 test("POST /api/import/pasted publishes a list_changed event on the bus", async () => {

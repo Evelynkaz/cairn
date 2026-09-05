@@ -14,8 +14,8 @@
 // orchestration is only ~60-70% reliable on its own.
 
 import { z } from "zod";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, resolve, sep } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { CallContext, Memory, SearchHit } from "../storage/index.js";
@@ -96,6 +96,24 @@ function hitToJson(hit: SearchHit): Record<string, unknown> {
 
 function jsonResult(data: unknown): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+}
+
+// Mirrors src/dashboard/api.ts's toSafeDegradedReason: the retrieval layer's
+// raw `degradedReason` (src/retrieval/search.ts's catch block) is whatever
+// text an HTTP-backed embedding provider's failure carried, which can embed
+// `${response.status} ${readBodyExcerpt(...)}` of the upstream response --
+// a provider URL, a host name, or raw upstream error body. That text must
+// never reach an MCP client verbatim (the same no-echo rule the dashboard's
+// API already applies over this daemon); keep the detail on stderr only and
+// return this fixed value instead. `degraded` (the boolean) is untouched.
+type SafeDegradedReason = "embedding_failed" | null;
+function toSafeDegradedReason(degraded: boolean, rawReason: string | null): SafeDegradedReason {
+  if (degraded && rawReason) {
+    // The detailed, potentially upstream-carrying text stays on stderr for
+    // whoever operates this daemon -- it never reaches the MCP client.
+    console.error(`degraded retrieval: ${rawReason}`);
+  }
+  return degraded ? "embedding_failed" : null;
 }
 
 // Picks the first non-blank value, in order -- how remember/recall/get_context/
@@ -195,6 +213,65 @@ function defaultExportPath(): string {
 const IMPORT_NO_ARCHIVE_MESSAGE = "import_memories: no readable archive at that path";
 const MAX_IMPORT_ARCHIVE_BYTES = 200 * 1024 * 1024;
 
+// Defence in depth for BUILD_BRIEF §10/§12: every error site an import
+// archive can reach (this file's own throws, archive.ts, and the storage
+// layer's importMemory) has been reviewed to bound attacker-controlled text
+// -- but a future one that isn't would otherwise flow straight into an MCP
+// client's context unbounded. This is the outer net, not a substitute for
+// bounding at the source: it clamps whatever message is ABOUT to leave a
+// tool result, however it got long.
+const CAUGHT_ERROR_MESSAGE_LIMIT = 200;
+function clampErrorMessage(message: string): string {
+  return message.length > CAUGHT_ERROR_MESSAGE_LIMIT
+    ? `${message.slice(0, CAUGHT_ERROR_MESSAGE_LIMIT)}…`
+    : message;
+}
+
+// The systemic version of the same net: an audit found six of the eight
+// tools (remember, recall, get_context, list_memories, update_memory,
+// forget) had NO catch block at all, so anything thrown below them -- e.g.
+// paging.ts's decodeCursor on a malformed cursor -- reached the MCP client
+// verbatim and unbounded. Rather than add six near-identical try/catch
+// blocks that will inevitably drift apart, every tool handler is wrapped
+// here, in one place, so no future tool can be added without this net.
+// Mutating `err.message` in place (instead of constructing a new Error)
+// preserves the thrown value's real type and identity -- callers/tests that
+// `instanceof`-match a specific error class, and the per-tool catch blocks
+// above (import_memories's ArchiveFormatError collapse, recall/get_context's
+// degradedReason scrub, export_memories's fixed messages) still run first
+// and produce whatever message they choose; this only clamps it further if
+// it is somehow still too long, it never replaces it.
+function withBoundedErrors<Args extends unknown[]>(
+  handler: (...args: Args) => CallToolResult | Promise<CallToolResult>,
+): (...args: Args) => Promise<CallToolResult> {
+  return async (...args: Args) => {
+    try {
+      return await handler(...args);
+    } catch (err) {
+      if (err instanceof Error) {
+        err.message = clampErrorMessage(err.message);
+      }
+      throw err;
+    }
+  };
+}
+
+// Every ArchiveFormatError archive.ts can raise BEFORE manifest.json has been
+// parsed and its formatVersion read (see importArchive there): a real ZIP
+// that just isn't a Cairn archive at all (e.g. a .jar/.docx/.xlsx/.apk/.epub)
+// falls in here. These must collapse to IMPORT_NO_ARCHIVE_MESSAGE below --
+// otherwise this call site is a filesystem oracle over every zip-container
+// file on the machine, not just Cairn archives. Anything raised AFTER that
+// point (unsupported format version, checksum mismatch, ...) proves the
+// caller already had a real Cairn archive, so it keeps its own message.
+const PRE_MANIFEST_ARCHIVE_ERRORS: RegExp[] = [
+  /^not a valid Cairn archive:/,
+  /^archive is missing manifest\.json$/,
+  /^manifest\.json is not valid JSON$/,
+  /^manifest\.json is not a JSON object$/,
+  /^manifest\.json is missing a numeric formatVersion$/,
+];
+
 function resolveWithinCairnHome(requested: string): string {
   const home = resolve(ensureHome(resolveCairnHome()));
   const candidate = resolve(home, requested);
@@ -204,6 +281,27 @@ function resolveWithinCairnHome(requested: string): string {
   return candidate;
 }
 
+// resolveWithinCairnHome's containment check is purely lexical (plain
+// `resolve()`), so it never sees a symlink in a PARENT component of the
+// candidate path -- a directory under the home that is actually a symlink
+// out of it passes that check untouched. `wx` on the final write only
+// defeats a symlink at the target FILE itself (dangling or pointing at an
+// existing file); it says nothing about the directory the file would be
+// created in. This is the additional gate: resolve the candidate's real
+// parent directory and re-check containment against that.
+function verifyExportDirNotSymlinkedOutOfHome(candidate: string): void {
+  const home = resolve(ensureHome(resolveCairnHome()));
+  let realDir: string;
+  try {
+    realDir = realpathSync(dirname(candidate));
+  } catch {
+    throw new Error("export_memories: path must be inside the Cairn home directory");
+  }
+  if (realDir !== home && !realDir.startsWith(home + sep)) {
+    throw new Error("export_memories: path must be inside the Cairn home directory");
+  }
+}
+
 // Being inside the Cairn home is necessary but not sufficient: the database
 // itself (and its WAL/SHM siblings) and the daemon's runtime file also live
 // there, and export_memories writing to any of THOSE names would truncate
@@ -211,11 +309,30 @@ function resolveWithinCairnHome(requested: string): string {
 // producing a backup. Refuse those exact paths by identity, using the same
 // helpers the daemon uses to find them, rather than hardcoding filenames
 // that could drift out of sync.
+//
+// A bare string-identity check against `candidate` is bypassable: a
+// trailing space or dot in the requested name (e.g. "cairn.db ") makes
+// `candidate` a distinct string on Linux, but Windows' filesystem strips
+// trailing spaces/dots so that name still resolves to the live database
+// there -- and a `:` introduces an NTFS alternate data stream (e.g.
+// "cairn.db:evil") whose non-existence would otherwise let `wx` succeed.
+// So this compares the final path segment, with trailing dots/spaces
+// stripped, against the protected names, and refuses any `:` outright.
+const PROTECTED_HOME_FILENAMES = new Set(["cairn.db", "cairn.db-wal", "cairn.db-shm", "daemon.json"]);
+
 function refuseCairnOwnedPath(candidate: string): void {
   const home = resolveCairnHome();
   const db = dbPath(home);
   const forbidden = new Set([db, `${db}-wal`, `${db}-shm`, runtimeFilePath(home)]);
   if (forbidden.has(candidate)) {
+    throw new Error("export_memories: path must be inside the Cairn home directory");
+  }
+  const base = basename(candidate);
+  if (base.includes(":")) {
+    throw new Error("export_memories: path must be inside the Cairn home directory");
+  }
+  const normalizedBase = base.replace(/[. ]+$/, "");
+  if (PROTECTED_HOME_FILENAMES.has(normalizedBase)) {
     throw new Error("export_memories: path must be inside the Cairn home directory");
   }
 }
@@ -281,7 +398,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
           ),
       },
     },
-    async (args) => {
+    withBoundedErrors(async (args) => {
       const content = firstNonEmpty(args.content, args.text);
       if (!content) {
         throw new Error("remember requires `content` (or its alias `text`) with non-empty text.");
@@ -302,7 +419,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
       );
       await notifyMutation(memory.id);
       return jsonResult({ id: memory.id, deduped, episodeId });
-    },
+    }),
   );
 
   server.registerTool(
@@ -329,7 +446,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         tags: z.array(z.string()).optional().describe("Only return memories carrying ALL of these tags."),
       },
     },
-    async (args) => {
+    withBoundedErrors(async (args) => {
       const query = firstNonEmpty(args.query, args.q, args.text);
       if (!query) {
         throw new Error("recall requires `query` (or its aliases `q`/`text`) with non-empty text.");
@@ -349,9 +466,9 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
       return jsonResult({
         hits: result.hits.map(hitToJson),
         degraded: result.degraded,
-        degradedReason: result.degradedReason,
+        degradedReason: toSafeDegradedReason(result.degraded, result.degradedReason),
       });
-    },
+    }),
   );
 
   server.registerTool(
@@ -383,7 +500,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         tags: z.array(z.string()).optional().describe("Only include memories carrying ALL of these tags."),
       },
     },
-    async (args) => {
+    withBoundedErrors(async (args) => {
       const query = firstNonEmpty(args.query, args.q, args.text) ?? "";
       const block = await deps.store.context(
         query,
@@ -403,9 +520,9 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         tokensEstimated: block.tokensEstimated,
         truncated: block.truncated,
         degraded: block.degraded,
-        degradedReason: block.degradedReason,
+        degradedReason: toSafeDegradedReason(block.degraded, block.degradedReason),
       });
-    },
+    }),
   );
 
   server.registerTool(
@@ -447,7 +564,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         includeSuperseded: z.boolean().optional().describe("Alias for `include_superseded`."),
       },
     },
-    (args) => {
+    withBoundedErrors((args) => {
       const result = deps.store.list(
         {
           scope: args.scope,
@@ -460,7 +577,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         callContext(server, args.scope),
       );
       return jsonResult({ items: result.items.map(memoryToJson), nextCursor: result.nextCursor });
-    },
+    }),
   );
 
   server.registerTool(
@@ -485,7 +602,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
           ),
       },
     },
-    async (args) => {
+    withBoundedErrors(async (args) => {
       const content = firstNonEmpty(args.content, args.text);
       const memory = deps.store.update(
         args.id,
@@ -494,7 +611,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
       );
       await notifyMutation(memory.id);
       return jsonResult(memoryToJson(memory));
-    },
+    }),
   );
 
   server.registerTool(
@@ -540,7 +657,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
           ),
       },
     },
-    async (args) => {
+    withBoundedErrors(async (args) => {
       if (args.id) {
         const deleted = deps.store.forget(args.id, callContext(server, args.scope));
         if (deleted) {
@@ -608,7 +725,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         }
       }
       return jsonResult({ deleted: result.deleted, count: result.count, ids: result.matches.map((m) => m.id) });
-    },
+    }),
   );
 
   server.registerTool(
@@ -629,12 +746,13 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         scope: z.string().optional().describe("Export only one namespace instead of every scope."),
       },
     },
-    (args) => {
+    withBoundedErrors((args) => {
       requireEnabled(args.scope);
       const path =
         args.path && args.path.trim().length > 0
           ? resolveWithinCairnHome(args.path)
           : defaultExportPath();
+      verifyExportDirNotSymlinkedOutOfHome(path);
       refuseCairnOwnedPath(path);
       // includeSuperseded: true -- otherwise listMemories' default
       // `valid_until IS NULL` filter silently drops every superseded row,
@@ -665,7 +783,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         memories: result.memories,
         episodes: result.episodes,
       });
-    },
+    }),
   );
 
   server.registerTool(
@@ -684,7 +802,7 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         scope: z.string().optional().describe("Attributed scope for this import call's own audit entry."),
       },
     },
-    async (args) => {
+    withBoundedErrors(async (args) => {
       requireEnabled(args.scope);
       const path = resolve(args.path);
       let archiveBuf: Buffer;
@@ -707,18 +825,20 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
       try {
         result = importArchive(deps.store, archiveBuf);
       } catch (err) {
-        // A file that reads fine but isn't a ZIP at all (e.g. /etc/shadow)
+        // A file that reads fine but isn't a ZIP at all (e.g. /etc/shadow),
+        // or a real ZIP that isn't a Cairn archive (e.g. a .jar/.docx),
         // is the same "no archive here" outcome as the two filesystem cases
         // above, for the same oracle reason -- collapse it to the identical
         // message. A real archive that fails deeper validation (checksum
         // mismatch, unsupported format version, ...) proves the caller COULD
-        // read a real archive at that path, so it keeps its own message.
+        // read a real Cairn archive at that path, so it keeps its own message.
         if (err instanceof ArchiveFormatError) {
+          const isPreManifest = PRE_MANIFEST_ARCHIVE_ERRORS.some((re) => re.test(err.message));
           throw new Error(
-            err.message.startsWith("not a valid Cairn archive") ? IMPORT_NO_ARCHIVE_MESSAGE : `import_memories: ${err.message}`,
+            isPreManifest ? IMPORT_NO_ARCHIVE_MESSAGE : clampErrorMessage(`import_memories: ${err.message}`),
           );
         }
-        throw err;
+        throw new Error(clampErrorMessage(err instanceof Error ? err.message : String(err)));
       }
       recordAudit(deps.store.db, {
         action: "import",
@@ -730,6 +850,6 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         await notifyMutation();
       }
       return jsonResult({ imported: result.imported, skipped: result.skipped });
-    },
+    }),
   );
 }

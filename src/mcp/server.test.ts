@@ -7,7 +7,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -22,6 +23,9 @@ import { DASHBOARD_CLIENT } from "../dashboard/api.js";
 import { dbPath } from "../config/paths.js";
 import { runtimeFilePath, writeRuntimeFile } from "../daemon/runtime-file.js";
 import { exportArchive } from "../portability/archive.js";
+import { readZip, writeZip } from "../portability/zip.js";
+import { ensureVectorSpace } from "../storage/repositories/vectors.js";
+import type { EmbeddingProvider } from "../embeddings/types.js";
 
 interface RememberResult {
   id: string;
@@ -189,6 +193,15 @@ async function callJson<T>(client: Client, name: string, args: Record<string, un
   return JSON.parse(text) as T;
 }
 
+function statSyncExists(path: string): boolean {
+  try {
+    statSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function firstResourceText(contents: Array<{ uri: string; text: string } | { uri: string; blob: string }>): string {
   const first = contents[0];
   if (!first || !("text" in first)) {
@@ -290,6 +303,60 @@ test("recall accepts q/text as aliases for query; remember accepts text as an al
     const byText = await callJson<RecallResult>(client, "recall", { text: "Neovim" });
     assert.ok(byText.hits.some((h) => h.id === remembered.id));
   });
+});
+
+// The retrieval layer's raw degradedReason (src/retrieval/search.ts's catch
+// block) is whatever text a failing embedding provider throws -- for a real
+// HTTP-backed provider that can embed `${response.status}` plus an excerpt
+// of the upstream response body. Both recall and get_context must scrub it
+// to the same fixed value the dashboard's API already uses, never echo it
+// verbatim to an MCP client.
+const SENSITIVE_UPSTREAM_TEXT = "502 upstream body: internal-host-10.0.0.7 token=must-not-leak";
+
+function createFailingProvider(): EmbeddingProvider {
+  return {
+    modelId: "failing-test-model",
+    dim: 8,
+    name: "fake",
+    requiresNetwork: false,
+    async embed(): Promise<Float32Array[]> {
+      throw new Error(SENSITIVE_UPSTREAM_TEXT);
+    },
+    async close(): Promise<void> {},
+  };
+}
+
+test("recall and get_context scrub degradedReason instead of echoing the raw provider error", async () => {
+  const dir = makeTempDir();
+  const store = openStore({ path: tempDbPath(dir) });
+  const provider = createFailingProvider();
+  const space = ensureVectorSpace(store.db, provider.modelId, provider.dim);
+  const server = createMcpServer({ store, provider, space });
+  const client = new Client({ name: "degraded-test-client", version: "1.0.0" });
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    await callJson(client, "remember", { content: "A plain fact findable by keyword search alone." });
+
+    const recalled = await callJson<RecallResult>(client, "recall", { query: "plain fact keyword" });
+    assert.equal(recalled.degraded, true);
+    assert.equal(recalled.degradedReason, "embedding_failed", "recall must return the fixed safe reason, not the raw provider error");
+    const recalledText = JSON.stringify(recalled);
+    assert.ok(!recalledText.includes("internal-host-10.0.0.7"), "recall must not echo the raw provider error");
+    assert.ok(!recalledText.includes("must-not-leak"), "recall must not echo the raw provider error");
+
+    const context = await callJson<ContextResult>(client, "get_context", { query: "plain fact keyword" });
+    assert.equal(context.degraded, true);
+    assert.equal(context.degradedReason, "embedding_failed", "get_context must return the fixed safe reason, not the raw provider error");
+    const contextText = JSON.stringify(context);
+    assert.ok(!contextText.includes("internal-host-10.0.0.7"), "get_context must not echo the raw provider error");
+    assert.ok(!contextText.includes("must-not-leak"), "get_context must not echo the raw provider error");
+  } finally {
+    await client.close();
+    await server.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
 });
 
 test("get_context respects token_budget", async () => {
@@ -644,6 +711,33 @@ test("a subscribed client receives resources/updated on mutation; an unsubscribe
   });
 });
 
+// Without a scheme check, a compromised client could subscribe to any
+// arbitrary string, not just the `cairn://` URIs the resource mirror
+// actually serves.
+test("subscribing to a non-cairn:// URI is refused", async () => {
+  await withServer(async ({ client }) => {
+    await assert.rejects(
+      () => client.subscribeResource({ uri: "https://example.com/not-a-cairn-resource" }),
+      "subscribeResource must refuse a URI outside the cairn:// scheme",
+    );
+  });
+});
+
+// Without a cap, a compromised client can grow the per-session subscribed-
+// URI set without bound, and every bus dispatch then scans it.
+test("subscribing past the cap is refused", async () => {
+  await withServer(async ({ client }) => {
+    const CAP = 1000;
+    for (let i = 0; i < CAP; i++) {
+      await client.subscribeResource({ uri: `cairn://memory/cap-probe-${i}` });
+    }
+    await assert.rejects(
+      () => client.subscribeResource({ uri: `cairn://memory/cap-probe-${CAP}` }),
+      "subscribeResource must refuse once the per-session cap is reached",
+    );
+  });
+});
+
 test("works end to end with no embedding provider configured (FTS-only mode)", async () => {
   await withServer(async ({ client }) => {
     const remembered = await callJson<RememberResult>(client, "remember", { content: "FTS-only fact about apples." });
@@ -895,6 +989,67 @@ for (const [label, makePath] of Object.entries({
   });
 }
 
+// resolveWithinCairnHome's containment check is purely lexical (`resolve()`
+// never follows a symlink), so a directory UNDER the home that is actually
+// a symlink to somewhere outside it passes that check untouched -- `wx` on
+// the final write only defeats a symlink at the target FILE itself, not a
+// symlinked PARENT directory.
+test("export_memories refuses a path through a directory symlinked out of CAIRN_HOME", async () => {
+  const home = makeTempDir();
+  const outside = makeTempDir();
+  const originalHome = process.env.CAIRN_HOME;
+  process.env.CAIRN_HOME = home;
+  try {
+    symlinkSync(outside, join(home, "outdir"));
+    await withServer(async ({ client }) => {
+      const { isError, text } = await callTool(client, "export_memories", { path: "outdir/escaped.zip" });
+      assert.equal(isError, true, "a path through a directory symlinked out of the Cairn home must be refused");
+      assert.ok(!text.includes(outside), "the refusal must not echo the requested path");
+      const outsideFile = join(outside, "escaped.zip");
+      assert.ok(!statSyncExists(outsideFile), "no file must be written outside the Cairn home");
+    });
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.CAIRN_HOME;
+    } else {
+      process.env.CAIRN_HOME = originalHome;
+    }
+    rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    rmSync(outside, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+});
+
+// refuseCairnOwnedPath must compare NORMALISED names, not raw string
+// identity: a trailing space or dot, or a `:` introducing an NTFS alternate
+// data stream, must not let a request past the guard just because the
+// resulting string differs from "cairn.db" byte-for-byte. Asserted directly
+// (isError, and that nothing gets written at that literal path) rather than
+// relying on Windows' filename-normalising filesystem behaviour, so this is
+// meaningful on Linux CI too.
+for (const suffix of [" ", ".", ":evil-stream"]) {
+  test(`export_memories refuses "cairn.db${suffix}" as a normalised alias of the live database`, async () => {
+    const home = makeTempDir();
+    const originalHome = process.env.CAIRN_HOME;
+    process.env.CAIRN_HOME = home;
+    try {
+      await withServer(async ({ client }) => {
+        const target = join(home, `cairn.db${suffix}`);
+        const { isError, text } = await callTool(client, "export_memories", { path: target });
+        assert.equal(isError, true, `export_memories(path: "cairn.db${suffix}") must be refused`);
+        assert.ok(!text.includes(home), "the refusal must not echo the path");
+        assert.ok(!statSyncExists(target), "no file must be written at the normalised-alias path");
+      });
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.CAIRN_HOME;
+      } else {
+        process.env.CAIRN_HOME = originalHome;
+      }
+      rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+}
+
 test("import_memories on a nonexistent path returns a clear error, not an unhandled throw", async () => {
   await withServer(async ({ client }) => {
     const { isError, text } = await callTool(client, "import_memories", { path: "/no/such/archive-for-this-test.zip" });
@@ -932,6 +1087,119 @@ test("import_memories returns the identical error for a nonexistent path, a dire
     } finally {
       rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     }
+  });
+});
+
+// A real, valid ZIP that just isn't a Cairn archive (no manifest.json) --
+// e.g. a .jar/.docx/.xlsx/.apk/.epub happen to be exactly this shape --
+// must be indistinguishable from a nonexistent path, or import_memories
+// becomes an existence-and-readability oracle over every zip-container file
+// on the machine.
+test("import_memories returns the identical error for a nonexistent path and a real, non-Cairn zip", async () => {
+  await withServer(async ({ client }) => {
+    const dir = makeTempDir();
+    try {
+      const notCairnZipPath = join(dir, "not-cairn.zip");
+      writeFileSync(notCairnZipPath, writeZip([{ name: "hello.txt", data: Buffer.from("just a real zip, no manifest.json") }]));
+
+      const nonexistent = await callTool(client, "import_memories", { path: "/no/such/archive-for-this-test.zip" });
+      const notCairnZip = await callTool(client, "import_memories", { path: notCairnZipPath });
+
+      assert.equal(nonexistent.isError, true);
+      assert.equal(notCairnZip.isError, true);
+      assert.equal(nonexistent.text, notCairnZip.text, "a real non-Cairn zip must produce the identical error as a nonexistent path");
+      assert.ok(!notCairnZip.text.includes(notCairnZipPath), "the error must not echo the requested path");
+    } finally {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+});
+
+// Once a file is proven to be a genuine Cairn archive (manifest.json parses,
+// formatVersion is accepted), a deeper failure like a checksum mismatch
+// keeps its own distinct, useful message -- the caller already knows what
+// the file is, so this no longer serves as a filesystem oracle.
+test("import_memories on a genuine Cairn archive with a corrupted checksum keeps its own distinct message", async () => {
+  await withServer(async ({ client: sourceClient, store: sourceStore }) => {
+    await callJson(sourceClient, "remember", { content: "Memory for the checksum-corruption probe." });
+    const { archive } = exportArchive(sourceStore);
+
+    const entries = readZip(archive);
+    const target = entries.find((e) => e.name === "memories.jsonl");
+    assert.ok(target, "export must contain memories.jsonl");
+    const tampered = Buffer.from(target.data);
+    tampered[0] = (tampered[0]! + 1) % 256;
+    const corrupted = writeZip(entries.map((e) => (e.name === "memories.jsonl" ? { name: e.name, data: tampered } : e)));
+
+    await withServer(async ({ client: destClient }) => {
+      const dir = makeTempDir();
+      try {
+        const corruptedPath = join(dir, "corrupted.zip");
+        writeFileSync(corruptedPath, corrupted);
+
+        const nonexistent = await callTool(destClient, "import_memories", { path: "/no/such/archive-for-this-test.zip" });
+        const result = await callTool(destClient, "import_memories", { path: corruptedPath });
+
+        assert.equal(result.isError, true, "a corrupted checksum must be refused");
+        assert.notEqual(result.text, nonexistent.text, "a genuine Cairn archive's checksum failure must NOT collapse to the generic no-archive message");
+        assert.ok(result.text.includes("checksum"), `expected a distinct checksum-mismatch message, got: ${result.text}`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      }
+    });
+  });
+});
+
+// Regression for a hostile-input finding (BUILD_BRIEF §10/§12): a memory id
+// hand-edited in an archive to be hundreds of thousands of characters must
+// never surface into the MCP client's context unbounded, whether via the
+// storage layer's own bounded message (src/storage/repositories/memories.ts)
+// or, if that ever regressed, the outer clamp in this tool's catch-all
+// (src/mcp/tools.ts) -- this test proves the OUTER net alone would still
+// hold, since the underlying error here is a plain Error, not an
+// ArchiveFormatError.
+test("import_memories: a 500,000-character memory id in the archive produces a small, bounded error", async () => {
+  await withServer(async ({ client: sourceClient, store: sourceStore }) => {
+    await callJson(sourceClient, "remember", { content: "Memory for the huge-id probe." });
+    const { archive } = exportArchive(sourceStore);
+
+    const entries = readZip(archive);
+    const memoriesEntry = entries.find((e) => e.name === "memories.jsonl");
+    assert.ok(memoriesEntry, "export must contain memories.jsonl");
+    const manifestEntry = entries.find((e) => e.name === "manifest.json");
+    assert.ok(manifestEntry, "export must contain manifest.json");
+
+    const record = JSON.parse(memoriesEntry.data.toString("utf8").trim());
+    record.id = "Q".repeat(500_000);
+    const tamperedMemoriesBuf = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+
+    const manifest = JSON.parse(manifestEntry.data.toString("utf8"));
+    manifest.entries["memories.jsonl"] = {
+      sha256: createHash("sha256").update(tamperedMemoriesBuf).digest("hex"),
+      bytes: tamperedMemoriesBuf.length,
+    };
+    const tamperedManifestBuf = Buffer.from(JSON.stringify(manifest, null, 2), "utf8");
+
+    const tampered = writeZip(
+      entries.map((e) => {
+        if (e.name === "memories.jsonl") return { name: e.name, data: tamperedMemoriesBuf };
+        if (e.name === "manifest.json") return { name: e.name, data: tamperedManifestBuf };
+        return e;
+      }),
+    );
+
+    await withServer(async ({ client: destClient }) => {
+      const dir = makeTempDir();
+      try {
+        const path = join(dir, "huge-id.zip");
+        writeFileSync(path, tampered);
+        const { isError, text } = await callTool(destClient, "import_memories", { path });
+        assert.equal(isError, true, "an implausible/huge memory id must be refused");
+        assert.ok(text.length < 300, `expected a small, bounded error, got length ${text.length}`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      }
+    });
   });
 });
 

@@ -13,7 +13,7 @@
 import { createHash } from "node:crypto";
 import { DEFAULT_SCOPE } from "../storage/index.js";
 import type { Store, CallContext } from "../storage/index.js";
-import { readZip, writeZip } from "./zip.js";
+import { readZip, safeName, writeZip } from "./zip.js";
 import type { ZipEntry } from "./zip.js";
 
 export interface ExportOptions {
@@ -197,7 +197,10 @@ export function exportArchive(store: Store, options: ExportOptions = {}): Export
   {
     let cursor: string | null = null;
     for (;;) {
-      const page = store.episodes({ scope: options.scope, cursor, limit: EXPORT_PAGE_SIZE }, CTX);
+      const page = store.episodes(
+        { scope: options.scope, includeDeleted, cursor, limit: EXPORT_PAGE_SIZE },
+        CTX,
+      );
       for (const e of page.items) {
         const record: EpisodeRecord = {
           id: e.id,
@@ -441,18 +444,18 @@ export function importArchive(store: Store, archive: Buffer): ImportResult {
     if (entry.name === "manifest.json") continue;
     const expected = manifestEntries[entry.name];
     if (!expected || typeof expected.sha256 !== "string") {
-      throw new ArchiveFormatError(`manifest.json has no checksum recorded for ${JSON.stringify(entry.name)}`);
+      throw new ArchiveFormatError(`manifest.json has no checksum recorded for ${safeName(entry.name)}`);
     }
     if (sha256(entry.data) !== expected.sha256) {
       throw new ArchiveFormatError(
-        `checksum mismatch for ${JSON.stringify(entry.name)}: the archive has been corrupted or tampered with`,
+        `checksum mismatch for ${safeName(entry.name)}: the archive has been corrupted or tampered with`,
       );
     }
   }
   for (const name of Object.keys(manifestEntries)) {
     if (name === "manifest.json") continue;
     if (!findEntry(entries, name)) {
-      throw new ArchiveFormatError(`manifest.json names ${JSON.stringify(name)} but the archive does not contain it`);
+      throw new ArchiveFormatError(`manifest.json names ${safeName(name)} but the archive does not contain it`);
     }
   }
 

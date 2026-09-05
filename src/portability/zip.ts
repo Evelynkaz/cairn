@@ -111,25 +111,56 @@ const EXTERNAL_ATTRS_REGULAR_FILE = UNIX_FILE_MODE << 16;
 // comfortably reachable by a 16-bit value, so a hostile/corrupt archive
 // declaring an absurd entry count is actually refused.
 const MAX_ENTRIES = 4096;
-const MAX_TOTAL_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
+// Lowered from 2 GiB: a legitimate Cairn export never approaches this --
+// archive.ts's own MAX_ENTRY_BYTES caps each of memories.jsonl/
+// episodes.jsonl at 64 MiB, and the archive only ever has a handful of
+// top-level entries, so the largest real export is on the order of a few
+// hundred MiB at most. 256 MiB leaves an order of magnitude of headroom
+// above that while keeping a decompression bomb's worst case (many
+// ~1000:1 deflate entries) to a bounded, sub-second amount of work.
+const MAX_TOTAL_UNCOMPRESSED_BYTES = 256 * 1024 * 1024; // 256 MiB
+// Caps a SINGLE entry's declared uncompressed size, checked independently
+// of the running total and right before that entry is inflated: without
+// this, one entry alone could still claim the entire MAX_TOTAL_UNCOMPRESSED_BYTES
+// budget and force one large synchronous inflateRawSync call. Deliberately
+// set ABOVE archive.ts's own MAX_ENTRY_BYTES (64 MiB, checked on the
+// decoded bytes of a specific named entry) rather than equal to it: this
+// cap is generic to any zip entry this reader ever sees, not just
+// memories.jsonl/episodes.jsonl, so it must not preempt archive.ts's own,
+// more specific and more informative refusal for those two files. 128 MiB
+// still leaves no legitimate entry anywhere near it while catching a
+// single-entry bomb well before it can consume the whole per-archive
+// budget above.
+const MAX_ENTRY_UNCOMPRESSED_BYTES = 128 * 1024 * 1024; // 128 MiB
 
 function validateEntryName(name: string): void {
   if (name.length === 0) {
     throw new ZipFormatError("zip entry has an empty name");
   }
   if (name.includes("\0")) {
-    throw new ZipFormatError(`zip entry name contains a NUL byte: ${JSON.stringify(name)}`);
+    throw new ZipFormatError(`zip entry name contains a NUL byte: ${safeName(name)}`);
   }
   if (name.includes("\\")) {
-    throw new ZipFormatError(`zip entry name contains a backslash: ${JSON.stringify(name)}`);
+    throw new ZipFormatError(`zip entry name contains a backslash: ${safeName(name)}`);
   }
   if (name.startsWith("/") || /^[a-zA-Z]:/.test(name)) {
-    throw new ZipFormatError(`zip entry name is absolute: ${JSON.stringify(name)}`);
+    throw new ZipFormatError(`zip entry name is absolute: ${safeName(name)}`);
   }
   const segments = name.split("/");
   if (segments.includes("..")) {
-    throw new ZipFormatError(`zip entry name escapes the archive root: ${JSON.stringify(name)}`);
+    throw new ZipFormatError(`zip entry name escapes the archive root: ${safeName(name)}`);
   }
+}
+
+// Bounds how much of an attacker-controlled name (a zip entry name, or,
+// via archive.ts, a manifest key) can ever land in an error message: this
+// error can surface all the way into an MCP client's context (§12), so an
+// entry name of hundreds of thousands of characters must never be echoed
+// in full. 80 chars is far more than any real file name in this format
+// (manifest.json, memories.jsonl, episodes.jsonl, README.txt) while still
+// being enough to identify the offending entry to a human.
+export function safeName(name: unknown): string {
+  return JSON.stringify(String(name).slice(0, 80));
 }
 
 function dosDateTime(): { time: number; date: number } {
@@ -323,8 +354,19 @@ export function readZip(archive: Buffer): ZipEntry[] {
   const entries: ZipEntry[] = [];
   let pos = centralDirStart;
   let totalUncompressed = 0;
+  const centralDirEnd = centralDirStart + centralDirSize;
 
   for (let i = 0; i < totalEntries; i++) {
+    // `pos` walks forward by however many bytes each entry's own header
+    // fields say it consumed -- without this bound, a crafted central
+    // directory entry can claim a small size while `totalEntries` keeps the
+    // loop going, parsing entries out of data past the declared central
+    // directory (into the EOCD record or beyond).
+    if (pos + 46 > centralDirEnd) {
+      throw new ZipFormatError(
+        "malformed zip archive: central directory entry overruns the declared central directory size",
+      );
+    }
     const sig = readUInt32(archive, pos, "central directory header signature");
     if (sig !== CENTRAL_DIR_HEADER_SIG) {
       throw new ZipFormatError(`malformed zip archive: bad central directory signature at entry ${i}`);
@@ -355,17 +397,30 @@ export function readZip(archive: Buffer): ZipEntry[] {
     // assume they match.
     const localSig = readUInt32(archive, localHeaderOffset, "local file header signature");
     if (localSig !== LOCAL_FILE_HEADER_SIG) {
-      throw new ZipFormatError(`malformed zip archive: bad local file header signature for ${JSON.stringify(name)}`);
+      throw new ZipFormatError(`malformed zip archive: bad local file header signature for ${safeName(name)}`);
     }
     const localNameLength = readUInt16(archive, localHeaderOffset + 26, "local file name length");
     const localExtraLength = readUInt16(archive, localHeaderOffset + 28, "local extra field length");
+    const localNameBytes = readSlice(archive, localHeaderOffset + 30, localNameLength, `local file name for ${safeName(name)}`);
+    // The local header's name is what an ordinary unzip tool shows/extracts
+    // as this entry; the central directory's name is what Cairn imports.
+    // Without this check the two can disagree (archive smuggling), so a
+    // mismatch is refused rather than silently trusting the central copy.
+    if (!localNameBytes.equals(nameBytes)) {
+      throw new ZipFormatError(`local file name does not match central directory entry for ${safeName(name)}`);
+    }
     const dataStart = localHeaderOffset + 30 + localNameLength + localExtraLength;
-    const compressedData = readSlice(archive, dataStart, compressedSize, `entry data for ${JSON.stringify(name)}`);
+    const compressedData = readSlice(archive, dataStart, compressedSize, `entry data for ${safeName(name)}`);
 
     let data: Buffer;
     if (method === METHOD_STORED) {
       data = Buffer.from(compressedData);
     } else if (method === METHOD_DEFLATE) {
+      if (uncompressedSize > MAX_ENTRY_UNCOMPRESSED_BYTES) {
+        throw new ZipFormatError(
+          `entry ${safeName(name)} declares ${uncompressedSize} uncompressed bytes, exceeding the per-entry cap of ${MAX_ENTRY_UNCOMPRESSED_BYTES}`,
+        );
+      }
       try {
         // maxOutputLength caps inflation at the entry's OWN declared
         // uncompressed size, not just the archive-wide total checked above:
@@ -379,23 +434,23 @@ export function readZip(archive: Buffer): ZipEntry[] {
         data = inflateRawSync(compressedData, { maxOutputLength: uncompressedSize });
       } catch (err) {
         throw new ZipFormatError(
-          `failed to inflate entry ${JSON.stringify(name)}: ${err instanceof Error ? err.message : String(err)}`,
+          `failed to inflate entry ${safeName(name)}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     } else {
-      throw new ZipFormatError(`unsupported compression method ${method} for entry ${JSON.stringify(name)}`);
+      throw new ZipFormatError(`unsupported compression method ${method} for entry ${safeName(name)}`);
     }
 
     if (data.length !== uncompressedSize) {
       throw new ZipFormatError(
-        `entry ${JSON.stringify(name)} declared uncompressed size ${uncompressedSize} but produced ${data.length}`,
+        `entry ${safeName(name)} declared uncompressed size ${uncompressedSize} but produced ${data.length}`,
       );
     }
 
     const actualCrc = crc32(data);
     if (actualCrc !== crc) {
       throw new ZipFormatError(
-        `crc-32 mismatch for entry ${JSON.stringify(name)}: expected ${crc.toString(16)}, got ${actualCrc.toString(16)}`,
+        `crc-32 mismatch for entry ${safeName(name)}: expected ${crc.toString(16)}, got ${actualCrc.toString(16)}`,
       );
     }
 

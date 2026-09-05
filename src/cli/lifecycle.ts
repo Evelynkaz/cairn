@@ -68,7 +68,15 @@ export async function daemonStatus(home?: string): Promise<DaemonStatus> {
   const url = `http://127.0.0.1:${info.port}`;
   const base: DaemonStatus = { running: true, pid: info.pid, port: info.port, url };
   try {
-    const res = await fetch(`${url}/health`);
+    // /health only includes the memory count when it sees a valid bearer
+    // token (src/daemon/server.ts) -- an unauthenticated hit must not be
+    // able to drive a full table scan or learn how much is stored. Send the
+    // token this CLI process itself just read off the runtime file: it is
+    // the same trust boundary as reading daemon.json in the first place, not
+    // a new one. A missing or rejected (stale) token just means `memories`
+    // stays undefined below, not an error.
+    const headers: Record<string, string> = info.token ? { Authorization: `Bearer ${info.token}` } : {};
+    const res = await fetch(`${url}/health`, { headers });
     if (!res.ok) {
       return base;
     }

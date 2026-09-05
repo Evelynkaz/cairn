@@ -199,6 +199,49 @@ test("rejects an entry whose deflate stream actually expands far beyond its decl
   assert.throws(() => readZip(archive), ZipFormatError);
 });
 
+test("rejects an archive whose local file name disagrees with the central directory's copy", () => {
+  const archive = writeZip([{ name: "readme.txt", data: Buffer.from("hello") }]);
+  const tampered = Buffer.from(archive);
+  // Local header: signature(4) version(2) flags(2) method(2) time(2) date(2)
+  // crc(4) compSize(4) uncompSize(4) nameLen(2) extraLen(2) = 30 bytes,
+  // then the name -- same length as "readme.txt" so no offsets shift.
+  const nameOffset = 30;
+  tampered.write("README.txt", nameOffset, "utf8");
+  assert.throws(() => readZip(tampered), ZipFormatError);
+});
+
+test("rejects a central directory entry that overruns the declared central directory size", () => {
+  const archive = writeZip([
+    { name: "a.txt", data: Buffer.from("hello") },
+    { name: "b.txt", data: Buffer.from("world") },
+  ]);
+  const tampered = Buffer.from(archive);
+  const eocdOffset = tampered.length - 22;
+  // Claim only 1 entry's worth of central directory bytes while totalEntries
+  // (still 2, read separately) tells the reader to keep parsing past it.
+  const centralDirSize = tampered.readUInt32LE(eocdOffset + 12);
+  tampered.writeUInt32LE(Math.floor(centralDirSize / 2), eocdOffset + 12);
+  assert.throws(() => readZip(tampered), ZipFormatError);
+});
+
+test("total uncompressed bytes: a declared total over the new 256 MiB cap is refused, one just under it is accepted", () => {
+  const MAX_ENTRY = 64 * 1024 * 1024; // zip.ts's MAX_ENTRY_UNCOMPRESSED_BYTES
+  const under = [
+    { name: "a.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) },
+    { name: "b.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) },
+    { name: "c.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) },
+    { name: "d.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) },
+  ]; // 240 MiB total, under the 256 MiB cap, each entry under MAX_ENTRY
+  assert.ok(under.every((e) => e.data.length < MAX_ENTRY));
+  const okArchive = writeZip(under);
+  const read = readZip(okArchive);
+  assert.equal(read.length, under.length);
+
+  const over = [...under, { name: "e.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) }]; // 300 MiB total
+  const badArchive = writeZip(over);
+  assert.throws(() => readZip(badArchive), /more than \d+ total uncompressed bytes/);
+});
+
 // --- Verification against system tools ------------------------------------
 
 test("writeZip output passes `unzip -t` and extracts byte-identical content", (t) => {

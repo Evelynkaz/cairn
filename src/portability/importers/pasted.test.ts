@@ -51,6 +51,24 @@ test("entry length is capped", () => {
   assert.equal(result[0]?.text.length, MAX_ENTRY_LENGTH);
 });
 
+test("4 MiB of newlines is handled without materialising a multi-million-element lines array", () => {
+  // Asserted on heap growth rather than wall-clock time: input.split(...)
+  // and an incremental scan are both O(n) in TIME on this input (measured
+  // ~1.3s vs ~0.7s locally, too close for a stable CI threshold), but they
+  // differ sharply in MEMORY -- split(...) must materialize a 4-million-
+  // element array of (mostly empty) strings before the entry cap ever
+  // applies. Measured locally: ~39MB heap growth for split(...) vs ~4MB for
+  // the incremental scan on the same input.
+  const input = "\n".repeat(4 * 1024 * 1024);
+  if (global.gc) global.gc();
+  const before = process.memoryUsage().heapUsed;
+  const result = parsePastedMemories(input);
+  const after = process.memoryUsage().heapUsed;
+  const deltaMb = (after - before) / (1024 * 1024);
+  assert.equal(result.length, 0);
+  assert.ok(deltaMb < 20, `expected well under 20MB of heap growth, saw ${deltaMb.toFixed(1)}MB`);
+});
+
 test("a realistic multi-line paste", () => {
   const paste = [
     "Here is my saved memory:",

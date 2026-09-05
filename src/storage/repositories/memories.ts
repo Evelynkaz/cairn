@@ -10,6 +10,16 @@ import { contentHash } from "../../util/text.js";
 import { bool, num, numOrNull, str, strOrNull } from "./row.js";
 import { clampLimit, decodeCursor, encodeCursor } from "./paging.js";
 
+// Bounds how much of an attacker-controlled value (an archive's memory id,
+// text, or any other field) can ever land in an error message: these errors
+// can surface all the way into an MCP client's context (BUILD_BRIEF §12).
+// Mirrors src/portability/zip.ts's safeName() -- same approach, kept local
+// here rather than importing from portability into storage (wrong layering
+// direction: portability depends on storage, not the reverse).
+function safeValue(value: unknown): string {
+  return JSON.stringify(String(value).slice(0, 80));
+}
+
 // Thrown by updateMemory/supersedeMemory when the requested text would
 // collide with another live memory's content_hash in the same scope. A
 // typed error (not a message string) so a caller like the dashboard API can
@@ -195,6 +205,16 @@ const EARLIEST_SANE_TIMESTAMP = Date.UTC(2020, 0, 1);
 // bogus future timestamp.
 const FUTURE_SKEW_MS = 5 * 60 * 1000;
 
+// Note: memories_live (used by createMemory/updateMemory/supersedeMemory
+// dedupe and collision checks) ignores valid_from entirely, while
+// memoriesAsOf honours it. So an imported memory whose validFrom is set far
+// in the future is listed and recallable right now via memories_live-backed
+// paths, but absent from memoriesAsOf(now) until that validFrom arrives.
+// That asymmetry is intentional here -- import trusts the archive's
+// validFrom for the temporal record without gating "is this live for normal
+// recall" on it -- not something to "fix" by teaching memories_live about
+// valid_from.
+//
 // Import-only insertion: a memory that already has an id (minted by the
 // EXPORTING store's uuidv7()) rather than one minted fresh here. This is
 // deliberately NOT "call createMemory but pass an id through" -- createMemory
@@ -234,7 +254,7 @@ export function importMemory(
   const createdAt = timestampFromUuidv7(input.id);
   const now = Date.now();
   if (createdAt < EARLIEST_SANE_TIMESTAMP || createdAt > now + FUTURE_SKEW_MS) {
-    throw new Error(`memory ${input.id}: id does not embed a plausible timestamp (${createdAt})`);
+    throw new Error(`memory ${safeValue(input.id)}: id does not embed a plausible timestamp (${createdAt})`);
   }
 
   const scope = input.scope ?? DEFAULT_SCOPE;
@@ -290,7 +310,13 @@ export function importMemory(
     // after its predecessor, or a scope filter may have dropped the
     // successor from this archive entirely -- in that case this is
     // best-effort and left null rather than failing the whole import.
-    if (input.supersededBy) {
+    // Reject a self-referential supersededBy before it can be wired up: the
+    // row is inserted above without one, so a naive existence check run
+    // afterwards would find the just-inserted row itself and accept it,
+    // leaving a memory permanently un-supersedable (supersedeMemory refuses
+    // any row that already has a superseded_by) while still live and
+    // editable -- exactly the shape a hand-edited archive could plant.
+    if (input.supersededBy && input.supersededBy !== input.id) {
       const target = db.q(`SELECT id FROM memories WHERE id = ?`).get(input.supersededBy);
       if (target) {
         db.q(`UPDATE memories SET superseded_by = ? WHERE id = ?`).run(input.supersededBy, input.id);
@@ -299,7 +325,7 @@ export function importMemory(
 
     const memory = getMemory(db, input.id);
     if (!memory) {
-      throw new Error(`memory ${input.id} not found immediately after import insert`);
+      throw new Error(`memory ${safeValue(input.id)} not found immediately after import insert`);
     }
     return { memory, skipped: false };
   });
@@ -400,13 +426,13 @@ export function updateMemory(
   return db.tx(() => {
     const current = getMemory(db, id);
     if (!current) {
-      throw new Error(`memory not found: ${id}`);
+      throw new Error(`memory not found: ${safeValue(id)}`);
     }
     // §5 audit trail: a superseded row is history. Editing its text would
     // make memoriesAsOf(past) return content that was never actually live
     // at that time, silently falsifying the record.
     if (current.validUntil !== null) {
-      throw new Error(`memory ${id} is superseded and cannot be edited`);
+      throw new Error(`memory ${safeValue(id)} is superseded and cannot be edited`);
     }
 
     const sets: string[] = ["updated_at = ?"];
@@ -421,7 +447,7 @@ export function updateMemory(
         if (conflict) {
           const conflictId = str(conflict, "id");
           throw new LiveTextCollisionError(
-            `text collides with live memory ${conflictId} in scope "${current.scope}"`,
+            `text collides with live memory ${conflictId} in scope ${safeValue(current.scope)}`,
             conflictId,
           );
         }
@@ -443,7 +469,7 @@ export function updateMemory(
 
     const updated = getMemory(db, id);
     if (!updated) {
-      throw new Error(`memory ${id} vanished after update`);
+      throw new Error(`memory ${safeValue(id)} vanished after update`);
     }
     return updated;
   });
@@ -472,7 +498,7 @@ export function restoreMemory(db: CairnDb, id: string): boolean {
     if (conflict) {
       const conflictId = str(conflict, "id");
       throw new LiveTextCollisionError(
-        `cannot restore memory ${id}: its text is already live as memory ${conflictId}`,
+        `cannot restore memory ${safeValue(id)}: its text is already live as memory ${conflictId}`,
         conflictId,
       );
     }
@@ -500,10 +526,10 @@ export function supersedeMemory(
   return db.tx(() => {
     const old = getMemory(db, oldId);
     if (!old) {
-      throw new Error(`memory not found: ${oldId}`);
+      throw new Error(`memory not found: ${safeValue(oldId)}`);
     }
     if (old.validUntil !== null || old.supersededBy !== null) {
-      throw new Error(`memory ${oldId} is already superseded`);
+      throw new Error(`memory ${safeValue(oldId)} is already superseded`);
     }
 
     const scope = input.scope ?? old.scope;
@@ -520,7 +546,7 @@ export function supersedeMemory(
     if (conflict) {
       const conflictId = str(conflict, "id");
       throw new LiveTextCollisionError(
-        `text collides with live memory ${conflictId} in scope "${scope}"`,
+        `text collides with live memory ${conflictId} in scope ${safeValue(scope)}`,
         conflictId,
       );
     }
@@ -546,6 +572,16 @@ export function supersedeMemory(
     // above.
     db.q(`UPDATE memories SET valid_until = ? WHERE id = ?`).run(validUntil, oldId);
 
+    // The replacement's valid_from is the clamped validUntil above, NOT
+    // createdAt: on a same-millisecond supersede those two values diverge
+    // (validUntil was pushed to old.validFrom + 1), and inserting at
+    // createdAt would put the replacement's valid_from BELOW the old row's
+    // now-clamped valid_until, overlapping the two intervals for that one
+    // millisecond -- both facts would read as simultaneously live under the
+    // [valid_from, valid_until) convention. Using validUntil here keeps the
+    // two intervals exactly adjacent and disjoint. created_at is still
+    // derived from the id and is deliberately left as-is; only valid_from
+    // moves.
     db.q(
       `INSERT INTO memories
          (id, text, scope, source_client, importance, created_at, updated_at,
@@ -559,7 +595,7 @@ export function supersedeMemory(
       importance,
       createdAt,
       createdAt,
-      createdAt,
+      validUntil,
       input.episodeId ?? null,
       input.redacted ? 1 : 0,
       hash,
@@ -573,7 +609,7 @@ export function supersedeMemory(
     const superseded = getMemory(db, oldId);
     const replacement = getMemory(db, id);
     if (!superseded || !replacement) {
-      throw new Error(`supersede of ${oldId} failed to reload rows`);
+      throw new Error(`supersede of ${safeValue(oldId)} failed to reload rows`);
     }
     return { superseded, replacement };
   });
@@ -595,6 +631,12 @@ export function memoriesAsOf(
   at: number,
   options: { scope?: string; limit?: number } = {},
 ): Memory[] {
+  // Note the asymmetry: `deleted_at IS NULL` is evaluated ABSOLUTELY (deleted
+  // now, not deleted as of `at`), so a memory deleted after `at` is invisible
+  // even when asking about the past -- the right privacy answer, since a
+  // deletion request should not be revivable by asking for an earlier
+  // snapshot. `valid_until` above, by contrast, IS evaluated relative to
+  // `at`. Don't "fix" this by making deleted_at relative to `at` too.
   const limit = clampLimit(options.limit);
   const conditions = ["valid_from <= ?", "(valid_until IS NULL OR valid_until > ?)", "deleted_at IS NULL"];
   const params: SqlValue[] = [at, at];

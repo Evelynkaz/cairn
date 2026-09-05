@@ -84,7 +84,13 @@ const UUID_V7_RE = /^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 export function timestampFromUuidv7(id: string): number {
   const match = UUID_V7_RE.exec(id);
   if (!match) {
-    throw new Error(`not a canonical UUIDv7: ${id}`);
+    // Deliberately does not echo `id`: it is attacker-controlled input (an
+    // archive's memory/episode id, hostile-input-tested end to end), and
+    // this error can surface all the way into an MCP client's context.
+    // Callers that need the offending value in a message must add their
+    // own safely-bounded context around this call rather than rely on it
+    // being here.
+    throw new Error("not a canonical UUIDv7");
   }
   const hex = match[1]! + match[2]!;
   return Number(BigInt(`0x${hex}`));

@@ -153,6 +153,37 @@ function toSafeDegradedReason(degraded: boolean): SafeDegradedReason {
   return degraded ? "embedding_failed" : null;
 }
 
+// A pasted import's `tags` array is re-applied to EVERY entry parsed out of
+// `text` (handleImportPasted below), so nothing here bounding array length
+// or per-tag length means N entries x unbounded tags becomes unbounded rows
+// -- measured at 500 entries x 2000 tags = 1,000,000 tag rows from a single
+// ~25 KB request, blocking the single-threaded daemon for minutes. Also
+// shared by every other write path in this file that accepts a caller-
+// supplied `tags` array (PATCH, supersede) for the same reason. A cap is
+// refused with a fixed 400 rather than silently truncated, so a paste that
+// looks like it worked never silently drops the user's own tags.
+const MAX_TAGS = 32;
+const MAX_TAG_LENGTH = 64;
+const MAX_SCOPE_LENGTH = 128;
+
+function clampTags(tags: unknown[]): string[] {
+  if (tags.length > MAX_TAGS) {
+    throw new HttpError(400, `tags exceeds the cap of ${MAX_TAGS}`);
+  }
+  const mapped = tags.map(String);
+  if (mapped.some((t) => t.length > MAX_TAG_LENGTH)) {
+    throw new HttpError(400, `each tag must be at most ${MAX_TAG_LENGTH} characters`);
+  }
+  return mapped;
+}
+
+function clampScope(scope: string): string {
+  if (scope.length > MAX_SCOPE_LENGTH) {
+    throw new HttpError(400, `scope exceeds the cap of ${MAX_SCOPE_LENGTH} characters`);
+  }
+  return scope;
+}
+
 function asRecord(body: unknown): Record<string, unknown> {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new HttpError(400, "expected a JSON object body");
@@ -261,7 +292,7 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     const body = asRecord(await readBody(req));
     const patch: { text?: string; tags?: string[]; importance?: number } = {};
     if (typeof body["text"] === "string") patch.text = body["text"];
-    if (Array.isArray(body["tags"])) patch.tags = body["tags"].map(String);
+    if (Array.isArray(body["tags"])) patch.tags = clampTags(body["tags"]);
     if (body["importance"] !== undefined) patch.importance = validateImportance(body["importance"]);
     const current = store.get(id, { includeDeleted: true, includeSuperseded: true }, CTX);
     if (!current) {
@@ -315,7 +346,7 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     if (typeof text !== "string") {
       throw new HttpError(400, "text is required");
     }
-    const tags = Array.isArray(body["tags"]) ? body["tags"].map(String) : undefined;
+    const tags = Array.isArray(body["tags"]) ? clampTags(body["tags"]) : undefined;
     const importance = validateImportance(body["importance"]);
     if (!store.get(id, { includeDeleted: true, includeSuperseded: true }, CTX)) {
       throw new HttpError(404, "not found");
@@ -525,8 +556,8 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     if (typeof text !== "string") {
       throw new HttpError(400, "text is required");
     }
-    const scope = typeof body["scope"] === "string" ? body["scope"] : undefined;
-    const tags = Array.isArray(body["tags"]) ? body["tags"].map(String) : undefined;
+    const scope = typeof body["scope"] === "string" ? clampScope(body["scope"]) : undefined;
+    const tags = Array.isArray(body["tags"]) ? clampTags(body["tags"]) : undefined;
 
     const parsed = parsePastedMemories(text);
     let imported = 0;
@@ -568,7 +599,7 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
   // file that guards against exactly that.
   async function handleImportChatGpt(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = asRecord(await readBody(req));
-    const scope = typeof body["scope"] === "string" ? body["scope"] : undefined;
+    const scope = typeof body["scope"] === "string" ? clampScope(body["scope"]) : undefined;
 
     let instructions;
     try {
@@ -660,7 +691,10 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     // process alive by itself -- same pattern as server.ts's session sweep
     // and embeddings/worker.ts's own interval.
     const heartbeat = setInterval(() => {
-      res.write(":\n\n");
+      const ok = res.write(":\n\n");
+      if (!ok && res.writableLength > SSE_BACKPRESSURE_CAP_BYTES && stream) {
+        endStream(stream);
+      }
     }, SSE_HEARTBEAT_INTERVAL_MS);
     heartbeat.unref();
 

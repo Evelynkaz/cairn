@@ -31,6 +31,11 @@ export function createMcpServer(deps: McpDeps): McpServer {
   // never broadcast to every connected client regardless of subscription
   // state.
   const subscribedUris = new Set<string>();
+  // A cap plus a scheme check: without this, a compromised client can call
+  // `resources/subscribe` with an unbounded number of arbitrary strings and
+  // grow this Set without limit, and every bus dispatch above then scans it.
+  const MAX_SUBSCRIBED_URIS = 1000;
+  const SUBSCRIBE_URI_SCHEME = "cairn://";
 
   // One daemon owns the store (BUILD_BRIEF §4), but each session gets its
   // own McpServer/transport -- so a mutation on session A must be announced
@@ -83,7 +88,14 @@ export function createMcpServer(deps: McpDeps): McpServer {
   });
 
   server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
-    subscribedUris.add(request.params.uri);
+    const uri = request.params.uri;
+    if (!uri.startsWith(SUBSCRIBE_URI_SCHEME)) {
+      throw new Error("subscribe: unsupported resource URI scheme");
+    }
+    if (!subscribedUris.has(uri) && subscribedUris.size >= MAX_SUBSCRIBED_URIS) {
+      throw new Error("subscribe: too many subscriptions for this session");
+    }
+    subscribedUris.add(uri);
     return {};
   });
 

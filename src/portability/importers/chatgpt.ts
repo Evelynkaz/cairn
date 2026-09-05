@@ -101,20 +101,23 @@ export function extractCustomInstructions(conversationsJson: unknown): ChatGptCu
 function extractFromContextData(data: Record<string, unknown>): ChatGptCustomInstructions {
   const result: ChatGptCustomInstructions = {};
 
+  // The file is attacker-supplied like any other import, confirmed shape or
+  // not, so about_user_message/about_model_message get the same cap as the
+  // fallback fields below -- nothing here is trusted as-is.
   const aboutUser = data["about_user_message"];
   const aboutModel = data["about_model_message"];
-  if (typeof aboutUser === "string") result.aboutUser = aboutUser;
-  if (typeof aboutModel === "string") result.aboutModel = aboutModel;
+  if (typeof aboutUser === "string") result.aboutUser = aboutUser.slice(0, MAX_ENTRY_LENGTH);
+  if (typeof aboutModel === "string") result.aboutModel = aboutModel.slice(0, MAX_ENTRY_LENGTH);
 
   if (result.aboutUser === undefined || result.aboutModel === undefined) {
     for (const [key, value] of Object.entries(data)) {
       if (key === "about_user_message" || key === "about_model_message") continue;
       if (typeof value !== "string") continue;
 
-      // Unlike about_user_message/about_model_message above (confirmed-shape
-      // fields, trusted as-is), this fallback accepts ANY string-valued
-      // field on an unconfirmed schema -- cap it the way pasted.ts caps a
-      // pasted entry, so a large field can't become an enormous memory.
+      // Same cap as about_user_message/about_model_message above -- this
+      // fallback accepts ANY string-valued field on an unconfirmed schema,
+      // so it gets it too, the way pasted.ts caps a pasted entry, so a
+      // large field can't become an enormous memory.
       const capped = value.slice(0, MAX_ENTRY_LENGTH);
       if (result.aboutUser === undefined) {
         result.aboutUser = capped;

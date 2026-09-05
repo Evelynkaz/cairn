@@ -205,6 +205,81 @@ async function withFakeLiveDaemon<T>(
   }
 }
 
+// A fake daemon that mirrors the real /health auth gate (src/daemon/
+// server.ts): it always answers 200 with the bare fields, and only adds
+// `memories` when the request carries the expected bearer token -- used to
+// prove daemonStatus sends the token from the runtime file, and degrades
+// honestly (no fabricated count) when there is none or it is wrong, without
+// depending on withFakeLiveDaemon's unconditional echo above.
+async function withFakeAuthDaemon<T>(
+  dir: string,
+  runtimeToken: string,
+  expectedToken: string,
+  fn: (url: string) => Promise<T>,
+): Promise<T> {
+  const server: HttpServer = createServer((req, res) => {
+    const body: Record<string, unknown> = {
+      ok: true,
+      pid: process.pid,
+      version: "0.1.0",
+      uptimeMs: 0,
+      vectors: false,
+      journalMode: null,
+    };
+    if (req.headers.authorization === `Bearer ${expectedToken}`) {
+      body.memories = 42;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  });
+  const port = await new Promise<number>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      resolve(typeof address === "object" && address !== null ? address.port : 0);
+    });
+  });
+  writeRuntimeFile(
+    { pid: process.pid, port, token: runtimeToken, startedAt: Date.now(), version: "0.1.0" },
+    dir,
+  );
+  try {
+    return await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+test("daemonStatus authenticates its /health call and gets the memory count back", async () => {
+  await withTempDirAsync(async (dir) => {
+    const token = generateToken();
+    await withFakeAuthDaemon(dir, token, token, async () => {
+      const status = await daemonStatus(dir);
+      assert.equal(status.running, true);
+      assert.equal(status.memories, 42);
+    });
+  });
+});
+
+test("daemonStatus stays honest (no fabricated count) when the runtime file's token is stale/rejected", async () => {
+  await withTempDirAsync(async (dir) => {
+    await withFakeAuthDaemon(dir, "a-stale-rotated-token", "the-real-current-token", async () => {
+      const status = await daemonStatus(dir);
+      assert.equal(status.running, true);
+      assert.equal(status.memories, undefined);
+    });
+  });
+});
+
+test("daemonStatus reports the daemon as running with no fabricated count when the runtime file has no token", async () => {
+  await withTempDirAsync(async (dir) => {
+    await withFakeAuthDaemon(dir, "", "some-token-the-daemon-actually-wants", async () => {
+      const status = await daemonStatus(dir);
+      assert.equal(status.running, true);
+      assert.equal(status.memories, undefined);
+    });
+  });
+});
+
 test("uiUrl is null with no daemon and carries the daemon's token in the fragment with one", async () => {
   await withTempDirAsync(async (dir) => {
     assert.equal(await uiUrl(dir), null);

@@ -305,6 +305,97 @@ test("supersede 50 times back-to-back with no delay: every superseded memory sta
   });
 });
 
+// Regression for finding 1's actual defect: not just "the old row stays
+// visible at its own validFrom" (checked above), but that the two
+// intervals never OVERLAP. Without inserting the replacement's valid_from
+// at the clamped valid_until (instead of createdAt), a same-millisecond
+// supersede makes both the old and new memory live at the boundary
+// millisecond -- asOf(old.validFrom) would return both "vN" and "vN+1"
+// instead of exactly one. Reverting the fix (replacement valid_from back to
+// createdAt) reproduces exactly that: this test fails with two ids returned
+// where one is expected.
+test("supersede back-to-back with no delay: at every boundary millisecond, asOf returns exactly one of the two facts, never both, never neither", () => {
+  withDb((db) => {
+    let current = createMemory(db, { text: "v0" }).memory;
+    const steps: { oldId: string; newId: string; validFrom: number; validUntil: number }[] = [];
+    for (let i = 1; i <= 50; i += 1) {
+      const { superseded, replacement } = supersedeMemory(db, current.id, { text: `v${i}` });
+      steps.push({
+        oldId: superseded.id,
+        newId: replacement.id,
+        validFrom: superseded.validFrom,
+        validUntil: superseded.validUntil as number,
+      });
+      current = replacement;
+    }
+
+    for (const step of steps) {
+      const atPredecessorBoundary = memoriesAsOf(db, step.validUntil - 1, { limit: 200 });
+      const predecessorIds = new Set(atPredecessorBoundary.map((m) => m.id));
+      assert.equal(predecessorIds.has(step.oldId), true, `old ${step.oldId} should be live at validUntil - 1`);
+      assert.equal(predecessorIds.has(step.newId), false, `new ${step.newId} must not be live before its own validFrom`);
+
+      const atSuccessorBoundary = memoriesAsOf(db, step.validUntil, { limit: 200 });
+      const successorIds = new Set(atSuccessorBoundary.map((m) => m.id));
+      assert.equal(successorIds.has(step.newId), true, `new ${step.newId} should be live at its own validFrom`);
+      assert.equal(successorIds.has(step.oldId), false, `old ${step.oldId} must no longer be live at validUntil`);
+    }
+  });
+});
+
+// Regression: a multi-step chain must hand off with neither a gap (a
+// millisecond where nothing from the chain is live) nor an overlap (a
+// millisecond where two links are simultaneously live).
+test("a three-step supersede chain hands off with no gap and no overlap at every boundary", () => {
+  withDb((db) => {
+    const v0 = createMemory(db, { text: "chain v0" }).memory;
+    const step1 = supersedeMemory(db, v0.id, { text: "chain v1" });
+    const step2 = supersedeMemory(db, step1.replacement.id, { text: "chain v2" });
+    const step3 = supersedeMemory(db, step2.replacement.id, { text: "chain v3" });
+
+    const chain = [
+      { id: v0.id, validFrom: v0.validFrom, validUntil: step1.superseded.validUntil as number },
+      { id: step1.replacement.id, validFrom: step1.replacement.validFrom, validUntil: step2.superseded.validUntil as number },
+      { id: step2.replacement.id, validFrom: step2.replacement.validFrom, validUntil: step3.superseded.validUntil as number },
+      { id: step3.replacement.id, validFrom: step3.replacement.validFrom, validUntil: null as number | null },
+    ];
+
+    // No gap, no overlap: each link's validFrom must equal the previous
+    // link's validUntil exactly.
+    for (let i = 1; i < chain.length; i += 1) {
+      assert.equal(chain[i]!.validFrom, chain[i - 1]!.validUntil, `link ${i} must start exactly where link ${i - 1} ends`);
+    }
+
+    for (let i = 0; i < chain.length; i += 1) {
+      const link = chain[i]!;
+      // Live at its own validFrom, and nowhere else in the chain is.
+      const atStart = memoriesAsOf(db, link.validFrom, { limit: 200 });
+      const startIds = new Set(atStart.map((m) => m.id));
+      assert.equal(startIds.has(link.id), true, `link ${i} should be live at its own validFrom`);
+      for (let j = 0; j < chain.length; j += 1) {
+        if (j !== i) {
+          assert.equal(startIds.has(chain[j]!.id), false, `link ${j} must not be live at link ${i}'s validFrom`);
+        }
+      }
+      // Live at validUntil - 1 (last millisecond it's live), gone at validUntil.
+      if (link.validUntil !== null) {
+        const atLast = memoriesAsOf(db, link.validUntil - 1, { limit: 200 });
+        assert.equal(
+          new Set(atLast.map((m) => m.id)).has(link.id),
+          true,
+          `link ${i} should still be live at validUntil - 1`,
+        );
+        const atEnd = memoriesAsOf(db, link.validUntil, { limit: 200 });
+        assert.equal(
+          new Set(atEnd.map((m) => m.id)).has(link.id),
+          false,
+          `link ${i} must not be live at its own validUntil`,
+        );
+      }
+    }
+  });
+});
+
 test("supersede: old row gets valid_until and superseded_by, replacement is live, both rows still exist, memoriesAsOf reflects each side of the boundary", () => {
   withDb((db) => {
     const { memory: oldMemory } = createMemory(db, { text: "old fact" });
@@ -760,6 +851,29 @@ test("importMemory: an id a few seconds ahead of now is accepted (clock skew)", 
   });
 });
 
+// Regression for finding 2: the row is inserted before supersededBy is
+// wired up, so a naive existence check run afterwards finds the
+// just-inserted row itself and accepts a self-referential supersededBy.
+// That leaves the memory live and editable forever, because
+// supersedeMemory refuses any row whose superseded_by is already set --
+// permanently un-supersedable. A hand-edited archive could plant exactly
+// this.
+test("importMemory: a self-referential supersededBy is rejected or nulled, and the memory can still be superseded normally afterward", () => {
+  withDb((db) => {
+    const id = uuidv7();
+    const result = importMemory(db, { id, text: "self-referential", supersededBy: id });
+    assert.equal(result.skipped, false);
+    assert.notEqual(result.memory?.supersededBy, id);
+    assert.equal(result.memory?.validUntil, null);
+
+    // If it were left permanently un-supersedable, this would throw
+    // "already superseded".
+    const { superseded, replacement } = supersedeMemory(db, id, { text: "replacement text" });
+    assert.equal(superseded.supersededBy, replacement.id);
+    assert.ok(superseded.validUntil !== null);
+  });
+});
+
 test("importMemory: tags, scope, importance and sourceClient all survive", () => {
   withDb((db) => {
     const id = uuidv7();
@@ -776,5 +890,31 @@ test("importMemory: tags, scope, importance and sourceClient all survive", () =>
     assert.deepEqual(result.memory?.tags, ["x", "y"]);
     assert.equal(result.memory?.importance, 0.9);
     assert.equal(result.memory?.sourceClient, "claude");
+  });
+});
+
+// Regression for a hostile-input finding (BUILD_BRIEF §10/§12): an
+// attacker-controlled id (a tool argument, or an archive's memory id) must
+// never be echoed unbounded into an error message that can surface all the
+// way into an MCP client's context.
+test("updateMemory: a 500,000-character id produces a bounded 'not found' message, not an unbounded echo", () => {
+  withDb((db) => {
+    const hugeId = "Q".repeat(500_000);
+    assert.throws(() => updateMemory(db, hugeId, { text: "x" }), (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.ok(err.message.length < 200, `expected a bounded message, got length ${err.message.length}`);
+      return true;
+    });
+  });
+});
+
+test("importMemory: an id embedding an implausible timestamp produces a bounded message even when the id itself is huge", () => {
+  withDb((db) => {
+    const hugeId = "Q".repeat(500_000);
+    assert.throws(() => importMemory(db, { id: hugeId, text: "x" }), (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.ok(err.message.length < 200, `expected a bounded message, got length ${err.message.length}`);
+      return true;
+    });
   });
 });

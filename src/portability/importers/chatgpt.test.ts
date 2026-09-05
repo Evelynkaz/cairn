@@ -79,6 +79,20 @@ test("the fallback caps a field's length instead of returning it in full", () =>
   assert.equal(result.aboutUser?.length, MAX_ENTRY_LENGTH);
 });
 
+test("about_user_message/about_model_message are capped too, not trusted as-is", () => {
+  const oversized = "Q".repeat(4_000_000);
+  const conversations = [
+    conversationWithCustomInstructions({
+      about_user_message: oversized,
+      about_model_message: oversized,
+    }),
+  ];
+
+  const result = extractCustomInstructions(conversations);
+  assert.equal(result.aboutUser?.length, MAX_ENTRY_LENGTH);
+  assert.equal(result.aboutModel?.length, MAX_ENTRY_LENGTH);
+});
+
 test("a valid export with no custom instructions returns empty, not an error", () => {
   const conversations = [
     {
