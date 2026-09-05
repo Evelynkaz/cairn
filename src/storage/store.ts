@@ -8,7 +8,7 @@ import { openDb } from "./db.js";
 import type { CairnDb, DbCapabilities } from "./db.js";
 import type { DriverFactory } from "./driver/index.js";
 import type { Memory, ClientRecord, Episode } from "./types.js";
-import type { VectorSpaceRef } from "./repositories/vectors.js";
+import { assertTableName, listVectorSpaces, type VectorSpaceRef } from "./repositories/vectors.js";
 import { appendEpisode, getEpisode, listEpisodes } from "./repositories/episodes.js";
 import {
   createMemory,
@@ -31,10 +31,14 @@ import {
   setClientEnabled as setClientEnabledRepo,
 } from "./repositories/audit.js";
 import type { AuditAction } from "./repositories/audit.js";
+import { recordRedactions } from "./repositories/redactions.js";
 import { search, getContext } from "../retrieval/index.js";
 import type { SearchDeps, SearchOptions, SearchResult, ContextOptions, ContextBlock } from "../retrieval/index.js";
 import type { EmbeddingProvider } from "../embeddings/types.js";
 import { clampLimit } from "./repositories/paging.js";
+import { redactText } from "../privacy/index.js";
+import type { Finding, SecretKind } from "../privacy/index.js";
+import { resolvePrivacyMode } from "./privacy-settings.js";
 
 export interface StoreOptions {
   path?: string;
@@ -92,6 +96,11 @@ export interface Store {
     // that new episode is still recorded in the log but is not reachable
     // from this return value.
     episodeId: string;
+    // §10: what the redactor found in this write, if anything -- kinds and
+    // counts only, never previews, so the tool layer decides what (if
+    // anything) to surface to the user. Empty when privacy mode is "off"
+    // or nothing was found.
+    redactions: { kind: SecretKind; count: number }[];
   };
   // A forgotten (or superseded) memory must not be readable by default
   // (BUILD_BRIEF §10): both options default to false. The dashboard's
@@ -154,6 +163,17 @@ export interface Store {
   ): { superseded: Memory; replacement: Memory };
   asOf(at: number, options?: { scope?: string; limit?: number }, ctx?: CallContext): Memory[];
 
+  // §10: "delete everything" is always available and hard-deletes every
+  // memory/episode/tag/FTS/vector row in one transaction. Requires
+  // `confirm: true`, same gate shape as forgetWhere's query-shaped delete
+  // -- a model mis-firing this call must not silently erase the whole
+  // store. audit_log, clients, settings and redactions are deliberately
+  // NOT purged (see the implementation comment for why).
+  deleteEverything(
+    options: { confirm: true },
+    ctx?: CallContext,
+  ): { memories: number; episodes: number; vectors: number };
+
   episodes(
     options?: { scope?: string; limit?: number; cursor?: string | null },
     ctx?: CallContext,
@@ -166,6 +186,24 @@ export interface Store {
   setClientEnabled(id: string, enabled: boolean): ClientRecord;
 
   close(): void;
+}
+
+// Names the KINDS found and how many, never a value or a preview that
+// could reconstruct one -- this is what a strict-mode refusal error is
+// allowed to say (BUILD_BRIEF §10).
+function summarizeFindings(findings: readonly Finding[]): string {
+  const counts = summarizeKindCounts(findings);
+  return counts.map(({ kind, count }) => `${count} ${kind}`).join(", ");
+}
+
+// Kinds and counts only, never previews -- the tool layer decides what (if
+// anything) to surface to the user.
+function summarizeKindCounts(findings: readonly Finding[]): { kind: SecretKind; count: number }[] {
+  const counts = new Map<SecretKind, number>();
+  for (const finding of findings) {
+    counts.set(finding.kind, (counts.get(finding.kind) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([kind, count]) => ({ kind, count }));
 }
 
 export function openStore(options: StoreOptions = {}): Store {
@@ -233,28 +271,82 @@ export function openStore(options: StoreOptions = {}): Store {
       const { sourceClient, scope } = gate(ctx, "remember");
       const resolvedScope = input.scope ?? scope;
 
+      // §10 redaction runs BEFORE anything is written, and is pure local
+      // regex (../privacy/detectors.ts) -- it never calls an LLM or the
+      // network, so this stays inside `remember`'s "never calls an LLM"
+      // contract (BUILD_BRIEF §2).
+      const { mode: privacyMode } = resolvePrivacyMode(db);
+      const redaction = redactText(input.content, privacyMode);
+
+      if (privacyMode === "strict" && redaction.blocked) {
+        // §10 strict mode: write NOTHING -- no episode, no memory, no
+        // vector. The refusal must still show up in the §9 "what was
+        // blocked" view, so it is recorded here, OUTSIDE the write
+        // transaction that never opens for this call -- the same shape as
+        // gate()'s client-refusal audit row above, which also records
+        // before throwing rather than inside a transaction that would roll
+        // it back. The error names the KINDS found and how many, never a
+        // value or a preview that could reconstruct one.
+        recordRedactions(
+          db,
+          redaction.findings.map((finding) => ({
+            memoryId: null,
+            episodeId: null,
+            scope: resolvedScope,
+            sourceClient,
+            kind: finding.kind,
+            preview: finding.preview,
+            action: "blocked",
+          })),
+        );
+        throw new Error(
+          `remember refused: found ${summarizeFindings(redaction.findings)}; privacy mode is "strict"`,
+        );
+      }
+
+      const contentToStore = redaction.text;
+      const redacted = redaction.findings.length > 0;
+
       return db.tx(() => {
         // Local-embedding hook lands in milestone 2 here: `remember` must
         // stay local-only and never make a network call in the default
         // path (BUILD_BRIEF §2). No vector is computed or stored yet.
 
-        // The episodic log is append-only and keeps the source, so the
-        // episode is appended even when the memory dedupes -- restating
-        // something is itself history worth keeping.
+        // The episodic log is append-only and keeps the source (§5), but
+        // §10 wins here for secrets: an unredacted episode would put the
+        // user's API key in the database, which is the exact outcome this
+        // feature exists to prevent. The episode therefore gets the
+        // REDACTED text too, not the raw content -- this looks like a §5
+        // violation to anyone who has not read §10, but it is not one.
         const episode = appendEpisode(db, {
-          content: input.content,
+          content: contentToStore,
           scope: resolvedScope,
           sourceClient,
           metadata: input.metadata,
         });
         const { memory, deduped } = createMemory(db, {
-          text: input.content,
+          text: contentToStore,
           scope: resolvedScope,
           tags: input.tags,
           sourceClient,
           importance: input.importance,
           episodeId: episode.id,
+          redacted,
         });
+        if (redacted) {
+          recordRedactions(
+            db,
+            redaction.findings.map((finding) => ({
+              memoryId: memory.id,
+              episodeId: episode.id,
+              scope: resolvedScope,
+              sourceClient,
+              kind: finding.kind,
+              preview: finding.preview,
+              action: "redacted",
+            })),
+          );
+        }
         recordAudit(db, {
           action: "remember",
           memoryId: memory.id,
@@ -264,7 +356,12 @@ export function openStore(options: StoreOptions = {}): Store {
         });
         // See the episodeId doc comment on the Store interface for what
         // this value means on dedupe vs. a fresh write.
-        return { memory, deduped, episodeId: memory.episodeId ?? episode.id };
+        return {
+          memory,
+          deduped,
+          episodeId: memory.episodeId ?? episode.id,
+          redactions: summarizeKindCounts(redaction.findings),
+        };
       });
     },
 
@@ -527,6 +624,57 @@ export function openStore(options: StoreOptions = {}): Store {
         });
       }
       return items;
+    },
+
+    deleteEverything(options, ctx) {
+      requireWritable("deleteEverything");
+      // Safety property, same as forgetWhere's query-shaped delete: NEVER
+      // purge without an explicit confirm -- a model mis-firing this call
+      // must not silently erase the whole store.
+      if (options.confirm !== true) {
+        throw new Error(`deleteEverything refused: requires { confirm: true }`);
+      }
+      const { sourceClient, scope } = gate(ctx, "forget");
+      // Invariant: the purge and its audit row commit together or not at
+      // all -- a failed audit insert must not leave a purged store with no
+      // trace of it in the §5 access log.
+      return db.tx(() => {
+        const memoryCount = db.q(`SELECT COUNT(*) AS c FROM memories`).get();
+        const episodeCount = db.q(`SELECT COUNT(*) AS c FROM episodes`).get();
+        const memories = memoryCount ? Number(memoryCount["c"]) : 0;
+        const episodes = episodeCount ? Number(episodeCount["c"]) : 0;
+
+        // Deliberately NOT purged: audit_log, clients, settings and
+        // redactions. audit_log and redactions are the access log and the
+        // privacy record that let a user verify the deletion happened at
+        // all -- a "delete everything" that erased its own evidence would
+        // be indistinguishable from data loss. clients and settings are
+        // connection/config state, not stored memory content.
+        let vectors = 0;
+        if (db.capabilities.vectors) {
+          for (const space of listVectorSpaces(db)) {
+            const tableName = assertTableName(space.tableName);
+            const countRow = db.q(`SELECT COUNT(*) AS c FROM ${tableName}`).get();
+            vectors += countRow ? Number(countRow["c"]) : 0;
+            db.exec(`DELETE FROM ${tableName}`);
+          }
+        }
+
+        // Deleting from memories cascades to memory_tags (ON DELETE
+        // CASCADE, PRAGMA foreign_keys=ON in db.ts) and fires memories_ad,
+        // which cleans up memories_fts -- no separate FTS statement needed.
+        db.q(`DELETE FROM memories`).run();
+        db.q(`DELETE FROM episodes`).run();
+
+        recordAudit(db, {
+          action: "forget",
+          scope: scope ?? null,
+          sourceClient,
+          details: { deleteEverything: true, memories, episodes, vectors },
+        });
+
+        return { memories, episodes, vectors };
+      });
     },
 
     episodes(options = {}, ctx) {

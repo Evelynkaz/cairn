@@ -5,19 +5,20 @@ import { withTempDir, withTempDirAsync, tempDbPath } from "../testing/tmp.js";
 import { openNodeSqlite } from "./driver/node-sqlite.js";
 import { migrations, runMigrations } from "./migrations/index.js";
 import type { Migration } from "./migrations/index.js";
+import { migration001 } from "./migrations/001-init.js";
 
 function userVersion(driver: ReturnType<typeof openNodeSqlite>): number {
   const row = driver.prepare("PRAGMA user_version").get();
   return Number(row?.["user_version"]);
 }
 
-test("fresh database ends at user_version 1", () => {
+test("fresh database ends at user_version 2", () => {
   withTempDir((dir) => {
     const driver = openNodeSqlite({ path: tempDbPath(dir) });
     try {
       const result = runMigrations(driver);
-      assert.deepEqual(result, { from: 0, to: 1 });
-      assert.equal(userVersion(driver), 1);
+      assert.deepEqual(result, { from: 0, to: 2 });
+      assert.equal(userVersion(driver), 2);
     } finally {
       driver.close();
     }
@@ -30,17 +31,56 @@ test("running migrations again is a no-op, including across a fresh connection t
     const driver = openNodeSqlite({ path });
     runMigrations(driver);
     const again = runMigrations(driver);
-    assert.deepEqual(again, { from: 1, to: 1 });
+    assert.deepEqual(again, { from: 2, to: 2 });
     driver.close();
 
     const reopened = openNodeSqlite({ path });
     try {
       assert.doesNotThrow(() => {
         const result = runMigrations(reopened);
-        assert.deepEqual(result, { from: 1, to: 1 });
+        assert.deepEqual(result, { from: 2, to: 2 });
       });
     } finally {
       reopened.close();
+    }
+  });
+});
+
+test("a database already at version 1 upgrades to 2 WITHOUT re-running migration 001", () => {
+  withTempDir((dir) => {
+    const path = tempDbPath(dir);
+    const driver = openNodeSqlite({ path });
+    try {
+      // Apply only migration 001 first, via the runner's injectable list --
+      // this is the first time the runner has ever been exercised with a
+      // database that starts a run already partway up the chain.
+      const first = runMigrations(driver, [migration001]);
+      assert.deepEqual(first, { from: 0, to: 1 });
+
+      // Seed data that a naive replay of migration 001 (e.g. a
+      // CREATE TABLE with no IF NOT EXISTS) would either collide with or
+      // wipe out.
+      const now = Date.now();
+      driver.exec(
+        `INSERT INTO memories (id, text, scope, created_at, updated_at, valid_from, content_hash)
+         VALUES ('preexisting', 'kept across the upgrade', 'default', ${now}, ${now}, ${now}, 'hash-upgrade')`,
+      );
+
+      const second = runMigrations(driver, migrations);
+      assert.deepEqual(second, { from: 1, to: 2 });
+      assert.equal(userVersion(driver), 2);
+
+      const redactionsTable = driver
+        .prepare("select name from sqlite_master where name = 'redactions'")
+        .get();
+      assert.ok(redactionsTable);
+
+      const preserved = driver
+        .prepare("select text from memories where id = 'preexisting'")
+        .get();
+      assert.equal(preserved?.["text"], "kept across the upgrade");
+    } finally {
+      driver.close();
     }
   });
 });

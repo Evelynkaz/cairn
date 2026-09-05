@@ -1,11 +1,13 @@
 import type { Migration } from "./index.js";
 
-// NOTE: this migration is being edited IN PLACE rather than followed by a
-// migration 002, because Cairn is unreleased (version 0.0.0) and no
-// database built against an earlier shape of this file exists in the wild.
-// Once real databases exist, schema changes belong in a new migration —
-// editing an already-shipped migration file corrupts any database that
-// already recorded it as applied.
+// NOTE: this migration was previously edited IN PLACE while Cairn was
+// unreleased (version 0.0.0), on the reasoning that no database built
+// against an earlier shape of this file existed in the wild. That window is
+// now closed: the repository is public and this schema has shipped in CI on
+// three platforms, so a real database recording version 1 as applied can
+// exist. From here on, every schema change is an additive migration file
+// (see 002-redactions.ts, the first one) — never an edit to a migration
+// that has already shipped.
 const TABLES_DDL = `
 CREATE TABLE episodes (
   -- seq is the real (AUTOINCREMENT) rowid: never reused, unlike the

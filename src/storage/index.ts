@@ -20,9 +20,24 @@ export type {
   Memory,
   AuditEvent,
   ClientRecord,
+  RedactionAction,
+  RedactionRecord,
 } from "./types.js";
 
 export type { AuditAction, ListAuditOptions, ListAuditResult, ClientAuditCounts } from "./repositories/audit.js";
+
+export {
+  recordRedactions,
+  listRedactions,
+  countRedactionsByKind,
+  deleteRedactionsForMemory,
+} from "./repositories/redactions.js";
+export type {
+  RedactionEntry,
+  ListRedactionsOptions,
+  ListRedactionsResult,
+  RedactionKindCount,
+} from "./repositories/redactions.js";
 
 // Store.recall()/Store.context() return retrieval types directly; the MCP
 // layer needs to name SearchHit (to shape its JSON response) without
@@ -40,3 +55,6 @@ export {
   memorySeqsMissingVectors,
 } from "./repositories/vectors.js";
 export type { VectorSpaceRef } from "./repositories/vectors.js";
+
+export { resolvePrivacyMode, setPrivacyMode, VALID_PRIVACY_MODES } from "./privacy-settings.js";
+export type { PrivacyConfig } from "./privacy-settings.js";

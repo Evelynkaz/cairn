@@ -5,18 +5,23 @@
 // that no longer exists, or never existed. Do not "fix" that by adding a
 // foreign key, and never delete audit rows when a memory is deleted.
 //
-// `query` is stored verbatim. It is a RECALL query, not ingest text, so it
-// does NOT currently pass through the §10 ingest redaction path — a user
-// who searches for their own API key gets it written to this log verbatim
-// and rendered in the dashboard's access log. This is a known gap: when
-// the §10 redactor lands, it must be applied to `event.query` in
-// `recordAudit` (see the TODO on that line below). `details` is for small
+// `query` is a RECALL query, not ingest text, but the same reasoning
+// applies: a user who searches for their own API key must not get it
+// written to this log verbatim and rendered in the dashboard's access log.
+// `recordAudit` below runs it through the §10 redactor before storing.
+// `strict` is treated as `on` here -- refusing to log a search (as strict
+// does on ingest) would be a strange failure mode for a read; recall
+// already ran and returned a result, so the only question left is whether
+// the LOGGED COPY of the query carries the secret, and `on`'s answer
+// (mask it) is right regardless of ingest mode. `details` is for small
 // structured metadata (counts, ids, flags) only — this module must never
 // be given a place to stash raw memory content.
 
 import type { CairnDb } from "../db.js";
 import type { Row, SqlValue } from "../driver/index.js";
 import type { AuditEvent, ClientRecord } from "../types.js";
+import { redactText } from "../../privacy/index.js";
+import { resolvePrivacyMode } from "../privacy-settings.js";
 import { bool, num, numOrNull, str, strOrNull } from "./row.js";
 import { clampLimit, decodeCursor, encodeCursor } from "./paging.js";
 
@@ -99,6 +104,17 @@ function toClientRecord(row: Row): ClientRecord {
   };
 }
 
+// `strict` refuses a WRITE outright; there is no equivalent "refuse to log"
+// action for a query string, so it is mapped to `on` (redact-and-store)
+// here, per the module comment above.
+function redactedQuery(db: CairnDb, query: string | null | undefined): string | null {
+  if (query == null) return null;
+  const { mode } = resolvePrivacyMode(db);
+  if (mode === "off") return query;
+  const effectiveMode = mode === "strict" ? "on" : mode;
+  return redactText(query, effectiveMode).text;
+}
+
 export function recordAudit(db: CairnDb, event: RecordAuditEvent): number {
   const ts = Date.now();
   const details = event.details == null ? null : JSON.stringify(event.details);
@@ -113,8 +129,7 @@ export function recordAudit(db: CairnDb, event: RecordAuditEvent): number {
       event.memoryId ?? null,
       event.scope ?? null,
       event.sourceClient ?? null,
-      // TODO(§10): run the redactor over event.query here once it exists.
-      event.query ?? null,
+      redactedQuery(db, event.query),
       event.resultCount ?? null,
       details,
       event.refused ? 1 : 0,

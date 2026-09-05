@@ -58,3 +58,17 @@ export interface ClientRecord {
   lastSeen: number;
   enabled: boolean;
 }
+
+export type RedactionAction = "redacted" | "blocked";
+
+export interface RedactionRecord {
+  id: number;
+  ts: number;
+  memoryId: MemoryId | null;
+  episodeId: EpisodeId | null;
+  scope: Scope | null;
+  sourceClient: string | null;
+  kind: string;
+  preview: string;
+  action: RedactionAction;
+}

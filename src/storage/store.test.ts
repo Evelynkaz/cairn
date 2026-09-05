@@ -4,6 +4,9 @@ import { rmSync } from "node:fs";
 import { withTempDir, makeTempDir, tempDbPath } from "../testing/tmp.js";
 import { openStore } from "./store.js";
 import type { CallContext, Store } from "./store.js";
+import { setPrivacyMode } from "./privacy-settings.js";
+import { ensureVectorSpace, upsertVector } from "./repositories/vectors.js";
+import type { CairnDb } from "./db.js";
 
 function withStore<T>(fn: (store: Store, dir: string) => T): T {
   return withTempDir((dir) => {
@@ -142,6 +145,7 @@ const GATED_METHODS: Record<string, GatedInvoke> = {
   restore: (store, id, ctx) => store.restore(id, ctx),
   supersede: (store, id, ctx) => store.supersede(id, { text: "gate probe" }, ctx),
   asOf: (store, _id, ctx) => store.asOf(Date.now(), {}, ctx),
+  deleteEverything: (store, _id, ctx) => store.deleteEverything({ confirm: true }, ctx),
   episodes: (store, _id, ctx) => store.episodes({}, ctx),
   episode: (store, id, ctx) => store.episode(id, ctx),
 };
@@ -593,5 +597,197 @@ test("close() is idempotent", () => {
     const store = openStore({ path: tempDbPath(dir) });
     store.close();
     assert.doesNotThrow(() => store.close());
+  });
+});
+
+// Synthetic secrets shaped to match ../privacy/detectors.ts, kept alnum-only
+// so an FTS5 MATCH query against them is well-formed.
+const AWS_KEY = "AKIAABCDEFGHIJKLMNOP";
+const GH_TOKEN = "ghp_" + "a".repeat(40);
+
+// Walks every table in the database, including the FTS5 shadow tables
+// (memories_fts_data etc.) -- the easy miss -- and every column value,
+// looking for the raw bytes of `needle`. This is the sanctioned way to
+// assert "this secret is nowhere in the database", stronger than checking
+// individual columns one by one because it also catches a leak into the
+// FTS index's term dictionary, which an ordinary `SELECT text FROM
+// memories_fts` would not: that query reads through to the (already
+// redacted) memories.text column rather than the index's own storage.
+function dbContainsRawBytes(db: CairnDb, needle: string): boolean {
+  const needleBytes = Buffer.from(needle, "utf8");
+  const tables = db
+    .q(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+    .all();
+  for (const t of tables) {
+    const name = String(t["name"]);
+    let rows;
+    try {
+      rows = db.q(`SELECT * FROM ${name}`).all();
+    } catch {
+      continue;
+    }
+    for (const row of rows) {
+      for (const value of Object.values(row)) {
+        if (typeof value === "string" && value.includes(needle)) return true;
+        if (value instanceof Uint8Array) {
+          const buf = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+          if (buf.includes(needleBytes)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+test("remember in 'on' mode redacts secrets in the memory, the episode, and the FTS index", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "on");
+    const content = `AWS key: ${AWS_KEY} and GitHub token: ${GH_TOKEN}`;
+
+    const { memory, episodeId, redactions } = store.remember({ content });
+
+    assert.equal(memory.redacted, true);
+    assert.match(memory.text, /\[redacted:aws-access-key-id\]/);
+    assert.match(memory.text, /\[redacted:github-token\]/);
+    assert.ok(!memory.text.includes(AWS_KEY));
+    assert.ok(!memory.text.includes(GH_TOKEN));
+
+    const episode = store.episode(episodeId);
+    assert.ok(episode);
+    assert.ok(!episode.content.includes(AWS_KEY));
+    assert.ok(!episode.content.includes(GH_TOKEN));
+
+    assert.equal(dbContainsRawBytes(store.db, AWS_KEY), false);
+    assert.equal(dbContainsRawBytes(store.db, GH_TOKEN), false);
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions`).all();
+    assert.equal(redactionRows.length, 2);
+    for (const row of redactionRows) {
+      assert.equal(row["action"], "redacted");
+      assert.equal(row["memory_id"], memory.id);
+    }
+
+    assert.deepEqual(
+      redactions.map((r) => r.kind).sort(),
+      ["aws-access-key-id", "github-token"],
+    );
+    assert.ok(redactions.every((r) => r.count === 1));
+  });
+});
+
+test("remember in 'strict' mode blocks the write entirely and records blocked redactions", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "strict");
+    const content = `AWS key: ${AWS_KEY} and GitHub token: ${GH_TOKEN}`;
+
+    let thrown: Error | undefined;
+    try {
+      store.remember({ content });
+    } catch (error) {
+      thrown = error as Error;
+    }
+    assert.ok(thrown, "expected strict mode to throw");
+    assert.match(thrown.message, /aws-access-key-id/);
+    assert.match(thrown.message, /github-token/);
+    assert.ok(!thrown.message.includes(AWS_KEY));
+    assert.ok(!thrown.message.includes(GH_TOKEN));
+
+    assert.equal(countRows(store, "memories"), 0);
+    assert.equal(countRows(store, "episodes"), 0);
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions`).all();
+    assert.equal(redactionRows.length, 2);
+    for (const row of redactionRows) {
+      assert.equal(row["action"], "blocked");
+      assert.equal(row["memory_id"], null);
+    }
+  });
+});
+
+test("remember in 'off' mode stores content verbatim and records nothing", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "off");
+    const content = `AWS key: ${AWS_KEY}`;
+
+    const { memory, redactions } = store.remember({ content });
+
+    assert.equal(memory.text, content);
+    assert.equal(memory.redacted, false);
+    assert.deepEqual(redactions, []);
+    assert.equal(countRows(store, "redactions"), 0);
+  });
+});
+
+test("a recall query containing a secret is stored redacted in the access log", async () => {
+  await withStoreAsync(async (store) => {
+    setPrivacyMode(store.db, "on");
+    const query = `looking for ${AWS_KEY}`;
+
+    await store.recall(query);
+
+    const { items } = store.auditLog({ action: "recall" });
+    const entry = items.find((e) => e.query !== null);
+    assert.ok(entry);
+    assert.ok(!(entry.query ?? "").includes(AWS_KEY));
+    assert.match(entry.query ?? "", /\[redacted:aws-access-key-id\]/);
+  });
+});
+
+test("deleteEverything hard-deletes memories/episodes/tags/FTS/vectors across two vector spaces, leaving audit/settings/clients/redactions intact", () => {
+  withStore((store) => {
+    assert.equal(store.capabilities.vectors, true, "sqlite-vec must load for this test to be meaningful");
+
+    setPrivacyMode(store.db, "on");
+    const { memory } = store.remember({ content: `secret ${AWS_KEY}` }, { sourceClient: "purger" });
+
+    const spaceA = ensureVectorSpace(store.db, "test-model-a", 4);
+    const spaceB = ensureVectorSpace(store.db, "test-model-b", 4);
+    upsertVector(store.db, spaceA, memory.seq, new Float32Array([1, 0, 0, 0]), {
+      scope: memory.scope,
+      live: true,
+      createdAt: Date.now(),
+    });
+    upsertVector(store.db, spaceB, memory.seq, new Float32Array([0, 1, 0, 0]), {
+      scope: memory.scope,
+      live: true,
+      createdAt: Date.now(),
+    });
+
+    const auditRowsBefore = store.db.q(`SELECT id FROM audit_log`).all();
+    const clientsBefore = countRows(store, "clients");
+    const settingsBefore = countRows(store, "settings");
+    const redactionsBefore = countRows(store, "redactions");
+    assert.ok(redactionsBefore > 0);
+
+    const result = store.deleteEverything({ confirm: true });
+
+    assert.equal(result.memories, 1);
+    assert.equal(result.episodes, 1);
+    assert.equal(result.vectors, 2);
+
+    assert.equal(countRows(store, "memories"), 0);
+    assert.equal(countRows(store, "episodes"), 0);
+    assert.equal(countRows(store, "memory_tags"), 0);
+    assert.equal(store.db.q(`SELECT COUNT(*) AS c FROM memories_fts`).get()?.["c"], 0);
+    assert.equal(store.db.q(`SELECT COUNT(*) AS c FROM ${spaceA.tableName}`).get()?.["c"], 0);
+    assert.equal(store.db.q(`SELECT COUNT(*) AS c FROM ${spaceB.tableName}`).get()?.["c"], 0);
+
+    // audit_log, settings, clients, redactions all survive the purge --
+    // every pre-purge row is still there (plus the purge's own audit row).
+    const auditRowIdsAfter = new Set(store.db.q(`SELECT id FROM audit_log`).all().map((r) => r["id"]));
+    for (const row of auditRowsBefore) {
+      assert.ok(auditRowIdsAfter.has(row["id"]));
+    }
+    assert.equal(countRows(store, "clients"), clientsBefore);
+    assert.equal(countRows(store, "settings"), settingsBefore);
+    assert.equal(countRows(store, "redactions"), redactionsBefore);
+  });
+});
+
+test("deleteEverything refuses without confirm: true", () => {
+  withStore((store) => {
+    store.remember({ content: "kept" });
+    assert.throws(() => store.deleteEverything({ confirm: false as unknown as true }), /confirm/);
+    assert.equal(countRows(store, "memories"), 1);
   });
 });
