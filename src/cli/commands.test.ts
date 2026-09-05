@@ -2,11 +2,12 @@
 // homes -- no test here may touch the developer's real ~/.cairn or a real
 // MCP client config file, and every process this file spawns is killed.
 
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
+import { PassThrough } from "node:stream";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { withTempDirAsync } from "../testing/tmp.js";
@@ -40,6 +41,22 @@ function captureContext(overrides: Partial<CommandContext> = {}): CommandContext
     ...overrides,
   };
 }
+
+// runCommand("hook-session-start") runs the recall hook, which sends its
+// request over Node's global fetch(), whose keep-alive connection pool is
+// owned by undici's global dispatcher -- there is no public API to close it,
+// only this well-known internal symbol. Closing it is what lets this file's
+// own worker process exit on its own (see CONTRIBUTING.md); it is a no-op if
+// a future Node stops exposing the symbol, rather than a hard failure.
+async function closeGlobalFetchDispatcher(): Promise<void> {
+  const globalAny = globalThis as unknown as Record<symbol, { close?: () => Promise<void> } | undefined>;
+  const dispatcher = globalAny[Symbol.for("undici.globalDispatcher.1")];
+  await dispatcher?.close?.();
+}
+
+after(async () => {
+  await closeGlobalFetchDispatcher();
+});
 
 test("status reports not running with no daemon", async () => {
   await withTempDirAsync(async (home) => {
@@ -390,27 +407,65 @@ test("journalMode surfaces through /health into daemonStatus (normally 'wal')", 
 
 // runHookSessionStart's whole reason to exist is guaranteeing the
 // always-exit-0 property the SessionStart hook design rests on (see
-// hook.ts's header) -- these two tests exercise the wrapper itself, not
-// just runSessionStartHook underneath it, since that is the layer
-// commands.ts actually promises callers. A fresh temp home has no runtime
-// file, so this drives the "no daemon" branch, which fires off a real,
-// unawaited background spawn (see hook.ts) for the NEXT session -- that
-// spawned daemon is polled for and killed below so it never outlives this
-// test.
+// hook.ts's header) -- this exercises the wrapper itself, not just
+// runSessionStartHook underneath it, since that is the layer commands.ts
+// actually promises callers. A fresh temp home has no runtime file, so this
+// drives the "no daemon" branch, which fires off a real, unawaited
+// background spawn (see hook.ts) for the NEXT session. runHookSessionStart
+// (commands.ts) has no seam of its own to redirect that spawn's env --
+// ensureDaemon (src/shim/ensure-daemon.ts) falls back to the real
+// process.env whenever no env is threaded through, which is exactly this
+// path -- so this pins process.env.CAIRN_PORT to a port this test already
+// holds open itself before calling runCommand, and restores it afterward.
+// The daemon process still gets spawned, but startDaemon (server.ts) claims
+// its port before touching the database (see its own comment on why), so it
+// hits EADDRINUSE and exits immediately: it never becomes healthy, never
+// writes a runtime file, and never outlives this test -- deterministically,
+// regardless of what else on the machine holds the real default port 8787.
+//
+// runHookSessionStart also always passes the process's own real
+// process.stdin into the hook (see hook.ts's drainStdin, which calls
+// .resume() on it) -- commands.ts has no seam to redirect that either. A
+// real stdin that is a pipe/tty never reaches "end" on its own, so resuming
+// it refs a handle that can keep this whole test process alive long after
+// the assertions below finish, in a way that has nothing to do with the
+// daemon spawn. Swapping in an already-ended stream for the duration of
+// this test removes that dependency on whatever the ambient stdin happens
+// to be, and is restored immediately after.
 test("runCommand('hook-session-start') over a fresh temp home returns 0 with ctx.out never called", async () => {
   await withTempDirAsync(async (home) => {
-    const ctx = captureContext({ home });
-    const code = await runCommand({ command: "hook-session-start" }, ctx);
-    assert.equal(code, 0);
-    assert.equal(ctx.lines.out.length, 0);
+    const blocker = createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+    const address = blocker.address();
+    const heldPort = typeof address === "object" && address !== null ? address.port : 0;
 
-    const deadline = Date.now() + 5000;
-    let info = readRuntimeFile(home);
-    while (!info && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      info = readRuntimeFile(home);
+    const previousPort = process.env.CAIRN_PORT;
+    process.env.CAIRN_PORT = String(heldPort);
+    const previousStdin = Object.getOwnPropertyDescriptor(process, "stdin");
+    const endedStdin = new PassThrough();
+    endedStdin.end();
+    Object.defineProperty(process, "stdin", { value: endedStdin, configurable: true, writable: true });
+    try {
+      const ctx = captureContext({ home });
+      const code = await runCommand({ command: "hook-session-start" }, ctx);
+      assert.equal(code, 0);
+      assert.equal(ctx.lines.out.length, 0);
+
+      // The spawn above is fire-and-forget; give it a moment to hit
+      // EADDRINUSE and exit, then confirm it never became a live daemon.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(readRuntimeFile(home), null);
+    } finally {
+      if (previousPort === undefined) {
+        delete process.env.CAIRN_PORT;
+      } else {
+        process.env.CAIRN_PORT = previousPort;
+      }
+      if (previousStdin) {
+        Object.defineProperty(process, "stdin", previousStdin);
+      }
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
     }
-    await killPid(info?.pid);
   });
 });
 
