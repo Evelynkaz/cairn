@@ -11,8 +11,8 @@
 
 > Status: pre-release. The daemon, dashboard API, all MCP tools, the
 > SessionStart recall hook, and export/import are implemented and covered
-> by tests (742 tests, 738 passing, 0 failing; CI green on Linux/macOS/
-> Windows). It is not yet published to npm (`package.json` is still
+> by tests (760 tests, 756 passing, 0 failing, 4 skipped; CI green on
+> Linux/macOS/Windows). It is not yet published to npm (`package.json` is still
 > `"private": true`) and the dashboard UI has never been rendered in a
 > browser — only its API handlers are tested.
 
