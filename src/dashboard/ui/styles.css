@@ -492,6 +492,16 @@ textarea {
 
 .cell-source {
   white-space: nowrap;
+  /* "cairn-dashboard" on every self-authored row, "0.50" on most importance
+     values below -- capping the growth these two columns would otherwise
+     get from the table's `width: 100%` (auto layout hands unclaimed space
+     to every column, not just the ones that need it) leaves more of a
+     1680px viewport for the columns that actually vary. */
+  max-width: 10rem;
+}
+
+.cell-importance {
+  max-width: 5rem;
 }
 
 .cell-actions {
@@ -516,12 +526,36 @@ textarea {
   gap: 0.35rem;
 }
 
+/* Status now sits right after Text (see the <th> order in memories.ts),
+   not last before the pinned Actions column -- whatever cell is immediately
+   left of a `position: sticky; right: 0` column gets painted over whenever
+   the table overflows, so the badges below (the thing a user is being
+   asked to act on) can never live there. */
+.cell-status {
+  white-space: nowrap;
+}
+
+/* Inline wrapper, not the <td> itself -- lets the Status/Deleted/Superseded
+   badge and the origin/approval badges sit on one line, without ever making
+   the row taller than a normal one (that exact defect, from stacking badges
+   directly in the cell, is what pushed the imported row to three times its
+   neighbours' height). Kept on one line rather than wrapped: `.cell-status`
+   above is nowrap, so a wrapped badge would just be clipped instead of
+   dropping to a second line. */
+.cell-status-inner {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.3rem;
+}
+
 .badge {
   display: inline-block;
   padding: 0.1rem 0.5rem;
   border-radius: 999px;
   font-size: 0.75rem;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .badge-deleted {
@@ -532,6 +566,24 @@ textarea {
 .badge-superseded {
   color: var(--warn);
   background: var(--warn-bg);
+}
+
+.badge-origin {
+  color: var(--accent);
+  background: var(--accent-bg);
+}
+
+/* Distinct from .badge-origin's fill so "not approved" reads as a visually
+   different kind of mark at a glance, not just more text -- an outline
+   rather than another filled pill. */
+.badge-unapproved {
+  color: var(--warn);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--warn);
+}
+
+.approval-hint {
+  margin: 0.25rem 0 0;
 }
 
 .pager {

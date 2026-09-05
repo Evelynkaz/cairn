@@ -53,12 +53,32 @@ export function writeRuntimeFile(info: RuntimeInfo, home: string = resolveCairnH
   const tmpPath = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
   const fd = openSync(tmpPath, "wx", RUNTIME_FILE_MODE);
   try {
-    fchmodSync(fd, RUNTIME_FILE_MODE);
+    // openSync's mode argument already applied RUNTIME_FILE_MODE to this
+    // brand-new file; this is belt-and-suspenders against a loose umask. On
+    // Windows libuv's fchmod needs FILE_READ_ATTRIBUTES on a handle opened
+    // "wx"-style and can throw -- losing this call costs nothing, since the
+    // file's mode is already set from creation.
+    try {
+      fchmodSync(fd, RUNTIME_FILE_MODE);
+    } catch {
+      // Best-effort: the file's mode from openSync already stands.
+    }
     writeSync(fd, JSON.stringify(info, null, 2));
-  } finally {
     closeSync(fd);
+    renameSync(tmpPath, path);
+  } catch (err) {
+    try {
+      closeSync(fd);
+    } catch {
+      // Best-effort close on the failure path -- may already be closed.
+    }
+    try {
+      rmSync(tmpPath, { force: true });
+    } catch {
+      // Best-effort: the original error is what matters to the caller.
+    }
+    throw err;
   }
-  renameSync(tmpPath, path);
 }
 
 function isRuntimeInfo(value: unknown): value is RuntimeInfo {

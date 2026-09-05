@@ -225,19 +225,23 @@ test("rejects a central directory entry that overruns the declared central direc
 });
 
 test("total uncompressed bytes: a declared total over the new 256 MiB cap is refused, one just under it is accepted", () => {
-  const MAX_ENTRY = 64 * 1024 * 1024; // zip.ts's MAX_ENTRY_UNCOMPRESSED_BYTES
+  const MAX_ENTRY = 128 * 1024 * 1024; // zip.ts's MAX_ENTRY_UNCOMPRESSED_BYTES
+  // 90,000,000 bytes/entry: two of them (~172 MiB) sit comfortably under the
+  // 256 MiB total cap; a third (~257 MiB) crosses it by only ~1.5 MiB -- the
+  // same cap boundaries as before, but with the minimum total data needed to
+  // cross them (two fewer, and barely-over instead of far-over) rather than
+  // the previous 60 MiB x 4/5 shape.
+  const ENTRY_SIZE = 90_000_000;
   const under = [
-    { name: "a.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) },
-    { name: "b.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) },
-    { name: "c.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) },
-    { name: "d.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) },
-  ]; // 240 MiB total, under the 256 MiB cap, each entry under MAX_ENTRY
+    { name: "a.bin", data: Buffer.alloc(ENTRY_SIZE, 0) },
+    { name: "b.bin", data: Buffer.alloc(ENTRY_SIZE, 0) },
+  ];
   assert.ok(under.every((e) => e.data.length < MAX_ENTRY));
   const okArchive = writeZip(under);
   const read = readZip(okArchive);
   assert.equal(read.length, under.length);
 
-  const over = [...under, { name: "e.bin", data: Buffer.alloc(60 * 1024 * 1024, 0) }]; // 300 MiB total
+  const over = [...under, { name: "c.bin", data: Buffer.alloc(ENTRY_SIZE, 0) }];
   const badArchive = writeZip(over);
   assert.throws(() => readZip(badArchive), /more than \d+ total uncompressed bytes/);
 });

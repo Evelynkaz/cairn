@@ -16,6 +16,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ResourceListChangedNotificationSchema, ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { makeTempDir, tempDbPath } from "../testing/tmp.js";
+import { uuidv7 } from "../util/id.js";
 import { openStore } from "../storage/index.js";
 import type { Store } from "../storage/index.js";
 import { createMcpServer } from "./server.js";
@@ -42,6 +43,8 @@ interface RecallHit {
   tags: string[];
   importance: number;
   createdAt: number;
+  origin?: string;
+  approved?: boolean;
 }
 
 interface RecallResult {
@@ -395,6 +398,49 @@ test("get_context respects token_budget", async () => {
     const block = await callJson<ContextResult>(client, "get_context", { query: "deployment pipeline", token_budget: 20 });
     assert.ok(block.tokensEstimated <= 20, `tokensEstimated (${block.tokensEstimated}) must stay within the 20-token budget`);
     assert.equal(block.truncated, true);
+  });
+});
+
+// GAP 2 (BUILD_BRIEF §1/§10/§14): get_context as a TOOL is a model-initiated
+// read, not automatic SessionStart injection -- excluding an imported,
+// unapproved memory here would silently break §1's cross-client portability
+// promise for anyone who imported a ChatGPT/Claude export. It must still
+// come back, LABELLED with its origin so the model can weigh it.
+test("get_context as a tool returns an imported, unapproved memory, labelled with its origin", async () => {
+  await withServer(async ({ client, store }) => {
+    const imported = store.importMemory({
+      id: uuidv7(),
+      text: "deployment pipeline notes carried over from an import",
+    });
+    assert.equal(imported.skipped, false);
+    assert.equal(imported.memory?.origin, "import");
+    assert.equal(imported.memory?.approved, false);
+
+    const block = await callJson<ContextResult>(client, "get_context", { query: "deployment pipeline" });
+    const hit = block.memories.find((m) => m.id === imported.memory?.id);
+    assert.ok(hit, "get_context (tool) must not exclude an imported, unapproved memory");
+    assert.equal(hit?.origin, "import");
+    assert.equal(hit?.approved, false);
+  });
+});
+
+// recall never excludes by origin/approval either (it never filtered on
+// that at all -- only automatic injection does), so it gets the same
+// provenance labelling for the same reason: a model-initiated read that can
+// already see unreviewed content should be able to see WHERE it came from.
+test("recall also labels an imported, unapproved memory with its origin", async () => {
+  await withServer(async ({ client, store }) => {
+    const imported = store.importMemory({
+      id: uuidv7(),
+      text: "recall provenance labelling fixture",
+    });
+    assert.equal(imported.skipped, false);
+
+    const result = await callJson<RecallResult>(client, "recall", { query: "recall provenance labelling fixture" });
+    const hit = result.hits.find((h) => h.id === imported.memory?.id);
+    assert.ok(hit, "recall must still return the imported memory");
+    assert.equal(hit?.origin, "import");
+    assert.equal(hit?.approved, false);
   });
 });
 
@@ -1129,6 +1175,37 @@ test("export_memories refuses a path through a directory symlinked out of CAIRN_
     }
     rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
     rmSync(outside, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+});
+
+// Regression for the macOS break: verifyExportDirNotSymlinkedOutOfHome used
+// to compare a realpath'd candidate directory against a LEXICAL (never
+// realpath'd) home, so any symlink ABOVE CAIRN_HOME -- not just one planted
+// under it -- made the two sides never agree, refusing every export. macOS's
+// own `$TMPDIR` is exactly this shape (`/var` -> `private/var`), so this is
+// not a contrived edge case. A symlinked ancestor of a legitimate in-home
+// path must still allow the export to succeed.
+test("export_memories succeeds when an ancestor of CAIRN_HOME (not the requested path) is a symlink", async () => {
+  const realBase = makeTempDir();
+  const linkedBase = `${realBase}-link`;
+  symlinkSync(realBase, linkedBase);
+  const home = join(linkedBase, "home");
+  const originalHome = process.env.CAIRN_HOME;
+  process.env.CAIRN_HOME = home;
+  try {
+    await withServer(async ({ client }) => {
+      const { isError, text } = await callTool(client, "export_memories", { path: "backup.zip" });
+      assert.equal(isError, false, `export_memories must succeed through a symlinked ancestor: ${text}`);
+      assert.ok(statSyncExists(join(realBase, "home", "backup.zip")), "the archive must be written inside the real home");
+    });
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.CAIRN_HOME;
+    } else {
+      process.env.CAIRN_HOME = originalHome;
+    }
+    rmSync(linkedBase, { force: true });
+    rmSync(realBase, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
 });
 

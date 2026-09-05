@@ -38,6 +38,16 @@ export interface DashboardApi {
 
 const CTX = { sourceClient: DASHBOARD_CLIENT };
 
+// Same identity as CTX, but stamps every write 'import' rather than the
+// silent 'user' default (see storage/store.ts's CallContext.origin doc) --
+// used by handleImportPasted and handleImportChatGpt below, the only two
+// routes in this file writing text that did not come from the user typing
+// it themselves. Without this, a memory pasted out of a ChatGPT export
+// would be indistinguishable from one the user typed, and would be
+// auto-injected into a session's highest-trust position exactly like the
+// prompt-injection channel two audits demonstrated (see context.ts).
+const IMPORT_CTX = { sourceClient: DASHBOARD_CLIENT, origin: "import" as const };
+
 // How often an SSE stream sends a heartbeat comment, keeping the
 // connection alive across proxies/load balancers that drop an idle one.
 const SSE_HEARTBEAT_INTERVAL_MS = 25_000;
@@ -52,12 +62,13 @@ const MAX_BULK_IDS = 200;
 const SSE_BACKPRESSURE_CAP_BYTES = 1024 * 1024;
 
 // The only discriminator an error body ever carries (see handlePatchMemory,
-// handleRestoreMemory and handleSupersedeMemory below): drawn from which
-// code path threw, never from an error's own message, so a client can tell
-// "this memory is history" apart from "that text already exists elsewhere"
-// apart from "the store refused this write in strict mode" without anything
-// user-supplied ever leaking into the enum.
-type ErrorReason = "superseded" | "duplicate_text" | "strict_redaction_refused";
+// handleRestoreMemory, handleSupersedeMemory and handleApproveMemory below):
+// drawn from which code path threw, never from an error's own message, so a
+// client can tell "this memory is history" apart from "that text already
+// exists elsewhere" apart from "the store refused this write in strict mode"
+// apart from "the store is read-only" without anything user-supplied ever
+// leaking into the enum.
+type ErrorReason = "superseded" | "duplicate_text" | "strict_redaction_refused" | "read_only";
 
 class HttpError extends Error {
   readonly status: number;
@@ -125,6 +136,14 @@ function isMalformedCursorError(err: unknown): boolean {
 // a read-only store) is a genuine failure and must still propagate.
 function isStrictRedactionRefusal(err: unknown): boolean {
   return err instanceof Error && err.message.startsWith("remember refused: found ");
+}
+
+// Matches ONLY Store's requireWritable() refusal (src/storage/store.ts),
+// whose message is a fixed "store opened read-only: cannot call X()" with
+// no request- or memory-derived content -- safe to test the prefix here,
+// same reasoning as isStrictRedactionRefusal above.
+function isReadOnlyRefusal(err: unknown): boolean {
+  return err instanceof Error && err.message.startsWith("store opened read-only");
 }
 
 // The fixed 400 body for isStrictRedactionRefusal above, wired into every
@@ -367,11 +386,37 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     sendJson(res, 200, { superseded: result.superseded, replacement: result.replacement });
   }
 
+  // The only human-facing way to flip `approved` (BUILD_BRIEF §9/§10): a
+  // 'user'-origin memory is already eligible for session-start injection
+  // without this, so approving one is a no-op, not an error -- the route
+  // does not special-case it, since store.setMemoryApproved is happy to set
+  // the flag on any memory and context.ts's gate only ever consults
+  // `origin === 'user' || approved`.
+  async function handleApproveMemory(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+    const body = asRecord(await readBody(req));
+    if (typeof body["approved"] !== "boolean") {
+      throw new HttpError(400, "approved must be a boolean");
+    }
+    if (!store.get(id, { includeDeleted: true, includeSuperseded: true }, CTX)) {
+      throw new HttpError(404, "not found");
+    }
+    let memory;
+    try {
+      memory = store.setMemoryApproved(id, body["approved"], CTX);
+    } catch (err) {
+      if (isReadOnlyRefusal(err)) {
+        throw new HttpError(403, "forbidden", "read_only");
+      }
+      throw err;
+    }
+    sendJson(res, 200, memory);
+  }
+
   async function handleBulk(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = asRecord(await readBody(req));
     const op = body["op"];
-    if (op !== "forget" && op !== "restore") {
-      throw new HttpError(400, `op must be "forget" or "restore"`);
+    if (op !== "forget" && op !== "restore" && op !== "approve" && op !== "unapprove") {
+      throw new HttpError(400, `op must be "forget", "restore", "approve" or "unapprove"`);
     }
     const ids = body["ids"];
     if (!Array.isArray(ids) || ids.some((id) => typeof id !== "string")) {
@@ -386,14 +431,26 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     // failure) on one id must not undo or block the ids already committed,
     // so each id is caught individually and reported in its own result
     // rather than aborting -- or worse, having already partially committed
-    // -- the whole request.
+    // -- the whole request. A read-only store refuses every id identically,
+    // so that one is not worth reporting per-id -- it short-circuits the
+    // whole request with 403, same status as the single-id route above.
     const results = (ids as string[]).map((id) => {
       try {
-        const ok = op === "forget" ? store.forget(id, CTX) : store.restore(id, CTX);
-        return { id, ok };
+        if (op === "forget" || op === "restore") {
+          const ok = op === "forget" ? store.forget(id, CTX) : store.restore(id, CTX);
+          return { id, ok };
+        }
+        if (!store.get(id, { includeDeleted: true, includeSuperseded: true }, CTX)) {
+          return { id, ok: false, reason: "not_found" as const };
+        }
+        store.setMemoryApproved(id, op === "approve", CTX);
+        return { id, ok: true };
       } catch (err) {
         if (err instanceof LiveTextCollisionError) {
           return { id, ok: false, reason: "conflict" as const };
+        }
+        if (isReadOnlyRefusal(err)) {
+          throw new HttpError(403, "forbidden", "read_only");
         }
         throw err;
       }
@@ -544,11 +601,15 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
 
   // §1/§12's lock-in-escape hook, wired to the dashboard rather than a
   // ninth MCP tool (§2's ≤7 ceiling): a deliberate, user-initiated,
-  // one-time paste. Writes through store.remember under the dashboard's
-  // own call context so redaction, dedupe and the audit trail apply
-  // exactly as they do for any other write -- these are new memories with
-  // no id of their own, so minting fresh ones (not the id-preserving
-  // importMemory path) is correct here.
+  // one-time paste. Writes through store.remember under IMPORT_CTX (not
+  // plain CTX) so redaction, dedupe and the audit trail apply exactly as
+  // they do for any other write, but this text is stamped origin: 'import'
+  // rather than 'user' -- it came out of a file, not out of the user's own
+  // typing, and must go through the same human-approval gate as any other
+  // import before it can be auto-injected (see context.ts's
+  // excludeUnapproved). These are new memories with no id of their own, so
+  // minting fresh ones (not the id-preserving importMemory path) is
+  // correct here.
   async function handleImportPasted(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = asRecord(await readBody(req));
     const text = body["text"];
@@ -569,7 +630,7 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     // to the generic 500 handler rather than being swallowed here.
     for (const entry of parsed) {
       try {
-        const result = store.remember({ content: entry.text, scope, tags }, CTX);
+        const result = store.remember({ content: entry.text, scope, tags }, IMPORT_CTX);
         if (result.deduped) {
           skipped++;
         } else {
@@ -627,7 +688,10 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     for (const field of fields) {
       if (field.value === undefined || field.value.length === 0) continue;
       try {
-        const result = store.remember({ content: field.value, scope, tags: ["chatgpt-import", field.tag] }, CTX);
+        const result = store.remember(
+          { content: field.value, scope, tags: ["chatgpt-import", field.tag] },
+          IMPORT_CTX,
+        );
         if (result.deduped) {
           skipped++;
         } else {
@@ -737,7 +801,8 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       return;
     }
 
-    // /api/memories, /api/memories/:id, /api/memories/:id/restore, /api/memories/:id/supersede, /api/memories/bulk
+    // /api/memories, /api/memories/:id, /api/memories/:id/restore, /api/memories/:id/supersede,
+    // /api/memories/:id/approve, /api/memories/bulk
     if (segments[0] === "memories") {
       if (segments.length === 1) {
         if (method !== "GET") throw new HttpError(405, "method not allowed");
@@ -773,6 +838,11 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       if (segments.length === 3 && segments[2] === "supersede") {
         if (method !== "POST") throw new HttpError(405, "method not allowed");
         await handleSupersedeMemory(req, res, requireId(segments, 1));
+        return;
+      }
+      if (segments.length === 3 && segments[2] === "approve") {
+        if (method !== "POST") throw new HttpError(405, "method not allowed");
+        await handleApproveMemory(req, res, requireId(segments, 1));
         return;
       }
       throw new HttpError(404, "not found");

@@ -410,94 +410,118 @@ test("an over-cap body on an ESTABLISHED MCP session (post-initialize) is reject
   });
 });
 
-test("a chunked request with no Content-Length that exceeds the cap on an established session is cut off", async () => {
-  await withDaemon(async (handle) => {
-    const { client, transport } = connectClient(handle);
-    await client.connect(transport);
-    const sessionId = transport.sessionId;
-    assert.ok(sessionId);
-    try {
-      // "response" if the whole oversized body was accepted and a normal
-      // HTTP response came back (the bug this test exists to catch);
-      // "connection-error" if the connection was torn down first, which is
-      // the only correct outcome once the byte-counting safeguard fires.
-      let outcome: "response" | "connection-error" = "response";
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const done = () => {
-          if (!settled) {
-            settled = true;
-            resolve();
-          }
-        };
-        const req = httpRequest(
-          {
-            host: handle.host,
-            port: handle.port,
-            path: "/mcp",
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${handle.token}`,
-              "Content-Type": "application/json",
-              // The SDK's own transport 406s a request missing this before
-              // ever reading the body -- without it, the test would "pass"
-              // by getting a fast, unrelated rejection instead of actually
-              // exercising the byte-counting safeguard.
-              Accept: "application/json, text/event-stream",
-              "Mcp-Session-Id": sessionId,
-              // Deliberately no Content-Length: node:http then sends this as
-              // a chunked request, the case the header check alone cannot
-              // catch -- the byte-counting safeguard must cut it off instead.
+test(
+  "a chunked request with no Content-Length that exceeds the cap on an established session is cut off",
+  // An explicit timeout so a regression in the byte-counting safeguard --
+  // or a platform where socket teardown surfaces differently, or where the
+  // ~9 MiB body simply fits in local buffers and the reset goes unnoticed
+  // -- fails this test loudly instead of hanging it (node:test's default
+  // per-test timeout is Infinity).
+  { timeout: 15000 },
+  async () => {
+    await withDaemon(async (handle) => {
+      const { client, transport } = connectClient(handle);
+      await client.connect(transport);
+      const sessionId = transport.sessionId;
+      assert.ok(sessionId);
+      try {
+        // "response" if the whole oversized body was accepted and a normal
+        // HTTP response came back (the bug this test exists to catch);
+        // "connection-error" if the connection was torn down first, which is
+        // the only correct outcome once the byte-counting safeguard fires.
+        let outcome: "response" | "connection-error" = "response";
+        await new Promise<void>((resolve, reject) => {
+          let settled = false;
+          // Neither `req.on("error")` nor a failing `write` callback is
+          // guaranteed to fire on every platform -- the whole reason this
+          // guard exists, alongside the test's own timeout option above.
+          // Without it, a stall here hangs this promise forever, and a
+          // hang is worse than a failure: it burns the runner and reports
+          // nothing. `unref()`'d so it can never by itself keep the event
+          // loop alive, and cleared on the normal path in `done()`.
+          const guard = setTimeout(() => {
+            if (!settled) {
+              settled = true;
+              reject(new Error("chunked-body test: neither an error nor a response arrived before the guard timer"));
+            }
+          }, 10000);
+          guard.unref();
+          const done = () => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(guard);
+              resolve();
+            }
+          };
+          const req = httpRequest(
+            {
+              host: handle.host,
+              port: handle.port,
+              path: "/mcp",
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${handle.token}`,
+                "Content-Type": "application/json",
+                // The SDK's own transport 406s a request missing this before
+                // ever reading the body -- without it, the test would "pass"
+                // by getting a fast, unrelated rejection instead of actually
+                // exercising the byte-counting safeguard.
+                Accept: "application/json, text/event-stream",
+                "Mcp-Session-Id": sessionId,
+                // Deliberately no Content-Length: node:http then sends this as
+                // a chunked request, the case the header check alone cannot
+                // catch -- the byte-counting safeguard must cut it off instead.
+              },
             },
-          },
-          (res) => {
-            res.resume();
-            res.on("end", () => {
-              outcome = "response";
-              done();
-            });
-          },
-        );
-        req.on("error", () => {
-          outcome = "connection-error";
-          done();
-        });
-        const chunk = Buffer.alloc(1024 * 1024, "a");
-        const totalChunks = Math.ceil((MAX_REQUEST_BODY_BYTES + 5 * 1024 * 1024) / chunk.length);
-        let sent = 0;
-        function pump(): void {
-          if (settled || sent >= totalChunks) {
-            if (!settled) req.end();
-            return;
-          }
-          sent += 1;
-          // Stop pumping the moment a write itself reports failure (the
-          // destroyed-socket case this test exists to trigger) instead of
-          // writing again -- a further write on a torn-down socket fires its
-          // error asynchronously, after this promise has already settled,
-          // which read back as an uncaught exception rather than a clean
-          // pass/fail.
-          req.write(chunk, (err) => {
-            if (err) {
-              outcome = "connection-error";
-              done();
+            (res) => {
+              res.resume();
+              res.on("end", () => {
+                outcome = "response";
+                done();
+              });
+            },
+          );
+          req.on("error", () => {
+            outcome = "connection-error";
+            done();
+          });
+          const chunk = Buffer.alloc(1024 * 1024, "a");
+          const totalChunks = Math.ceil((MAX_REQUEST_BODY_BYTES + 5 * 1024 * 1024) / chunk.length);
+          let sent = 0;
+          function pump(): void {
+            if (settled || sent >= totalChunks) {
+              if (!settled) req.end();
               return;
             }
-            pump();
-          });
-        }
-        pump();
-      });
-      assert.equal(
-        outcome,
-        "connection-error",
-        "an oversized chunked body with no Content-Length must have its connection cut, not complete as a normal response",
-      );
-    } finally {
-      await client.close();
-    }
-  });
-});
+            sent += 1;
+            // Stop pumping the moment a write itself reports failure (the
+            // destroyed-socket case this test exists to trigger) instead of
+            // writing again -- a further write on a torn-down socket fires its
+            // error asynchronously, after this promise has already settled,
+            // which read back as an uncaught exception rather than a clean
+            // pass/fail.
+            req.write(chunk, (err) => {
+              if (err) {
+                outcome = "connection-error";
+                done();
+                return;
+              }
+              pump();
+            });
+          }
+          pump();
+        });
+        assert.equal(
+          outcome,
+          "connection-error",
+          "an oversized chunked body with no Content-Length must have its connection cut, not complete as a normal response",
+        );
+      } finally {
+        await client.close();
+      }
+    });
+  },
+);
 
 test("Host header enforcement: a foreign Host is refused while loopback forms are accepted", async () => {
   await withDaemon(async (handle) => {

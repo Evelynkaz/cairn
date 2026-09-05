@@ -2,6 +2,7 @@ import type { SqliteDriver } from "../driver/index.js";
 import { migration001 } from "./001-init.js";
 import { migration002 } from "./002-redactions.js";
 import { migration003 } from "./003-importance-index.js";
+import { migration004 } from "./004-provenance.js";
 
 export interface Migration {
   version: number;
@@ -10,7 +11,7 @@ export interface Migration {
 }
 
 // Sorted ascending by version.
-export const migrations: Migration[] = [migration001, migration002, migration003];
+export const migrations: Migration[] = [migration001, migration002, migration003, migration004];
 
 function userVersion(driver: SqliteDriver): number {
   const row = driver.prepare("PRAGMA user_version").get();

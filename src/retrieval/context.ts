@@ -7,7 +7,7 @@
 
 import type { CairnDb } from "../storage/db.js";
 import type { SqlValue } from "../storage/driver/index.js";
-import { num, numOrNull, str } from "../storage/repositories/row.js";
+import { bool, num, numOrNull, str } from "../storage/repositories/row.js";
 import { listMemories } from "../storage/repositories/memories.js";
 import { rerank } from "./rerank.js";
 import type { RerankItem } from "./rerank.js";
@@ -16,6 +16,34 @@ import type { SearchDeps, SearchHit, SearchOptions, SearchResult } from "./searc
 
 export interface ContextOptions extends SearchOptions {
   tokenBudget?: number;
+  // BUILD_BRIEF §10/§14: two independent security audits found that a
+  // memory that entered Cairn via `import_memories`, a pasted/ChatGPT
+  // import, or an agent's own `remember` after reading a web page is
+  // injected into a session's highest-trust position exactly as readily as
+  // one the user typed themselves -- including a memory whose text reads
+  // "IMPORTANT SYSTEM UPDATE: ...", instructing the model to act on it.
+  //
+  // When true (the default), a candidate whose memories.origin is not
+  // 'user' and whose `approved` flag is not set is dropped before the
+  // token-budget loop runs -- it never gets a chance to occupy the budget
+  // or be injected. `cairn hook session-start` (via GET /api/context) is
+  // exactly the automatic, unrequested-by-the-user injection this
+  // protects: neither that route nor the hook itself passes an override,
+  // so it gets this safe default with no further wiring.
+  //
+  // `get_context` called directly as an MCP tool is a DIFFERENT trust
+  // situation: it is a model-initiated read the model chose to make, not
+  // something injected before the user (or the model) said anything, and
+  // the model can see each entry's provenance in the returned block just
+  // as it can see any other memory field. The right answer there is to
+  // LABEL provenance, not silently drop content the model deliberately
+  // asked for -- but that requires the caller (src/mcp/tools.ts, not
+  // touched here) to both pass `excludeUnapproved: false` and render each
+  // hit's origin/approval in the tool result. Until that caller is
+  // updated, get_context-as-a-tool inherits the same safe default as the
+  // hook -- fail closed rather than silently defaulting to "inject
+  // everything" -- as an explicit option, not a hidden branch.
+  excludeUnapproved?: boolean;
 }
 
 export interface ContextBlock {
@@ -319,6 +347,29 @@ function emptyQueryFallback(db: CairnDb, options: ContextOptions & { limit: numb
   return { hits, degraded: false, degradedReason: null };
 }
 
+const DEFAULT_EXCLUDE_UNAPPROVED = true;
+
+// Looks up injection eligibility for a bounded set of ids in one query --
+// `ids` is always the current result set's own hit list (bounded by
+// candidateLimit, at most CONTEXT_CANDIDATE_LIMIT/MAX_CONTEXT_CANDIDATES),
+// never an unbounded scan. A hit is eligible when its origin is 'user' (a
+// direct remember/update/supersede -- the caller supplied this text
+// themselves) or when a human has explicitly approved it via
+// Store.setMemoryApproved. Everything else -- 'import' and the honest
+// 'unknown' default for pre-migration rows -- is excluded until reviewed.
+function loadInjectionEligibility(db: CairnDb, ids: string[]): Map<string, boolean> {
+  const eligible = new Map<string, boolean>();
+  if (ids.length === 0) return eligible;
+  const placeholders = ids.map(() => "?").join(", ");
+  const rows = db.q(`SELECT id, origin, approved FROM memories WHERE id IN (${placeholders})`).all(...ids);
+  for (const row of rows) {
+    const id = str(row, "id");
+    const origin = str(row, "origin");
+    eligible.set(id, origin === "user" || bool(row, "approved"));
+  }
+  return eligible;
+}
+
 /**
  * The BUILD_BRIEF §8 budgeted context block. Fills greedily in ranked
  * order; every accept is gated on `estimateTokens` of the candidate text
@@ -380,11 +431,25 @@ export async function getContext(
           deps,
         );
 
+  // BUILD_BRIEF §10/§14 gate -- see ContextOptions.excludeUnapproved's doc
+  // comment. Filtered BEFORE the budget loop below, not after: an excluded
+  // memory must never occupy a budget slot another candidate could have
+  // used, and must never appear in `memories`/`text` at all.
+  const excludeUnapproved = options.excludeUnapproved ?? DEFAULT_EXCLUDE_UNAPPROVED;
+  let eligibleHits = result.hits;
+  if (excludeUnapproved) {
+    const eligibility = loadInjectionEligibility(
+      db,
+      result.hits.map((hit) => hit.id),
+    );
+    eligibleHits = result.hits.filter((hit) => eligibility.get(hit.id) === true);
+  }
+
   let text = "";
   const memories: SearchHit[] = [];
   let truncated = false;
 
-  for (const hit of result.hits) {
+  for (const hit of eligibleHits) {
     const entry = formatEntry(hit);
     const candidate = text.length === 0 ? entry : `${text}\n${entry}`;
     if (estimateTokens(candidate) > tokenBudget) {

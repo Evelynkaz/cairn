@@ -14,6 +14,7 @@ import {
   listMemories,
   memoriesAsOf,
   restoreMemory,
+  setMemoryApproved,
   softDeleteMemory,
   supersedeMemory,
   touchMemory,
@@ -916,5 +917,102 @@ test("importMemory: an id embedding an implausible timestamp produces a bounded 
       assert.ok(err.message.length < 200, `expected a bounded message, got length ${err.message.length}`);
       return true;
     });
+  });
+});
+
+// BUILD_BRIEF §10/§14 provenance (migrations/004-provenance.ts): a direct
+// createMemory (what `remember` calls) is 'user'-origin by default, and
+// never pre-approved -- 'user' origin does not need it.
+test("createMemory defaults to origin 'user', approved false", () => {
+  withDb((db) => {
+    const { memory } = createMemory(db, { text: "typed directly" });
+    assert.equal(memory.origin, "user");
+    assert.equal(memory.approved, false);
+  });
+});
+
+// importMemory always stamps 'import' and approved false, and NEVER trusts
+// a caller-supplied claim to the contrary -- a crafted archive setting
+// `approved: true` on itself must not self-certify as trusted, or the
+// entire point of this column is defeated. importMemory's own input type
+// has no `approved`/`origin` fields at all, so this also checks that a
+// caller cannot smuggle either past TypeScript via an `as` cast.
+test("importMemory always stamps origin 'import' and approved false, regardless of any extra input fields", () => {
+  withDb((db) => {
+    const result = importMemory(db, {
+      id: uuidv7(),
+      text: "arrived via import",
+      ...({ origin: "user", approved: true } as Record<string, unknown>),
+    });
+    assert.equal(result.skipped, false);
+    assert.equal(result.memory?.origin, "import");
+    assert.equal(result.memory?.approved, false);
+  });
+});
+
+// updateMemory: a text replacement is fresh content supplied by THIS
+// call's caller, so it is stamped 'user' -- promoting even a previously
+// 'import'/'unknown' row, since the caller is now vouching for the new
+// text directly. A tags/importance-only patch (no text change) must NOT
+// touch origin at all.
+test("updateMemory: replacing text stamps origin 'user'; a tags-only patch leaves origin untouched", () => {
+  withDb((db) => {
+    const imported = importMemory(db, { id: uuidv7(), text: "from an import" }).memory!;
+    assert.equal(imported.origin, "import");
+
+    const tagged = updateMemory(db, imported.id, { tags: ["x"] });
+    assert.equal(tagged.origin, "import", "a tags-only patch must not touch origin");
+
+    const edited = updateMemory(db, imported.id, { text: "rewritten by the caller" });
+    assert.equal(edited.origin, "user", "a text replacement must stamp 'user'");
+  });
+});
+
+// supersedeMemory: the replacement's text is fresh input from THIS call's
+// caller (the dashboard's edit-and-supersede flow), so it is stamped
+// 'user' regardless of the predecessor's own origin. The superseded
+// (predecessor) row is history (§5) and keeps its own origin untouched.
+test("supersedeMemory: the replacement is stamped origin 'user'; the superseded predecessor's origin is untouched", () => {
+  withDb((db) => {
+    const imported = importMemory(db, { id: uuidv7(), text: "predecessor from an import" }).memory!;
+    const { superseded, replacement } = supersedeMemory(db, imported.id, { text: "fresh replacement text" });
+    assert.equal(superseded.origin, "import", "the superseded row's own origin must not be rewritten");
+    assert.equal(replacement.origin, "user");
+  });
+});
+
+test("setMemoryApproved flips the approved flag and throws for a missing id", () => {
+  withDb((db) => {
+    const imported = importMemory(db, { id: uuidv7(), text: "needs review" }).memory!;
+    assert.equal(imported.approved, false);
+
+    const approved = setMemoryApproved(db, imported.id, true);
+    assert.equal(approved.approved, true);
+    assert.equal(getMemory(db, imported.id)?.approved, true);
+
+    const revoked = setMemoryApproved(db, imported.id, false);
+    assert.equal(revoked.approved, false);
+
+    assert.throws(() => setMemoryApproved(db, "does-not-exist", true), /not found/);
+  });
+});
+
+// Pre-existing rows predate origin/approved entirely (migrations/
+// 004-provenance.ts): a raw row inserted before this column existed gets
+// the honest 'unknown' default and approved=0, exactly like a fresh row
+// that never specifies either -- proven here directly against the schema
+// default rather than the migration path (migrations.test.ts covers the
+// migration itself).
+test("a row with no origin/approved specified gets the schema's honest defaults ('unknown', false)", () => {
+  withDb((db) => {
+    const id = uuidv7();
+    const now = Date.now();
+    db.q(
+      `INSERT INTO memories (id, text, scope, created_at, updated_at, valid_from, content_hash)
+       VALUES (?, ?, 'default', ?, ?, ?, ?)`,
+    ).run(id, "predates provenance", now, now, now, contentHash("predates provenance"));
+    const row = getMemory(db, id);
+    assert.equal(row?.origin, "unknown");
+    assert.equal(row?.approved, false);
   });
 });

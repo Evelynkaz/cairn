@@ -6,7 +6,16 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { createSseFrameParser, parseSseEvent, getTimeline, getAudit, deleteEverything, putPrivacy } from "./api-client.js";
+import {
+  createSseFrameParser,
+  parseSseEvent,
+  getTimeline,
+  getAudit,
+  deleteEverything,
+  putPrivacy,
+  approveMemory,
+  bulkOp,
+} from "./api-client.js";
 
 // The data-layer functions above all go through request(), which reads
 // getToken() (backed by sessionStorage) and calls the global fetch() --
@@ -71,6 +80,32 @@ test("putPrivacy sends the mode in the body", async () => {
   }) as typeof fetch;
   await putPrivacy("on");
   assert.deepEqual(capturedBody, { mode: "on" });
+});
+
+test("approveMemory posts to /api/memories/:id/approve with the approved flag in the body", async () => {
+  let capturedUrl = "";
+  let capturedMethod = "";
+  let capturedBody: unknown;
+  globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+    capturedUrl = String(url);
+    capturedMethod = init?.method ?? "";
+    capturedBody = init?.body ? JSON.parse(String(init.body)) : undefined;
+    return new Response(JSON.stringify({ id: "mem_1", approved: true }), { status: 200 });
+  }) as typeof fetch;
+  await approveMemory("mem 1", true);
+  assert.equal(capturedMethod, "POST");
+  assert.ok(capturedUrl.endsWith("/api/memories/mem%201/approve"), capturedUrl);
+  assert.deepEqual(capturedBody, { approved: true });
+});
+
+test("bulkOp with approve sends the op and ids", async () => {
+  let capturedBody: unknown;
+  globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+    capturedBody = init?.body ? JSON.parse(String(init.body)) : undefined;
+    return new Response(JSON.stringify({ op: "approve", results: [], count: 0 }), { status: 200 });
+  }) as typeof fetch;
+  await bulkOp("approve", ["a", "b"]);
+  assert.deepEqual(capturedBody, { op: "approve", ids: ["a", "b"] });
 });
 
 // A CRLF-framed heartbeat followed by a CRLF-framed real event -- a

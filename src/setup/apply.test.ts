@@ -388,7 +388,11 @@ test("atomic write: mode of the original file is carried onto the replacement", 
   });
 });
 
-test("atomic write: a 0600 original file's mode is preserved across an update", () => {
+test("atomic write: a 0600 original file's mode is preserved across an update", (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX file mode bits are not meaningful on Windows");
+    return;
+  }
   withTempDir((dir) => {
     const configPath = join(dir, "mcp.json");
     writeFileSync(configPath, JSON.stringify({ mcpServers: { other: { command: "foo" } } }, null, 2), "utf8");
@@ -399,7 +403,11 @@ test("atomic write: a 0600 original file's mode is preserved across an update", 
   });
 });
 
-test("created: a new config is 0600 and a newly created directory is 0700", () => {
+test("created: a new config is 0600 and a newly created directory is 0700", (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX file mode bits are not meaningful on Windows");
+    return;
+  }
   withTempDir((dir) => {
     const configPath = join(dir, "sub", "mcp.json");
     const result = applyToClient(target(configPath));

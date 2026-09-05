@@ -92,6 +92,18 @@ function hitToJson(hit: SearchHit): Record<string, unknown> {
     tags: hit.tags,
     importance: hit.importance,
     createdAt: hit.createdAt,
+    // recall and get_context-as-a-tool are both MODEL-INITIATED reads --
+    // the model asked deliberately, unlike the automatic SessionStart
+    // injection src/retrieval/context.ts's excludeUnapproved gates -- so
+    // neither one drops a non-'user' hit here; both LABEL it instead, so
+    // the model can see a memory came from an import (or is otherwise
+    // unreviewed) and weigh it accordingly rather than trusting it
+    // verbatim. `hit.origin`/`hit.approved` are only undefined for a hit
+    // built by context.ts's empty-query fallback, which does not carry
+    // them (see SearchHit's doc) -- 'unknown' is the honest, least-trusted
+    // reading of "we don't know", never treated as 'user'.
+    origin: hit.origin ?? "unknown",
+    approved: hit.approved ?? false,
   };
 }
 
@@ -236,7 +248,13 @@ export function withBoundedErrors<Args extends unknown[], Result>(
       return await handler(...args);
     } catch (err) {
       if (err instanceof Error) {
-        err.message = clampErrorMessage(err.message);
+        try {
+          err.message = clampErrorMessage(err.message);
+        } catch {
+          // A getter-only `message` (e.g. zod's ZodError) can't be
+          // reassigned -- degrade to leaving it unclamped rather than
+          // replacing the real error with a TypeError.
+        }
       }
       throw err;
     }
@@ -268,6 +286,24 @@ function resolveWithinCairnHome(requested: string): string {
   return candidate;
 }
 
+// The comparison base for verifyExportDirNotSymlinkedOutOfHome: resolving
+// `realDir` through realpathSync but comparing it against the LEXICAL home
+// (as resolveWithinCairnHome does) can never agree if any component ABOVE
+// the home is itself a symlink -- e.g. macOS's `$TMPDIR` under
+// `/var/folders/...`, where `/var` -> `private/var` is a fixed property of
+// the OS, not an attack. That made every export refuse unconditionally on
+// macOS. realpath the home itself the same way before comparing; fall back
+// to the unresolved home if that throws (e.g. it doesn't exist yet) so the
+// check degrades to its old behaviour rather than crashing.
+function realCairnHome(): string {
+  const home = resolve(ensureHome(resolveCairnHome()));
+  try {
+    return realpathSync(home);
+  } catch {
+    return home;
+  }
+}
+
 // resolveWithinCairnHome's containment check is purely lexical (plain
 // `resolve()`), so it never sees a symlink in a PARENT component of the
 // candidate path -- a directory under the home that is actually a symlink
@@ -277,11 +313,20 @@ function resolveWithinCairnHome(requested: string): string {
 // created in. This is the additional gate: resolve the candidate's real
 // parent directory and re-check containment against that.
 function verifyExportDirNotSymlinkedOutOfHome(candidate: string): void {
-  const home = resolve(ensureHome(resolveCairnHome()));
+  const home = realCairnHome();
   let realDir: string;
   try {
     realDir = realpathSync(dirname(candidate));
-  } catch {
+  } catch (err) {
+    // ENOENT here means the target directory just doesn't exist yet (e.g.
+    // a subdirectory under the home the user hasn't created) -- a real
+    // write failure, not a containment violation. Anything else (e.g. an
+    // ELOOP symlink cycle) stays refused as a containment failure, out of
+    // caution.
+    const code = err && typeof err === "object" && "code" in err ? (err as NodeJS.ErrnoException).code : undefined;
+    if (code === "ENOENT") {
+      throw new Error("export_memories: failed to write the archive");
+    }
     throw new Error("export_memories: path must be inside the Cairn home directory");
   }
   if (realDir !== home && !realDir.startsWith(home + sep)) {
@@ -314,6 +359,25 @@ function verifyExportDirNotSymlinkedOutOfHome(candidate: string): void {
 // the live WAL file.
 const PROTECTED_HOME_FILENAMES = new Set(["cairn.db", "cairn.db-wal", "cairn.db-shm", "daemon.json"]);
 
+// Windows' reserved device names (case-insensitive, with or without an
+// extension -- "nul", "NUL.txt", and "Nul.zip" are all the same device).
+// Refused on every platform, not just Windows: `export_memories({ path:
+// "NUL" })` resolves lexically inside the home and passes both other
+// guards, and `writeFileSync(..., { flag: "wx" })` would then open the
+// device -- CON writes to the console, and COM1 on a machine with a serial
+// port can block the daemon's single thread indefinitely. That is reachable
+// by a prompt-injected model, exactly the threat this guard exists for. An
+// archive or a path can travel between platforms, so a name that is a
+// device on one should not be produced on any of them.
+const RESERVED_DEVICE_NAMES = new Set([
+  "con",
+  "prn",
+  "aux",
+  "nul",
+  "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+  "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+]);
+
 function refuseCairnOwnedPath(candidate: string): void {
   const home = resolveCairnHome();
   const db = dbPath(home);
@@ -327,6 +391,10 @@ function refuseCairnOwnedPath(candidate: string): void {
   }
   const normalizedBase = base.replace(/[. ]+$/, "").toLowerCase();
   if (PROTECTED_HOME_FILENAMES.has(normalizedBase)) {
+    throw new Error("export_memories: path must be inside the Cairn home directory");
+  }
+  const stem = normalizedBase.replace(/\.[^.]*$/, "");
+  if (RESERVED_DEVICE_NAMES.has(stem)) {
     throw new Error("export_memories: path must be inside the Cairn home directory");
   }
 }
@@ -507,6 +575,21 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
           now: nowOverride(),
           provider: deps.provider ?? null,
           space: deps.space ?? null,
+          // DELIBERATE, and the opposite of what the SessionStart hook must
+          // do: `excludeUnapproved` defaults to true because automatic
+          // injection (GET /api/context, called before the user or model
+          // has said anything) must never inject unreviewed content (§10/
+          // §14 -- see context.ts's ContextOptions.excludeUnapproved doc).
+          // get_context called HERE, as an MCP tool, is the model asking on
+          // its own initiative -- excluding would silently break §1's
+          // portability promise for anyone who imported a ChatGPT/Claude
+          // export and can then never retrieve it. So this path labels
+          // provenance instead of excluding it (see hitToJson above). Do
+          // NOT "align" this with the hook's default -- that would either
+          // reopen the injection channel (if the hook stopped excluding) or
+          // break portability (if this tool started excluding); they are
+          // two different trust situations by design.
+          excludeUnapproved: false,
         },
         callContext(server, args.scope),
       );

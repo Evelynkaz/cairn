@@ -8,6 +8,13 @@ export type EpisodeId = string;
 
 export const DEFAULT_SCOPE = "default";
 
+// See migrations/004-provenance.ts for the full reasoning. 'user' is a
+// direct remember/update/supersede from an MCP client or the dashboard;
+// 'import' is anything that entered through importMemory/importEpisode or a
+// vendor importer built on it; 'unknown' is a row that predates this
+// column and carries no provenance record at all.
+export type MemoryOrigin = "user" | "import" | "unknown";
+
 export interface Episode {
   id: EpisodeId;
   content: string;
@@ -36,6 +43,12 @@ export interface Memory {
   redacted: boolean;
   contentHash: string;
   tags: string[];
+  origin: MemoryOrigin;
+  // Whether a human has vetted a non-'user' memory as trusted for automatic
+  // SessionStart injection (see src/retrieval/context.ts). Meaningless for
+  // 'user'-origin memories, which are already eligible regardless of this
+  // flag.
+  approved: boolean;
 }
 
 export interface AuditEvent {

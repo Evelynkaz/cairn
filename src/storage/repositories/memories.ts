@@ -4,7 +4,7 @@
 import type { CairnDb } from "../db.js";
 import type { Row, SqlValue } from "../driver/index.js";
 import { DEFAULT_SCOPE } from "../types.js";
-import type { Memory } from "../types.js";
+import type { Memory, MemoryOrigin } from "../types.js";
 import { timestampFromUuidv7, uuidv7 } from "../../util/id.js";
 import { contentHash } from "../../util/text.js";
 import { bool, num, numOrNull, str, strOrNull } from "./row.js";
@@ -38,7 +38,7 @@ export class LiveTextCollisionError extends Error {
 const MEMORY_COLUMNS =
   "id, seq, text, scope, source_client, importance, created_at, updated_at, " +
   "last_accessed, access_count, valid_from, valid_until, superseded_by, " +
-  "episode_id, deleted_at, redacted, content_hash";
+  "episode_id, deleted_at, redacted, content_hash, origin, approved";
 
 // BUILD_BRIEF §6/§5: importance is 0-1 on the MCP surface. A bare CHECK
 // constraint failure is opaque, so reject out-of-range values here with a
@@ -74,6 +74,8 @@ function rowToMemory(row: Row, tags: string[]): Memory {
     redacted: bool(row, "redacted"),
     contentHash: str(row, "content_hash"),
     tags,
+    origin: str(row, "origin") as MemoryOrigin,
+    approved: bool(row, "approved"),
   };
 }
 
@@ -106,6 +108,13 @@ export function createMemory(
     importance?: number;
     episodeId?: string | null;
     redacted?: boolean;
+    // Provenance of THIS write (see types.ts's MemoryOrigin). Defaults to
+    // 'user' -- createMemory backs `remember`, and the Store layer is the
+    // only caller that ever has reason to pass something else (see
+    // store.ts's remember(), which passes 'import' only for the dashboard's
+    // own vendor-importer glue code, never for an ordinary MCP/dashboard
+    // remember).
+    origin?: MemoryOrigin;
   },
 ): { memory: Memory; deduped: boolean } {
   checkImportance(input.importance);
@@ -113,6 +122,7 @@ export function createMemory(
   const tags = uniqueSorted(input.tags ?? []);
   const hash = contentHash(input.text);
   const importance = input.importance ?? 0.5;
+  const origin: MemoryOrigin = input.origin ?? "user";
 
   return db.tx(() => {
     // Dedupe lookup: this is the intended path for the partial unique
@@ -157,8 +167,8 @@ export function createMemory(
     db.q(
       `INSERT INTO memories
          (id, text, scope, source_client, importance, created_at, updated_at,
-          valid_from, episode_id, redacted, content_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          valid_from, episode_id, redacted, content_hash, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       input.text,
@@ -171,6 +181,7 @@ export function createMemory(
       input.episodeId ?? null,
       input.redacted ? 1 : 0,
       hash,
+      origin,
     );
     replaceTags(db, id, tags);
     const memory = getMemory(db, id);
@@ -283,11 +294,19 @@ export function importMemory(
     const updatedAt = input.updatedAt ?? createdAt;
     const validFrom = input.validFrom ?? createdAt;
 
+    // origin is always 'import' and approved is always 0, regardless of
+    // anything the archive itself carries: an archive is a file from
+    // anywhere (see store.ts's importMemory doc comment on `redacted` for
+    // the same reasoning), so a hostile archive that claimed 'user' origin
+    // or approved: true on itself would defeat the entire point of this
+    // column -- letting a poisoned import self-certify as trusted. Neither
+    // value is even accepted as an input field on this function; both are
+    // hardcoded here.
     db.q(
       `INSERT INTO memories
          (id, text, scope, source_client, importance, created_at, updated_at,
-          valid_from, valid_until, deleted_at, redacted, content_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          valid_from, valid_until, deleted_at, redacted, content_hash, origin, approved)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'import', 0)`,
     ).run(
       input.id,
       input.text,
@@ -452,8 +471,13 @@ export function updateMemory(
           );
         }
       }
-      sets.push("text = ?", "content_hash = ?");
-      params.push(patch.text, hash);
+      // A text replacement is fresh content supplied by THIS call's
+      // caller, not text carried in from a file -- same reasoning as
+      // `remember`'s own 'user' stamp. Only touched when text actually
+      // changes: a tags/importance-only patch does not re-ingest content
+      // and must not silently promote an 'import'/'unknown' row.
+      sets.push("text = ?", "content_hash = ?", "origin = ?");
+      params.push(patch.text, hash, "user");
     }
     if (patch.importance !== undefined) {
       sets.push("importance = ?");
@@ -582,11 +606,17 @@ export function supersedeMemory(
     // two intervals exactly adjacent and disjoint. created_at is still
     // derived from the id and is deliberately left as-is; only valid_from
     // moves.
+    // The replacement's origin is always 'user': supersedeMemory writes
+    // brand-new text supplied directly by THIS call's caller (a dashboard
+    // or MCP edit), never text carried in from a file -- same reasoning as
+    // updateMemory's own text-replacement path above. The SUPERSEDED row's
+    // own origin is left exactly as it was; it is history now (§5), not
+    // something this call rewrites.
     db.q(
       `INSERT INTO memories
          (id, text, scope, source_client, importance, created_at, updated_at,
-          valid_from, episode_id, redacted, content_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          valid_from, episode_id, redacted, content_hash, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'user')`,
     ).run(
       id,
       input.text,
@@ -624,6 +654,23 @@ export function touchMemory(db: CairnDb, id: string): void {
     Date.now(),
     id,
   );
+}
+
+// The dashboard's one-way door for trusting a non-'user' memory: sets
+// `approved`, which src/retrieval/context.ts's SessionStart gate treats as
+// equivalent to 'user' origin for injection purposes. Deliberately a plain
+// setter with no origin check -- approving an already-'user' memory is a
+// harmless no-op, not an error worth refusing.
+export function setMemoryApproved(db: CairnDb, id: string, approved: boolean): Memory {
+  const result = db.q(`UPDATE memories SET approved = ? WHERE id = ?`).run(approved ? 1 : 0, id);
+  if (result.changes === 0) {
+    throw new Error(`memory not found: ${safeValue(id)}`);
+  }
+  const memory = getMemory(db, id);
+  if (!memory) {
+    throw new Error(`memory ${safeValue(id)} vanished after approval update`);
+  }
+  return memory;
 }
 
 export function memoriesAsOf(

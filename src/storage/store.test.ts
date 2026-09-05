@@ -142,6 +142,7 @@ const GATED_METHODS: Record<string, GatedInvoke> = {
   recall: (store, _id, ctx) => store.recall("gate probe", {}, ctx),
   context: (store, _id, ctx) => store.context("gate probe", {}, ctx),
   update: (store, id, ctx) => store.update(id, { text: "gate probe" }, ctx),
+  setMemoryApproved: (store, id, ctx) => store.setMemoryApproved(id, true, ctx),
   forget: (store, id, ctx) => store.forget(id, ctx),
   forgetWhere: (store, _id, ctx) => store.forgetWhere("gate probe", {}, ctx),
   restore: (store, id, ctx) => store.restore(id, ctx),
@@ -1545,5 +1546,98 @@ test("redaction still fires on all four ingest paths (remember/update/supersede/
 
     assert.equal(dbContainsRawBytes(store.db, AWS_KEY), false);
     assert.equal(dbContainsRawBytes(store.db, GH_TOKEN), false);
+  });
+});
+
+// BUILD_BRIEF §10/§14 provenance: an ordinary remember() (any MCP client or
+// the dashboard) is 'user'-origin. The `ctx.origin: "import"` override
+// exists ONLY for trusted first-party server-side code (e.g. a future
+// dashboard vendor-importer handler writing through remember() on behalf of
+// a pasted/ChatGPT export) -- it must never be reachable from an ordinary
+// call with no ctx, or from any value other than the literal 'import'.
+test("remember: ordinary calls are 'user'-origin; ctx.origin: 'import' downgrades, anything else does not", () => {
+  withStore((store) => {
+    const ordinary = store.remember({ content: "typed by the user" });
+    assert.equal(ordinary.memory.origin, "user");
+
+    const downgraded = store.remember({ content: "ingested on the user's behalf from a file" }, { origin: "import" });
+    assert.equal(downgraded.memory.origin, "import");
+
+    const garbage = store.remember(
+      { content: "an unrecognised override must not elevate trust" },
+      { origin: "unknown" },
+    );
+    assert.equal(garbage.memory.origin, "user");
+  });
+});
+
+test("setMemoryApproved: gated, audited as update_memory, and flips the flag", () => {
+  withStore((store) => {
+    const importedId = uuidv7();
+    const { memory } = store.importMemory({ id: importedId, text: "arrived via import" });
+    assert.ok(memory);
+    assert.equal(memory!.origin, "import");
+    assert.equal(memory!.approved, false);
+
+    const approved = store.setMemoryApproved(importedId, true, { sourceClient: "dashboard" });
+    assert.equal(approved.approved, true);
+    assert.equal(store.get(importedId)?.approved, true);
+
+    const { items } = store.auditLog({ action: "update_memory", sourceClient: "dashboard" });
+    const approvalEvent = items.find((e) => e.memoryId === importedId);
+    assert.ok(approvalEvent);
+    assert.equal(approvalEvent?.details?.["approved"], true);
+  });
+});
+
+test("setMemoryApproved refuses on a read-only store", () => {
+  withTempDir((dir) => {
+    const path = tempDbPath(dir);
+    const writable = openStore({ path });
+    const { memory } = writable.importMemory({ id: uuidv7(), text: "arrived via import" });
+    writable.close();
+
+    const readOnlyStore = openStore({ path, readOnly: true });
+    try {
+      assert.throws(() => readOnlyStore.setMemoryApproved(memory!.id, true), /read-only/);
+    } finally {
+      readOnlyStore.close();
+    }
+  });
+});
+
+// Export/import round trip (BUILD_BRIEF §10/§14, accept criteria): `origin`
+// is preserved as a CONCEPT across a re-import, not literally copied --
+// importMemory always stamps 'import' regardless of what the row's own
+// prior origin was, because a file is a file regardless of what it claims
+// about its own contents (see repositories/memories.ts's importMemory
+// comment). `approved` deliberately does NOT round-trip through import for
+// the same reason: trusting a caller-supplied `approved: true` on import
+// would let a crafted archive self-approve a poisoned memory, which is
+// exactly the attack this whole feature exists to close. Both properties
+// are exercised directly here at the store level; the on-disk archive
+// format (src/portability/archive.ts) is out of scope for this change --
+// see the notes reported alongside this test suite.
+test("import round trip: origin always becomes 'import' (never re-elevated), and approved never round-trips through import", () => {
+  withStore((store) => {
+    const original = store.remember({ content: "originally typed by the user" }).memory;
+    store.setMemoryApproved(original.id, true);
+    // Forgotten first so the live-content-hash dedupe (idx_memories_live_hash)
+    // does not skip the reimport as a duplicate -- a real cross-store round
+    // trip never has this collision, since the target is a fresh store.
+    store.forget(original.id);
+
+    // Simulate re-importing this same memory's content into a fresh store,
+    // the way archive.ts's exportArchive/importArchive round trip would
+    // (a fresh id, since importMemory refuses to overwrite an existing id).
+    const reimportedId = uuidv7();
+    const reimported = store.importMemory({ id: reimportedId, text: original.text });
+    assert.equal(reimported.skipped, false);
+    assert.equal(reimported.memory?.origin, "import", "re-importing must never re-assert 'user'");
+    assert.equal(
+      reimported.memory?.approved,
+      false,
+      "approved must never be re-asserted by import, even for content that was approved/'user' before",
+    );
   });
 });

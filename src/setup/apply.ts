@@ -129,7 +129,16 @@ function writeConfig(configPath: string, config: Record<string, unknown>, defaul
   let closed = false;
   try {
     writeSync(fd, `${JSON.stringify(config, null, 2)}\n`, null, "utf8");
-    fchmodSync(fd, mode);
+    // openSync's mode argument already applied 0o600 to a new file; this is
+    // best-effort tightening for a PRE-EXISTING file whose mode we're
+    // carrying over. On Windows libuv's fchmod needs FILE_READ_ATTRIBUTES on
+    // a handle opened "wx"-style and can throw -- losing this call costs
+    // nothing, since the file's mode is already set from creation.
+    try {
+      fchmodSync(fd, mode);
+    } catch {
+      // Best-effort: the file's mode from openSync already stands.
+    }
     closeSync(fd);
     closed = true;
     renameSync(tmpPath, target);

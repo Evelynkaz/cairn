@@ -97,6 +97,10 @@ export interface Memory {
   redacted: boolean;
   contentHash: string;
   tags: string[];
+  origin: "user" | "import" | "unknown";
+  // Whether this memory is eligible for SessionStart auto-injection despite
+  // not being 'user'-origin -- see /api/memories/:id/approve below.
+  approved: boolean;
 }
 
 export interface SearchHit {
@@ -110,6 +114,8 @@ export interface SearchHit {
   lastAccessed: number | null;
   accessCount: number;
   score: number;
+  origin?: "user" | "import" | "unknown";
+  approved?: boolean;
 }
 
 export type ListMemoriesResult =
@@ -238,13 +244,20 @@ export function supersedeMemory(
 }
 
 export interface BulkResult {
-  op: "forget" | "restore";
-  results: Array<{ id: string; ok: boolean }>;
+  op: "forget" | "restore" | "approve" | "unapprove";
+  results: Array<{ id: string; ok: boolean; reason?: "conflict" | "not_found" }>;
   count: number;
 }
 
-export function bulkOp(op: "forget" | "restore", ids: string[]): Promise<BulkResult> {
+export function bulkOp(op: "forget" | "restore" | "approve" | "unapprove", ids: string[]): Promise<BulkResult> {
   return request<BulkResult>("POST", "/api/memories/bulk", { op, ids });
+}
+
+// The only human-facing way to make an 'import'/'unknown'-origin memory
+// eligible for SessionStart auto-injection (see src/retrieval/context.ts's
+// excludeUnapproved) -- never set as a side effect of any other write.
+export function approveMemory(id: string, approved: boolean): Promise<Memory> {
+  return request<Memory>("POST", `/api/memories/${encodeURIComponent(id)}/approve`, { approved });
 }
 
 export interface ClientInfo {

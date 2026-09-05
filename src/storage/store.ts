@@ -7,7 +7,7 @@
 import { openDb } from "./db.js";
 import type { CairnDb, DbCapabilities } from "./db.js";
 import type { DriverFactory } from "./driver/index.js";
-import type { Memory, ClientRecord, Episode } from "./types.js";
+import type { Memory, MemoryOrigin, ClientRecord, Episode } from "./types.js";
 import { assertTableName, listVectorSpaces, type VectorSpaceRef } from "./repositories/vectors.js";
 import { appendEpisode, getEpisode, importEpisode as importEpisodeRepo, listEpisodes } from "./repositories/episodes.js";
 import type { ImportEpisodeResult } from "./repositories/episodes.js";
@@ -18,6 +18,7 @@ import {
   listMemories,
   memoriesAsOf,
   restoreMemory,
+  setMemoryApproved,
   softDeleteMemory,
   supersedeMemory,
   touchMemory,
@@ -80,6 +81,17 @@ export interface StoreContextOptions extends ContextOptions {
 export interface CallContext {
   sourceClient?: string | null;
   scope?: string;
+  // Internal-only override for remember()'s provenance stamp (BUILD_BRIEF
+  // §10/§14): defaults to 'user'. NOT for the MCP tool layer to expose to a
+  // connected client -- it exists so first-party server-side glue code that
+  // writes through remember() on a user's behalf from a FILE (e.g. the
+  // dashboard's ChatGPT/pasted-text importer handlers) can mark that write
+  // 'import' instead of silently claiming 'user'. A caller that can set
+  // this is by definition trusted code inside this codebase, not untrusted
+  // input -- the whole point of `origin` is to stop untrusted content from
+  // asserting its own trust level, so this must never be wired to a
+  // client-supplied request field.
+  origin?: MemoryOrigin;
 }
 
 export interface Store {
@@ -160,6 +172,12 @@ export interface Store {
     patch: { text?: string; tags?: string[]; importance?: number },
     ctx?: CallContext,
   ): Memory;
+  // BUILD_BRIEF §10/§14: the dashboard's approval action for a non-'user'
+  // memory. Setting `approved: true` is what src/retrieval/context.ts's
+  // SessionStart gate treats as equivalent to 'user' origin -- the human
+  // review step a non-'user' memory needs before it can be injected
+  // automatically. Approving an already-'user' memory is a harmless no-op.
+  setMemoryApproved(id: string, approved: boolean, ctx?: CallContext): Memory;
   forget(id: string, ctx?: CallContext): boolean;
   // The query-shaped form of forget (BUILD_BRIEF §6): a preview run
   // (confirm falsy) never mutates anything and is gated/audited as a read;
@@ -542,6 +560,10 @@ export function openStore(options: StoreOptions = {}): Store {
       assertMetadataWithinCap(input.metadata);
       const { sourceClient, scope } = gate(ctx, "remember");
       const resolvedScope = input.scope ?? scope;
+      // See CallContext.origin's doc comment: only an explicit 'import'
+      // from trusted first-party code downgrades this write; anything else
+      // (including undefined, the ordinary case) is 'user'.
+      const origin: MemoryOrigin = ctx?.origin === "import" ? "import" : "user";
 
       // §10 redaction runs BEFORE anything is written, and is pure local
       // regex (../privacy/detectors.ts) -- it never calls an LLM or the
@@ -610,6 +632,7 @@ export function openStore(options: StoreOptions = {}): Store {
           importance: input.importance,
           episodeId: episode.id,
           redacted,
+          origin,
         });
         if (redacted) {
           recordRedactions(
@@ -830,6 +853,28 @@ export function openStore(options: StoreOptions = {}): Store {
           memoryId: memory.id,
           scope: memory.scope ?? scope ?? null,
           sourceClient,
+        });
+        return memory;
+      });
+    },
+
+    setMemoryApproved(id, approved, ctx) {
+      requireWritable("setMemoryApproved");
+      // No dedicated action for this in the §6-capped audit vocabulary;
+      // approving is a metadata mutation on the memory row, closest to
+      // update_memory, same reasoning as supersede()'s own audit action
+      // above.
+      const { sourceClient, scope } = gate(ctx, "update_memory");
+      // Invariant: the mutation and its audit row commit together or not
+      // at all -- same reasoning as every other mutation in this file.
+      return db.tx(() => {
+        const memory = setMemoryApproved(db, id, approved);
+        recordAudit(db, {
+          action: "update_memory",
+          memoryId: memory.id,
+          scope: memory.scope ?? scope ?? null,
+          sourceClient,
+          details: { approved },
         });
         return memory;
       });

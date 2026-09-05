@@ -14,6 +14,7 @@ import {
   importPasted,
   importChatGpt,
   bulkOp,
+  approveMemory,
   subscribeToEvents,
   ApiError,
 } from "../api-client.js";
@@ -47,6 +48,8 @@ interface Row {
   deletedAt: number | null;
   validUntil: number | null;
   score: number | null;
+  origin: "user" | "import" | "unknown";
+  approved: boolean;
 }
 
 function memoryToRow(m: Memory): Row {
@@ -62,6 +65,8 @@ function memoryToRow(m: Memory): Row {
     deletedAt: m.deletedAt,
     validUntil: m.validUntil,
     score: null,
+    origin: m.origin,
+    approved: m.approved,
   };
 }
 
@@ -78,7 +83,17 @@ function hitToRow(h: SearchHit): Row {
     deletedAt: null,
     validUntil: null,
     score: h.score,
+    origin: h.origin ?? "unknown",
+    approved: h.approved ?? false,
   };
+}
+
+// A memory is eligible for the "Approve" action exactly when approving it
+// would change something: 'user'-origin memories are already eligible for
+// SessionStart injection (see src/retrieval/context.ts's excludeUnapproved
+// gate), and an already-approved memory needs no further action.
+function needsApproval(row: Row): boolean {
+  return row.origin !== "user" && !row.approved;
 }
 
 function formatDate(ms: number | null): string {
@@ -356,6 +371,31 @@ export function mountMemoriesView(container: HTMLElement): () => void {
       await load();
     } catch (err) {
       error = err instanceof ApiError ? err.message : "Bulk restore failed.";
+      render();
+    }
+  }
+
+  async function handleApprove(id: string): Promise<void> {
+    try {
+      await approveMemory(id, true);
+      await load();
+    } catch (err) {
+      error = err instanceof ApiError ? err.message : "Could not approve that memory.";
+      render();
+    }
+  }
+
+  async function handleBulkApprove(): Promise<void> {
+    // Only the ids that actually need it, not the whole selection -- an
+    // already-eligible id in the same selection is simply left alone.
+    const ids = rows.filter((r) => selected.has(r.id) && needsApproval(r)).map((r) => r.id);
+    if (ids.length === 0) return;
+    try {
+      await bulkOp("approve", ids);
+      selected.clear();
+      await load();
+    } catch (err) {
+      error = err instanceof ApiError ? err.message : "Bulk approve failed.";
       render();
     }
   }
@@ -833,17 +873,23 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     render();
   });
 
+  // Status sits right after Text, not last before Actions: whatever column
+  // sits immediately left of a `position: sticky; right: 0` column gets
+  // painted over whenever the table overflows its viewport, so nothing that
+  // must stay readable (the provenance/approval badges the user is being
+  // asked to act on) can live there. Actions is last by design, so Status
+  // moves away from it instead.
   const theadEl = el("thead", {}, [
     el("tr", {}, [
       el("th", { scope: "col" }, [selectAllCheckbox]),
       el("th", { scope: "col" }, ["Text"]),
+      el("th", { scope: "col" }, ["Status"]),
       el("th", { scope: "col" }, ["Scope"]),
       el("th", { scope: "col" }, ["Tags"]),
       el("th", { scope: "col" }, ["Importance"]),
       el("th", { scope: "col" }, ["Source"]),
       el("th", { scope: "col" }, ["Created"]),
       el("th", { scope: "col" }, ["Updated"]),
-      el("th", { scope: "col" }, ["Status"]),
       el("th", { scope: "col" }, ["Actions"]),
     ]),
   ]);
@@ -858,8 +904,22 @@ export function mountMemoriesView(container: HTMLElement): () => void {
   const bulkBarSlot = el("div", {});
   const toastSlot = el("div", {});
 
+  // BUILD_BRIEF §9/§10: the user is being asked to make a real
+  // prompt-injection decision here, not just tidying metadata -- say what
+  // it means.
+  const approvalHintEl = el("p", { class: "muted approval-hint" }, [
+    "Imported or unknown-origin memories are excluded from the automatic session-start context block until you approve them below; approving one lets it be injected like a memory you typed yourself.",
+  ]);
+
   container.appendChild(
-    el("div", { class: "memories-view" }, [toolbarEl, importPanelSlot, bulkBarSlot, tableContainerEl, toastSlot]),
+    el("div", { class: "memories-view" }, [
+      toolbarEl,
+      approvalHintEl,
+      importPanelSlot,
+      bulkBarSlot,
+      tableContainerEl,
+      toastSlot,
+    ]),
   );
 
   // --- rendering ---------------------------------------------------------
@@ -875,12 +935,15 @@ export function mountMemoriesView(container: HTMLElement): () => void {
       selected.clear();
       render();
     });
-    return el("div", { class: "bulk-bar" }, [
-      el("span", {}, [`${selected.size} selected`]),
-      forgetBtn,
-      restoreBtn,
-      clearBtn,
-    ]);
+    const buttons: HTMLElement[] = [forgetBtn, restoreBtn];
+    // Only shown when it would do something -- see needsApproval's doc.
+    if (rows.some((r) => selected.has(r.id) && needsApproval(r))) {
+      const approveBtn = el("button", { type: "button", class: "btn" }, ["Approve selected"]);
+      approveBtn.addEventListener("click", () => void handleBulkApprove());
+      buttons.push(approveBtn);
+    }
+    buttons.push(clearBtn);
+    return el("div", { class: "bulk-bar" }, [el("span", {}, [`${selected.size} selected`]), ...buttons]);
   }
 
   function rowStatus(row: Row): { label: string; className: string } | null {
@@ -1066,6 +1129,8 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     restoreBtn.addEventListener("click", () => void handleRestore(row.id));
     const supersedeBtn = el("button", { type: "button", class: "btn btn-quiet btn-small" }, ["Supersede"]);
     supersedeBtn.addEventListener("click", () => startSupersede(row));
+    const approveBtn = el("button", { type: "button", class: "btn btn-quiet btn-small" }, ["Approve"]);
+    approveBtn.addEventListener("click", () => void handleApprove(row.id));
 
     const actions: HTMLElement[] = [editBtn];
     if (row.deletedAt !== null) {
@@ -1078,6 +1143,46 @@ export function mountMemoriesView(container: HTMLElement): () => void {
       // status badge.
       if (row.validUntil === null) actions.push(supersedeBtn);
     }
+    // Only shown when it would do something -- see needsApproval's doc.
+    if (needsApproval(row)) actions.push(approveBtn);
+
+    // Same shape of information Status already carries (deleted/superseded),
+    // so it renders alongside that badge rather than in a column of its own
+    // -- see BUILD_BRIEF §9's Provenance fix. Labels stay short; the full
+    // sentence lives in the `title` so the row height never inflates.
+    const provenanceBadges: HTMLElement[] =
+      row.origin === "user"
+        ? []
+        : [
+            el(
+              "span",
+              {
+                class: "badge badge-origin",
+                title:
+                  row.origin === "import"
+                    ? "Imported from outside this session."
+                    : "Origin of this memory is unknown.",
+              },
+              [row.origin === "import" ? "Imported" : "Unknown"],
+            ),
+            ...(row.approved
+              ? []
+              : [
+                  el(
+                    "span",
+                    {
+                      class: "badge badge-unapproved",
+                      title:
+                        "Excluded from the automatic session-start context block until approved.",
+                    },
+                    ["Unapproved"],
+                  ),
+                ]),
+          ];
+    const statusBadges: HTMLElement[] = [
+      ...(status ? [el("span", { class: status.className }, [status.label])] : []),
+      ...provenanceBadges,
+    ];
 
     const tr = el(
       "tr",
@@ -1085,13 +1190,21 @@ export function mountMemoriesView(container: HTMLElement): () => void {
       [
         el("td", {}, [checkbox]),
         textCell,
+        el(
+          "td",
+          { class: "cell-status" },
+          [
+            statusBadges.length > 0
+              ? el("span", { class: "cell-status-inner" }, statusBadges)
+              : text("—"),
+          ],
+        ),
         el("td", {}, [row.scope]),
         el("td", { class: "cell-tags" }, [row.tags.join(", ") || "—"]),
-        el("td", {}, [row.importance.toFixed(2)]),
+        el("td", { class: "cell-importance" }, [row.importance.toFixed(2)]),
         el("td", { class: "cell-source" }, [row.sourceClient ?? "—"]),
         el("td", { class: "cell-timestamp" }, [formatDate(row.createdAt)]),
         el("td", { class: "cell-timestamp" }, [formatDate(row.updatedAt)]),
-        el("td", {}, [status ? el("span", { class: status.className }, [status.label]) : text("—")]),
         el("td", { class: "cell-actions" }, [el("div", { class: "cell-actions-inner" }, actions)]),
       ],
     );

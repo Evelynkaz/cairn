@@ -4,7 +4,8 @@ import { rmSync } from "node:fs";
 import { makeTempDir, tempDbPath } from "../testing/tmp.js";
 import { openDb } from "../storage/db.js";
 import type { CairnDb } from "../storage/db.js";
-import { createMemory, softDeleteMemory } from "../storage/repositories/memories.js";
+import { createMemory, importMemory, setMemoryApproved, softDeleteMemory } from "../storage/repositories/memories.js";
+import { uuidv7 } from "../util/id.js";
 import { ensureVectorSpace, knn } from "../storage/repositories/vectors.js";
 import type { VectorSpaceRef } from "../storage/repositories/vectors.js";
 import { createFakeProvider } from "../embeddings/fake.js";
@@ -787,5 +788,30 @@ test("search: two matching memories both survive the default relevance floor", a
       [a.id, b.id].sort(),
       "both matching memories must survive the default minRelevance floor",
     );
+  });
+});
+
+// GAP 2 (BUILD_BRIEF §10/§14): a caller labelling provenance instead of
+// excluding it (src/mcp/tools.ts's get_context/recall) needs origin/
+// approved ON the hit itself -- this pins that search() actually stamps
+// both, for a plain 'user' write and for an imported, unapproved one.
+test("search: every hit carries its own origin and approved flag", async () => {
+  await withDbAsync(async (db) => {
+    const user = createMemory(db, { text: "kubernetes cluster upgrade checklist" }).memory;
+    const importResult = importMemory(db, { id: uuidv7(), text: "kubernetes cluster upgrade notes from an export" });
+    const imported = importResult.memory!;
+
+    const result = await search(db, "kubernetes cluster upgrade", {}, {});
+    const byId = new Map(result.hits.map((h) => [h.id, h]));
+
+    assert.equal(byId.get(user.id)?.origin, "user");
+    assert.equal(byId.get(user.id)?.approved, false);
+    assert.equal(byId.get(imported.id)?.origin, "import");
+    assert.equal(byId.get(imported.id)?.approved, false);
+
+    setMemoryApproved(db, imported.id, true);
+    const afterApproval = await search(db, "kubernetes cluster upgrade", {}, {});
+    const approvedHit = afterApproval.hits.find((h) => h.id === imported.id);
+    assert.equal(approvedHit?.approved, true, "approved flag must reflect a later approval, not be cached");
   });
 });

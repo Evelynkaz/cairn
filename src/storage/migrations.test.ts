@@ -12,13 +12,13 @@ function userVersion(driver: ReturnType<typeof openNodeSqlite>): number {
   return Number(row?.["user_version"]);
 }
 
-test("fresh database ends at user_version 3", () => {
+test("fresh database ends at user_version 4", () => {
   withTempDir((dir) => {
     const driver = openNodeSqlite({ path: tempDbPath(dir) });
     try {
       const result = runMigrations(driver);
-      assert.deepEqual(result, { from: 0, to: 3 });
-      assert.equal(userVersion(driver), 3);
+      assert.deepEqual(result, { from: 0, to: 4 });
+      assert.equal(userVersion(driver), 4);
     } finally {
       driver.close();
     }
@@ -31,14 +31,14 @@ test("running migrations again is a no-op, including across a fresh connection t
     const driver = openNodeSqlite({ path });
     runMigrations(driver);
     const again = runMigrations(driver);
-    assert.deepEqual(again, { from: 3, to: 3 });
+    assert.deepEqual(again, { from: 4, to: 4 });
     driver.close();
 
     const reopened = openNodeSqlite({ path });
     try {
       assert.doesNotThrow(() => {
         const result = runMigrations(reopened);
-        assert.deepEqual(result, { from: 3, to: 3 });
+        assert.deepEqual(result, { from: 4, to: 4 });
       });
     } finally {
       reopened.close();
@@ -46,7 +46,7 @@ test("running migrations again is a no-op, including across a fresh connection t
   });
 });
 
-test("a database already at version 1 upgrades to 3 WITHOUT re-running migration 001", () => {
+test("a database already at version 1 upgrades to 4 WITHOUT re-running migration 001", () => {
   withTempDir((dir) => {
     const path = tempDbPath(dir);
     const driver = openNodeSqlite({ path });
@@ -67,8 +67,8 @@ test("a database already at version 1 upgrades to 3 WITHOUT re-running migration
       );
 
       const second = runMigrations(driver, migrations);
-      assert.deepEqual(second, { from: 1, to: 3 });
-      assert.equal(userVersion(driver), 3);
+      assert.deepEqual(second, { from: 1, to: 4 });
+      assert.equal(userVersion(driver), 4);
 
       const redactionsTable = driver
         .prepare("select name from sqlite_master where name = 'redactions'")

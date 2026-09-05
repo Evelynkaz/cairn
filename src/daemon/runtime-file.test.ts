@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createServer as createNetServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
@@ -101,6 +101,21 @@ test("writeRuntimeFile does not write the token through a symlink planted at the
     assert.equal(readFileSync(attackerTarget, "utf8"), "not touched");
     assert.ok(!lstatSync(path).isSymbolicLink());
     assert.deepEqual(readRuntimeFile(dir), info);
+  });
+});
+
+test("writeRuntimeFile does not leak its temp file when the final rename fails", () => {
+  withTempDir((dir) => {
+    const path = runtimeFilePath(dir);
+    // A directory sitting at the destination makes the final renameSync
+    // fail (EISDIR/EPERM), simulating any late failure after the temp file
+    // was created -- the leaked-temp-file bug this guards against.
+    mkdirSync(path);
+
+    assert.throws(() => writeRuntimeFile(sampleInfo(), dir));
+
+    const leftover = readdirSync(dir).filter((name) => name.endsWith(".tmp"));
+    assert.deepEqual(leftover, []);
   });
 });
 

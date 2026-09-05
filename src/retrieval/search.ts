@@ -5,7 +5,8 @@
 
 import type { CairnDb } from "../storage/db.js";
 import type { SqlValue } from "../storage/driver/index.js";
-import { num, numOrNull, str } from "../storage/repositories/row.js";
+import { bool, num, numOrNull, str } from "../storage/repositories/row.js";
+import type { MemoryOrigin } from "../storage/types.js";
 import { knn, getVectorsBySeq } from "../storage/repositories/vectors.js";
 import type { VectorSpaceRef } from "../storage/repositories/vectors.js";
 import type { EmbeddingProvider } from "../embeddings/types.js";
@@ -138,6 +139,22 @@ export interface SearchHit {
       reason `coverage` is: so a caller can see WHY a semantic hit was kept,
       not just that it was. */
   vectorDistance: number | null;
+  /** Provenance (BUILD_BRIEF §10/§14, see storage/store.ts's CallContext.origin
+      and storage/types.ts's Memory.origin): 'user' for a direct
+      remember/update/supersede, 'import' for anything written through
+      importMemory or a vendor importer built on it, 'unknown' for a
+      pre-migration row. Populated here from the memories table for every
+      hit `search()` itself produces. Optional because not every SearchHit
+      in this codebase is built by `search()` — src/retrieval/context.ts's
+      empty-query ("what matters right now") fallback constructs its own
+      hits directly from a recency/importance pool and does not carry this;
+      a caller rendering this field must treat `undefined` the same as
+      'unknown' (least-trusted), never as 'user'. */
+  origin?: MemoryOrigin;
+  /** Whether a human has approved this (non-'user') memory for automatic
+      injection (see Memory.approved). Same optionality caveat as `origin`
+      above. */
+  approved?: boolean;
 }
 
 export interface SearchResult {
@@ -356,6 +373,23 @@ function resolveTagMatchingSeqs(
 function tieBreak(aId: string, aScore: number, bId: string, bScore: number): number {
   if (bScore !== aScore) return bScore - aScore;
   return aId < bId ? -1 : aId > bId ? 1 : 0;
+}
+
+// Looks up SearchHit.origin/approved for a bounded set of ids in one query
+// -- `ids` is always this call's own final (post-MMR, post-`limit`) hit
+// list, never an unbounded scan. Reads the `memories` table directly
+// (not memories_live) purely for these two columns: a hit already resolved
+// through memories_live by this point, so this is a provenance lookup, not
+// a second liveness check.
+function fetchProvenanceByIds(db: CairnDb, ids: string[]): Map<string, { origin: MemoryOrigin; approved: boolean }> {
+  const result = new Map<string, { origin: MemoryOrigin; approved: boolean }>();
+  if (ids.length === 0) return result;
+  const placeholders = ids.map(() => "?").join(", ");
+  const rows = db.q(`SELECT id, origin, approved FROM memories WHERE id IN (${placeholders})`).all(...ids);
+  for (const row of rows) {
+    result.set(str(row, "id"), { origin: str(row, "origin") as MemoryOrigin, approved: bool(row, "approved") });
+  }
+  return result;
 }
 
 /**
@@ -642,11 +676,14 @@ export async function search(
   });
   const selectedIds = mmr(mmrCandidates, limit, options.mmrLambda);
 
+  const provenanceById = fetchProvenanceByIds(db, selectedIds);
+
   const rerankedById = new Map(reranked.map((r) => [r.id, r]));
   const hits: SearchHit[] = selectedIds.map((id) => {
     const r = rerankedById.get(id)!;
     const row = rowsById.get(id)!;
     const ranks = ranksById.get(id) ?? [null, null];
+    const provenance = provenanceById.get(id);
     return {
       id: row.id,
       seq: row.seq,
@@ -662,6 +699,8 @@ export async function search(
       sources: { fts: ranks[0] ?? null, vector: ranks[1] ?? null },
       coverage: coverageById.get(id) ?? null,
       vectorDistance: vectorDistanceById.get(id) ?? null,
+      origin: provenance?.origin,
+      approved: provenance?.approved,
     };
   });
 
