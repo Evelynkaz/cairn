@@ -186,6 +186,15 @@ export interface ImportMemoryResult {
 // refused rather than stored, per the id-validation requirement below.
 const EARLIEST_SANE_TIMESTAMP = Date.UTC(2020, 0, 1);
 
+// How far into the future an id's embedded timestamp may sit before it is
+// refused rather than a wildly implausible one (e.g. a hand-edited archive
+// carrying a year-9999 id) permanently outranking every real memory in
+// every recency-weighted list, including get_context's output. Five minutes
+// is generous enough to absorb ordinary clock drift between two machines,
+// nowhere near enough to matter for ranking, and far short of a genuinely
+// bogus future timestamp.
+const FUTURE_SKEW_MS = 5 * 60 * 1000;
+
 // Import-only insertion: a memory that already has an id (minted by the
 // EXPORTING store's uuidv7()) rather than one minted fresh here. This is
 // deliberately NOT "call createMemory but pass an id through" -- createMemory
@@ -224,7 +233,7 @@ export function importMemory(
   // UUIDv7 whose embedded timestamp is not plausibly a real export.
   const createdAt = timestampFromUuidv7(input.id);
   const now = Date.now();
-  if (createdAt < EARLIEST_SANE_TIMESTAMP || createdAt > now + 24 * 60 * 60 * 1000) {
+  if (createdAt < EARLIEST_SANE_TIMESTAMP || createdAt > now + FUTURE_SKEW_MS) {
     throw new Error(`memory ${input.id}: id does not embed a plausible timestamp (${createdAt})`);
   }
 

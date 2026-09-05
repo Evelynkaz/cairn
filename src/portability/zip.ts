@@ -359,7 +359,16 @@ export function readZip(archive: Buffer): ZipEntry[] {
       data = Buffer.from(compressedData);
     } else if (method === METHOD_DEFLATE) {
       try {
-        data = inflateRawSync(compressedData);
+        // maxOutputLength caps inflation at the entry's OWN declared
+        // uncompressed size, not just the archive-wide total checked above:
+        // that total is summed from declared sizes before any inflating
+        // happens, so a single entry lying about its size (declaring 100
+        // bytes for a stream that actually expands to 200MB) would pass
+        // that check and only get caught by the length comparison below --
+        // after the real 200MB had already been allocated, which is the
+        // allocation this cap exists to prevent. Failing during inflation
+        // instead means the lying stream never gets fully materialized.
+        data = inflateRawSync(compressedData, { maxOutputLength: uncompressedSize });
       } catch (err) {
         throw new ZipFormatError(
           `failed to inflate entry ${JSON.stringify(name)}: ${err instanceof Error ? err.message : String(err)}`,

@@ -6,6 +6,8 @@
 // metadata.is_user_system_message, carrying
 // metadata.user_context_message_data.
 //
+import { MAX_ENTRY_LENGTH } from "./pasted.js";
+
 // Deliberately NOT built here: mining "Model set context updated" memory
 // write events out of conversation transcripts. Those are creation events
 // only -- no deletions, no supersessions -- so importing them would
@@ -109,10 +111,15 @@ function extractFromContextData(data: Record<string, unknown>): ChatGptCustomIns
       if (key === "about_user_message" || key === "about_model_message") continue;
       if (typeof value !== "string") continue;
 
+      // Unlike about_user_message/about_model_message above (confirmed-shape
+      // fields, trusted as-is), this fallback accepts ANY string-valued
+      // field on an unconfirmed schema -- cap it the way pasted.ts caps a
+      // pasted entry, so a large field can't become an enormous memory.
+      const capped = value.slice(0, MAX_ENTRY_LENGTH);
       if (result.aboutUser === undefined) {
-        result.aboutUser = value;
+        result.aboutUser = capped;
       } else if (result.aboutModel === undefined) {
-        result.aboutModel = value;
+        result.aboutModel = capped;
       }
     }
   }

@@ -24,7 +24,8 @@
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.ui.json && tsc -p tsconfig.uitest.json && node dist/scripts/copy-ui-assets.js",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.ui.json --noEmit && tsc -p tsconfig.uitest.json --noEmit",
     "test": "npm run clean && npm run build && node --test \"dist/**/*.test.js\"",
-    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "verify-package": "node dist/scripts/verify-package.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

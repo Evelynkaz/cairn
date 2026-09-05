@@ -15,7 +15,7 @@
 
 import { z } from "zod";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { CallContext, Memory, SearchHit } from "../storage/index.js";
@@ -176,6 +176,22 @@ function defaultExportPath(): string {
   const home = ensureHome(resolveCairnHome());
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return resolve(home, `cairn-export-${stamp}.zip`);
+}
+
+// export_memories is reachable by ordinary mistaken or prompt-injected model
+// behaviour (the tool description itself invites a path), so its writes are
+// confined to the Cairn home -- unlike a future human-driven CLI export
+// command, which could reasonably write anywhere the human chooses. The
+// difference is who chose the path. Mirrors the prefix check in
+// src/dashboard/assets.ts: compare with a separator-terminated prefix, not a
+// bare startsWith, so a sibling directory like "<home>-evil" cannot pass.
+function resolveWithinCairnHome(requested: string): string {
+  const home = resolve(ensureHome(resolveCairnHome()));
+  const candidate = resolve(home, requested);
+  if (candidate !== home && !candidate.startsWith(home + sep)) {
+    throw new Error("export_memories: path must be inside the Cairn home directory");
+  }
+  return candidate;
 }
 
 /**
@@ -589,7 +605,10 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
     },
     (args) => {
       requireEnabled(args.scope);
-      const path = resolve(args.path && args.path.trim().length > 0 ? args.path : defaultExportPath());
+      const path =
+        args.path && args.path.trim().length > 0
+          ? resolveWithinCairnHome(args.path)
+          : defaultExportPath();
       const result = exportArchive(deps.store, { scope: args.scope });
       writeFileSync(path, result.archive);
       recordAudit(deps.store.db, {

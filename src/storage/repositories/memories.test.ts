@@ -736,6 +736,30 @@ test("importMemory: an id embedding an implausible timestamp is refused", () => 
   });
 });
 
+// Builds a well-formed uuidv7-shaped id whose embedded 48-bit timestamp is
+// exactly `ms`, for exercising the future-skew bound precisely.
+function idAtTimestamp(ms: number): string {
+  const hex = BigInt(Math.trunc(ms)).toString(16).padStart(12, "0");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-7000-8000-000000000000`;
+}
+
+test("importMemory: an id whose timestamp is far in the future is refused", () => {
+  withDb((db) => {
+    const farFutureId = idAtTimestamp(Date.UTC(9999, 0, 1));
+    assert.throws(() => importMemory(db, { id: farFutureId, text: "far future" }));
+    const count = db.q("select count(*) as c from memories").get()?.["c"];
+    assert.equal(count, 0);
+  });
+});
+
+test("importMemory: an id a few seconds ahead of now is accepted (clock skew)", () => {
+  withDb((db) => {
+    const slightlyAheadId = idAtTimestamp(Date.now() + 5_000);
+    const result = importMemory(db, { id: slightlyAheadId, text: "slightly ahead" });
+    assert.equal(result.skipped, false);
+  });
+});
+
 test("importMemory: tags, scope, importance and sourceClient all survive", () => {
   withDb((db) => {
     const id = uuidv7();

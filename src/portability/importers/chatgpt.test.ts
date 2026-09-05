@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { extractCustomInstructions, ImporterFormatError } from "./chatgpt.js";
+import { MAX_ENTRY_LENGTH } from "./pasted.js";
 
 // Fixtures below are constructed by hand from documented/community-reported
 // shapes (OpenAI help article 8096356 for the presence of custom
@@ -64,6 +65,18 @@ test("falls back to other string fields when inner keys are named differently", 
     aboutUser: "Lives in Berlin.",
     aboutModel: "Answer briefly.",
   });
+});
+
+test("the fallback caps a field's length instead of returning it in full", () => {
+  const oversized = "x".repeat(MAX_ENTRY_LENGTH + 500);
+  const conversations = [
+    conversationWithCustomInstructions({
+      user_profile: oversized,
+    }),
+  ];
+
+  const result = extractCustomInstructions(conversations);
+  assert.equal(result.aboutUser?.length, MAX_ENTRY_LENGTH);
 });
 
 test("a valid export with no custom instructions returns empty, not an error", () => {

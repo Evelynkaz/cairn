@@ -23,5 +23,7 @@ jobs:
       - name: Verify sqlite-vec loadable extension
         run: node dist/scripts/smoke-vec.js
       - name: Verify published package contents
-        run: node dist/scripts/verify-package.js
+        # Must go through `npm run` so npm_execpath is set — otherwise the script
+        # falls back to a bare executable name and Windows fails.
+        run: npm run verify-package
       - run: npm test

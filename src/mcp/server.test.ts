@@ -775,6 +775,10 @@ test("export_memories then import_memories into a different store round-trips or
   const destClient = new Client({ name: "dest-client", version: "1.0.0" });
   const [sourceServerTransport, sourceClientTransport] = InMemoryTransport.createLinkedPair();
   const [destServerTransport, destClientTransport] = InMemoryTransport.createLinkedPair();
+  // export_memories confines its writes to CAIRN_HOME, so this test's
+  // archive path must live under the temp home it points at.
+  const originalHome = process.env.CAIRN_HOME;
+  process.env.CAIRN_HOME = sourceDir;
   try {
     await Promise.all([sourceServer.connect(sourceServerTransport), sourceClient.connect(sourceClientTransport)]);
     await Promise.all([destServer.connect(destServerTransport), destClient.connect(destClientTransport)]);
@@ -799,6 +803,11 @@ test("export_memories then import_memories into a different store round-trips or
     assert.equal(again.imported, 0, "re-importing the same archive must import nothing the second time");
     assert.equal(again.skipped, 2);
   } finally {
+    if (originalHome === undefined) {
+      delete process.env.CAIRN_HOME;
+    } else {
+      process.env.CAIRN_HOME = originalHome;
+    }
     await sourceClient.close();
     await sourceServer.close();
     await destClient.close();
@@ -813,6 +822,57 @@ test("export_memories then import_memories into a different store round-trips or
     }
   }
 });
+
+// export_memories is reachable through ordinary mistaken or prompt-injected
+// model behaviour (its own description invites a `path`), so its writes
+// must be confined to CAIRN_HOME regardless of what path a caller asks for.
+test("export_memories accepts a path inside CAIRN_HOME", async () => {
+  const home = makeTempDir();
+  const originalHome = process.env.CAIRN_HOME;
+  process.env.CAIRN_HOME = home;
+  try {
+    await withServer(async ({ client }) => {
+      const target = join(home, "inside.zip");
+      const exported = await callJson<ExportResult>(client, "export_memories", { path: target });
+      assert.equal(exported.path, target);
+    });
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.CAIRN_HOME;
+    } else {
+      process.env.CAIRN_HOME = originalHome;
+    }
+    rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+});
+
+for (const [label, makePath] of Object.entries({
+  "relative traversal out of home": (home: string) => join(home, "..", "..", "etc", "passwd"),
+  "absolute path outside home": () => "/etc/passwd",
+  "sibling directory sharing home's name as a prefix": (home: string) => `${home}-evil/x.zip`,
+})) {
+  test(`export_memories refuses a path escaping CAIRN_HOME: ${label}`, async () => {
+    const home = makeTempDir();
+    const originalHome = process.env.CAIRN_HOME;
+    process.env.CAIRN_HOME = home;
+    try {
+      await withServer(async ({ client }) => {
+        const target = makePath(home);
+        const { isError, text } = await callTool(client, "export_memories", { path: target });
+        assert.equal(isError, true, "a path outside CAIRN_HOME must be refused");
+        assert.ok(!text.includes(target), "the refusal must not echo the requested path");
+        assert.ok(!text.includes("/etc/passwd"), "the refusal must not echo the requested path");
+      });
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.CAIRN_HOME;
+      } else {
+        process.env.CAIRN_HOME = originalHome;
+      }
+      rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+}
 
 test("import_memories on a nonexistent path returns a clear error, not an unhandled throw", async () => {
   await withServer(async ({ client }) => {

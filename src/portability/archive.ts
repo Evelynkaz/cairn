@@ -385,6 +385,14 @@ export function importArchive(store: Store, archive: Buffer): ImportResult {
   // partially-applied import of a corrupted archive is worse than a
   // refusal, so nothing below this point may run until every checksum in
   // the archive has been confirmed to match.
+  //
+  // This must check BOTH directions. Checking only "every manifest entry is
+  // in the archive and matches" leaves a hole: an entry present in the ZIP
+  // but absent from the manifest is then never checksummed and never
+  // rejected by this loop. manifest.json itself is the one archive entry
+  // deliberately excluded from both directions -- it cannot checksum
+  // itself, and its own contents (formatVersion, entries table) are already
+  // validated above by being parsed and required to have the right shape.
   for (const entry of entries) {
     if (entry.name === "manifest.json") continue;
     const expected = manifestEntries[entry.name];
@@ -395,6 +403,12 @@ export function importArchive(store: Store, archive: Buffer): ImportResult {
       throw new ArchiveFormatError(
         `checksum mismatch for ${JSON.stringify(entry.name)}: the archive has been corrupted or tampered with`,
       );
+    }
+  }
+  for (const name of Object.keys(manifestEntries)) {
+    if (name === "manifest.json") continue;
+    if (!findEntry(entries, name)) {
+      throw new ArchiveFormatError(`manifest.json names ${JSON.stringify(name)} but the archive does not contain it`);
     }
   }
 
@@ -410,72 +424,82 @@ export function importArchive(store: Store, archive: Buffer): ImportResult {
   }
   const records = parseMemoryLines(memoriesEntry.data, "memories.jsonl");
 
-  // Episodes import BEFORE memories: a memory carries an episodeId, and
-  // memories.episode_id is a `REFERENCES episodes(id)` foreign key with
-  // PRAGMA foreign_keys=ON (storage/db.ts) -- inserting a memory ahead of
-  // the episode it references would fail that constraint. This also means
-  // an imported memory's episodeId resolves to a real row in the
-  // destination store, not just in the source it came from.
-  let episodesImported = 0;
-  let episodesSkipped = 0;
-  for (const record of episodeRecords) {
-    const result = store.importEpisode(
-      {
-        id: record.id,
-        content: record.content,
-        scope: record.scope,
-        sourceClient: record.sourceClient,
-        metadata: record.metadata,
-      },
-      CTX,
-    );
-    if (result.skipped) {
-      episodesSkipped += 1;
-    } else {
-      episodesImported += 1;
+  // The whole import runs as one transaction (storage/store.ts's db.tx,
+  // same idiom as deleteEverything/forget): the SHA256 gate above proves the
+  // ARCHIVE BYTES match the manifest, but says nothing about whether every
+  // row will insert -- a bad importance value, a text collision, or an
+  // episodeId the archive omits can still throw partway through. Without
+  // this, that throw would leave the destination store permanently
+  // half-imported with no record of where it stopped. Everything or
+  // nothing.
+  return store.db.tx(() => {
+    // Episodes import BEFORE memories: a memory carries an episodeId, and
+    // memories.episode_id is a `REFERENCES episodes(id)` foreign key with
+    // PRAGMA foreign_keys=ON (storage/db.ts) -- inserting a memory ahead of
+    // the episode it references would fail that constraint. This also means
+    // an imported memory's episodeId resolves to a real row in the
+    // destination store, not just in the source it came from.
+    let episodesImported = 0;
+    let episodesSkipped = 0;
+    for (const record of episodeRecords) {
+      const result = store.importEpisode(
+        {
+          id: record.id,
+          content: record.content,
+          scope: record.scope,
+          sourceClient: record.sourceClient,
+          metadata: record.metadata,
+        },
+        CTX,
+      );
+      if (result.skipped) {
+        episodesSkipped += 1;
+      } else {
+        episodesImported += 1;
+      }
     }
-  }
 
-  // Import preserves the original ids from the exporting store rather than
-  // minting fresh ones -- see the doc comment on
-  // storage/repositories/memories.ts's importMemory for why "just call
-  // remember()" is wrong here: created_at is derived from the id, so a
-  // fresh id would collapse every imported memory's creation time to this
-  // moment and destroy the chronology this format exists to preserve.
-  let imported = 0;
-  let skipped = 0;
-  for (const record of records) {
-    const result = store.importMemory(
-      {
-        id: record.id,
-        text: record.text,
-        scope: record.scope,
-        tags: record.tags,
-        importance: record.importance,
-        sourceClient: record.sourceClient,
-        updatedAt: record.updatedAt,
-        validFrom: record.validFrom,
-        validUntil: record.validUntil,
-        supersededBy: record.supersededBy,
-        deletedAt: record.deletedAt,
-        redacted: record.redacted,
-        episodeId: record.episodeId,
-      },
-      CTX,
-    );
-    if (result.skipped) {
-      skipped += 1;
-    } else {
-      imported += 1;
+    // Import preserves the original ids from the exporting store rather than
+    // minting fresh ones -- see the doc comment on
+    // storage/repositories/memories.ts's importMemory for why "just call
+    // remember()" is wrong here: created_at is derived from the id, so a
+    // fresh id would collapse every imported memory's creation time to this
+    // moment and destroy the chronology this format exists to preserve.
+    let imported = 0;
+    let skipped = 0;
+    for (const record of records) {
+      const result = store.importMemory(
+        {
+          id: record.id,
+          text: record.text,
+          scope: record.scope,
+          tags: record.tags,
+          importance: record.importance,
+          sourceClient: record.sourceClient,
+          updatedAt: record.updatedAt,
+          validFrom: record.validFrom,
+          validUntil: record.validUntil,
+          supersededBy: record.supersededBy,
+          deletedAt: record.deletedAt,
+          redacted: record.redacted,
+          episodeId: record.episodeId,
+        },
+        CTX,
+      );
+      if (result.skipped) {
+        skipped += 1;
+      } else {
+        imported += 1;
+      }
     }
-  }
 
-  return {
-    imported,
-    skipped,
-    memories: records.length,
-    episodesImported,
-    episodesSkipped,
-    episodes: episodeRecords.length,
-  };
+    return {
+      imported,
+      skipped,
+      memories: records.length,
+      episodesImported,
+      episodesSkipped,
+      episodes: episodeRecords.length,
+    };
+  });
 }

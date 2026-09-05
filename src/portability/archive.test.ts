@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { withTempDir, makeTempDir, tempDbPath } from "../testing/tmp.js";
@@ -65,6 +66,13 @@ const HAVE_UNZIP = which("unzip");
 function countAllMemories(store: Store): number {
   const row = store.db.q(`select count(*) as c from memories`).get();
   return row ? Number(row["c"]) : 0;
+}
+
+// The full id set, not just a count -- a count alone can't tell "half
+// imported then rolled back" apart from "half imported and stuck".
+function allMemoryIds(store: Store): Set<string> {
+  const rows = store.db.q(`select id from memories`).all();
+  return new Set(rows.map((r) => String(r["id"])));
 }
 
 // Flips one byte inside a named entry after the archive has been built, so
@@ -211,6 +219,88 @@ test("a tampered archive is refused and leaves the target store completely uncha
       const before = countAllMemories(dest);
       assert.throws(() => importArchive(dest, tampered), ArchiveFormatError);
       assert.equal(countAllMemories(dest), before);
+    });
+  });
+});
+
+test("a checksum-valid archive containing a row the store rejects leaves the destination store completely unchanged", () => {
+  withStore((source) => {
+    source.remember({ content: "first fact" });
+    waitForNextMs();
+    source.remember({ content: "second fact" });
+    const { archive } = exportArchive(source);
+
+    const entries = readZip(archive);
+    const memoriesEntry = entries.find((e) => e.name === "memories.jsonl")!;
+    const lines = memoriesEntry.data.toString("utf8").trimEnd().split("\n");
+    assert.equal(lines.length, 2);
+    const second = JSON.parse(lines[1]!) as { importance: number };
+    second.importance = 5; // out of the store's 0-1 range: importMemory will throw on this row
+    lines[1] = JSON.stringify(second);
+    const newMemoriesData = Buffer.from(lines.map((l) => `${l}\n`).join(""), "utf8");
+
+    // Recompute the manifest's checksum for the edited file, so this
+    // archive is checksum-valid -- the SHA256 gate proves the bytes match
+    // the manifest, not that the rows will insert, which is exactly the
+    // gap this test targets.
+    const manifestEntry = entries.find((e) => e.name === "manifest.json")!;
+    const manifest = JSON.parse(manifestEntry.data.toString("utf8")) as {
+      entries: Record<string, { sha256: string; bytes: number }>;
+    };
+    manifest.entries["memories.jsonl"] = {
+      sha256: createHash("sha256").update(newMemoriesData).digest("hex"),
+      bytes: newMemoriesData.length,
+    };
+    const newManifestData = Buffer.from(JSON.stringify(manifest, null, 2), "utf8");
+
+    const tampered = writeZip(
+      entries.map((e) => {
+        if (e.name === "memories.jsonl") return { name: e.name, data: newMemoriesData };
+        if (e.name === "manifest.json") return { name: e.name, data: newManifestData };
+        return e;
+      }),
+    );
+
+    withStore((dest) => {
+      const beforeCount = countAllMemories(dest);
+      const beforeIds = allMemoryIds(dest);
+      assert.throws(() => importArchive(dest, tampered));
+      assert.equal(countAllMemories(dest), beforeCount);
+      assert.deepEqual(allMemoryIds(dest), beforeIds);
+    });
+  });
+});
+
+test("an archive entry present in the zip but absent from the manifest is refused", () => {
+  withStore((source) => {
+    source.remember({ content: "manifest coverage" });
+    const { archive } = exportArchive(source);
+    const entries = readZip(archive);
+    const extra = writeZip([...entries, { name: "extra.txt", data: Buffer.from("not in the manifest") }]);
+
+    withStore((dest) => {
+      assert.throws(() => importArchive(dest, extra), ArchiveFormatError);
+    });
+  });
+});
+
+test("a manifest naming an entry the archive lacks is refused", () => {
+  withStore((source) => {
+    source.remember({ content: "manifest coverage" });
+    const { archive } = exportArchive(source);
+    const entries = readZip(archive);
+    const manifestEntry = entries.find((e) => e.name === "manifest.json")!;
+    const manifest = JSON.parse(manifestEntry.data.toString("utf8")) as {
+      entries: Record<string, { sha256: string; bytes: number }>;
+    };
+    manifest.entries["ghost.jsonl"] = { sha256: "0".repeat(64), bytes: 0 };
+    const newManifestData = Buffer.from(JSON.stringify(manifest, null, 2), "utf8");
+    const missing = writeZip(
+      entries.map((e) => (e.name === "manifest.json" ? { name: e.name, data: newManifestData } : e)),
+    );
+
+    withStore((dest) => {
+      assert.throws(() => importArchive(dest, missing), ArchiveFormatError);
     });
   });
 });

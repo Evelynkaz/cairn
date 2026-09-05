@@ -13,10 +13,26 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 // root is two levels up.
 const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
+// Every file the dashboard actually loads at runtime, not just its entry
+// points: index.html loads app.js, which statically imports dom.js,
+// state.js, api-client.js, and views/memories.js -- each is fetched by the
+// browser as its own ES module (this build is not bundled), so a `files`
+// edit that dropped any one of them would pass a check that only looked at
+// index.html/app.js/styles.css and break the dashboard on its first route.
+// The daemon itself loads no other on-disk assets at runtime (no migrations
+// directory, no template files) -- everything else it needs is compiled
+// into dist/**/*.js, already covered by the package.json `files` glob and
+// this script's test-artifact/src leak checks below -- so this list plus
+// the bin-entry check above is the complete runtime surface, not a
+// speculative addition.
 const REQUIRED_DASHBOARD_FILES = [
   "dist/dashboard/ui/index.html",
   "dist/dashboard/ui/app.js",
   "dist/dashboard/ui/styles.css",
+  "dist/dashboard/ui/dom.js",
+  "dist/dashboard/ui/state.js",
+  "dist/dashboard/ui/api-client.js",
+  "dist/dashboard/ui/views/memories.js",
 ];
 
 const TEST_ARTIFACT_RE = /\.test\.(js|d\.ts)(\.map)?$/;

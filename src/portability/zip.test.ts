@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { deflateRawSync } from "node:zlib";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { platform } from "node:os";
@@ -119,6 +120,78 @@ test("rejects an archive declaring more uncompressed bytes than the cap (zip bom
   // Central directory header uncompressed-size field is at offset +24.
   tampered.writeUInt32LE(0xffffffff, centralDirStart + 24);
   assert.throws(() => readZip(tampered), ZipFormatError);
+});
+
+// Hand-builds a single-entry ZIP whose local AND central directory headers
+// both declare `declaredUncompressedSize` bytes, while the deflate stream
+// they wrap actually inflates to `realData.length` bytes. This fixture is
+// DELIBERATELY MALFORMED (a lying header) -- it exists to prove readZip
+// refuses it during inflation (via inflateRawSync's maxOutputLength) rather
+// than inflating the real size first and only then noticing the mismatch.
+// Built with node:zlib directly, not writeZip, because writeZip always
+// writes a truthful uncompressed-size field.
+function buildLyingSizeZip(realData: Buffer, declaredUncompressedSize: number): Buffer {
+  const name = Buffer.from("bomb.bin", "utf8");
+  const compressed = deflateRawSync(realData);
+  const crc = 0; // never reached: inflation must fail before the CRC check runs
+
+  const localHeader = Buffer.alloc(30);
+  localHeader.writeUInt32LE(0x04034b50, 0);
+  localHeader.writeUInt16LE(20, 4); // version needed to extract
+  localHeader.writeUInt16LE(0x0800, 6); // UTF-8 flag
+  localHeader.writeUInt16LE(8, 8); // deflate
+  localHeader.writeUInt16LE(0, 10);
+  localHeader.writeUInt16LE(0x21, 12);
+  localHeader.writeUInt32LE(crc, 14);
+  localHeader.writeUInt32LE(compressed.length, 18);
+  localHeader.writeUInt32LE(declaredUncompressedSize, 22); // the lie
+  localHeader.writeUInt16LE(name.length, 26);
+  localHeader.writeUInt16LE(0, 28);
+
+  const local = Buffer.concat([localHeader, name, compressed]);
+
+  const centralHeader = Buffer.alloc(46);
+  centralHeader.writeUInt32LE(0x02014b50, 0);
+  centralHeader.writeUInt16LE((3 << 8) | 20, 4); // version made by (unix)
+  centralHeader.writeUInt16LE(20, 6); // version needed to extract
+  centralHeader.writeUInt16LE(0x0800, 8); // UTF-8 flag
+  centralHeader.writeUInt16LE(8, 10); // deflate
+  centralHeader.writeUInt16LE(0, 12);
+  centralHeader.writeUInt16LE(0x21, 14);
+  centralHeader.writeUInt32LE(crc, 16);
+  centralHeader.writeUInt32LE(compressed.length, 20);
+  centralHeader.writeUInt32LE(declaredUncompressedSize, 24); // the lie, same field
+  centralHeader.writeUInt16LE(name.length, 28);
+  centralHeader.writeUInt16LE(0, 30);
+  centralHeader.writeUInt16LE(0, 32);
+  centralHeader.writeUInt16LE(0, 34);
+  centralHeader.writeUInt16LE(0, 36);
+  centralHeader.writeUInt32LE(0o644 << 16, 38);
+  centralHeader.writeUInt32LE(0, 42); // local header offset
+
+  const central = Buffer.concat([centralHeader, name]);
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(central.length, 12);
+  eocd.writeUInt32LE(local.length, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([local, central, eocd]);
+}
+
+test("rejects an entry whose deflate stream actually expands far beyond its declared uncompressed size, refusing during inflation", () => {
+  // 50MB of zeros deflates to a tiny stream but really is 50MB once
+  // inflated -- the declared size (100 bytes) passes the archive-wide
+  // MAX_TOTAL_UNCOMPRESSED_BYTES cap easily, so only maxOutputLength on
+  // this entry's own inflateRawSync call can catch the lie.
+  const real = Buffer.alloc(50 * 1024 * 1024, 0);
+  const archive = buildLyingSizeZip(real, 100);
+  assert.throws(() => readZip(archive), ZipFormatError);
 });
 
 // --- Verification against system tools ------------------------------------
