@@ -171,6 +171,131 @@ export function createMemory(
   });
 }
 
+export type ImportMemorySkipReason = "duplicate-id" | "duplicate-content";
+
+export interface ImportMemoryResult {
+  memory: Memory | undefined;
+  skipped: boolean;
+  reason?: ImportMemorySkipReason;
+}
+
+// Earliest created_at we accept from an id's embedded timestamp: uuidv7 as
+// a format predates this codebase, but nothing genuinely exported from a
+// Cairn store can claim to be older than this project. A hand-edited or
+// corrupted archive id that decodes to a wildly implausible timestamp is
+// refused rather than stored, per the id-validation requirement below.
+const EARLIEST_SANE_TIMESTAMP = Date.UTC(2020, 0, 1);
+
+// Import-only insertion: a memory that already has an id (minted by the
+// EXPORTING store's uuidv7()) rather than one minted fresh here. This is
+// deliberately NOT "call createMemory but pass an id through" -- createMemory
+// derives created_at from a freshly-minted id, which is exactly wrong for
+// import. created_at must be derived from the ORIGINAL id, or every
+// imported memory's creation time collapses to "now" and the chronology
+// that "take your memory with you" (BUILD_BRIEF §1) exists to preserve is
+// destroyed. So this function re-derives createdAt from input.id itself
+// (never trusting a createdAt field carried in the archive), and otherwise
+// reuses exactly the same side effects createMemory relies on: the FTS
+// trigger fires off the same INSERT INTO memories, tags go through the same
+// replaceTags, and the same idx_memories_live_hash dedupe rule applies.
+export function importMemory(
+  db: CairnDb,
+  input: {
+    id: string;
+    text: string;
+    scope?: string;
+    tags?: string[];
+    sourceClient?: string | null;
+    importance?: number;
+    updatedAt?: number;
+    validFrom?: number;
+    validUntil?: number | null;
+    supersededBy?: string | null;
+    deletedAt?: number | null;
+    redacted?: boolean;
+  },
+): ImportMemoryResult {
+  checkImportance(input.importance);
+
+  // Validate the id itself: a malformed id (from a hand-edited archive)
+  // must be refused, not stored, or created_at becomes nonsense.
+  // timestampFromUuidv7 already rejects anything that isn't a canonical
+  // UUIDv7; the range check below additionally catches a well-formed
+  // UUIDv7 whose embedded timestamp is not plausibly a real export.
+  const createdAt = timestampFromUuidv7(input.id);
+  const now = Date.now();
+  if (createdAt < EARLIEST_SANE_TIMESTAMP || createdAt > now + 24 * 60 * 60 * 1000) {
+    throw new Error(`memory ${input.id}: id does not embed a plausible timestamp (${createdAt})`);
+  }
+
+  const scope = input.scope ?? DEFAULT_SCOPE;
+  const tags = uniqueSorted(input.tags ?? []);
+  const hash = contentHash(input.text);
+  const importance = input.importance ?? 0.5;
+
+  return db.tx(() => {
+    // Never overwrite: re-importing the same archive twice must be a
+    // no-op the second time.
+    const existingById = db.q(`SELECT id FROM memories WHERE id = ?`).get(input.id);
+    if (existingById) {
+      return { memory: undefined, skipped: true, reason: "duplicate-id" };
+    }
+
+    // Same live-hash rule createMemory enforces via idx_memories_live_hash:
+    // an imported memory whose text is already live in this scope is
+    // skipped, not duplicated, rather than bypassing the constraint.
+    const liveConflict = db
+      .q(`SELECT id FROM memories_live WHERE scope = ? AND content_hash = ?`)
+      .get(scope, hash);
+    if (liveConflict) {
+      return { memory: undefined, skipped: true, reason: "duplicate-content" };
+    }
+
+    const updatedAt = input.updatedAt ?? createdAt;
+    const validFrom = input.validFrom ?? createdAt;
+
+    db.q(
+      `INSERT INTO memories
+         (id, text, scope, source_client, importance, created_at, updated_at,
+          valid_from, valid_until, deleted_at, redacted, content_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      input.id,
+      input.text,
+      scope,
+      input.sourceClient ?? null,
+      importance,
+      createdAt,
+      updatedAt,
+      validFrom,
+      input.validUntil ?? null,
+      input.deletedAt ?? null,
+      input.redacted ? 1 : 0,
+      hash,
+    );
+    replaceTags(db, input.id, tags);
+
+    // supersededBy is wired up only once the target already exists in this
+    // store: the memories(id) foreign key requires the referenced row to
+    // exist at the time it is set, and the archive may list a successor
+    // after its predecessor, or a scope filter may have dropped the
+    // successor from this archive entirely -- in that case this is
+    // best-effort and left null rather than failing the whole import.
+    if (input.supersededBy) {
+      const target = db.q(`SELECT id FROM memories WHERE id = ?`).get(input.supersededBy);
+      if (target) {
+        db.q(`UPDATE memories SET superseded_by = ? WHERE id = ?`).run(input.supersededBy, input.id);
+      }
+    }
+
+    const memory = getMemory(db, input.id);
+    if (!memory) {
+      throw new Error(`memory ${input.id} not found immediately after import insert`);
+    }
+    return { memory, skipped: false };
+  });
+}
+
 export function listMemories(
   db: CairnDb,
   options: {

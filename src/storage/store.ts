@@ -13,6 +13,7 @@ import { appendEpisode, getEpisode, listEpisodes } from "./repositories/episodes
 import {
   createMemory,
   getMemory,
+  importMemory as importMemoryRepo,
   listMemories,
   memoriesAsOf,
   restoreMemory,
@@ -21,6 +22,7 @@ import {
   touchMemory,
   updateMemory,
 } from "./repositories/memories.js";
+import type { ImportMemoryResult } from "./repositories/memories.js";
 import {
   countAuditByClient,
   isClientEnabled,
@@ -186,6 +188,31 @@ export interface Store {
     options: { confirm: true },
     ctx?: CallContext,
   ): { memories: number; episodes: number; vectors: number };
+
+  // Portability import (BUILD_BRIEF §10/§16 milestone 10): inserts a memory
+  // with a CALLER-SUPPLIED id rather than minting one, so that a re-import
+  // preserves created_at exactly (see the doc comment on
+  // repositories/memories.ts's importMemory for why that is not the same
+  // as calling remember()). Never overwrites: an id that already exists,
+  // or content already live in that scope, comes back skipped rather than
+  // applied, so re-importing the same archive twice is a no-op.
+  importMemory(
+    input: {
+      id: string;
+      text: string;
+      scope?: string;
+      tags?: string[];
+      sourceClient?: string | null;
+      importance?: number;
+      updatedAt?: number;
+      validFrom?: number;
+      validUntil?: number | null;
+      supersededBy?: string | null;
+      deletedAt?: number | null;
+      redacted?: boolean;
+    },
+    ctx?: CallContext,
+  ): ImportMemoryResult;
 
   episodes(
     options?: { scope?: string; limit?: number; cursor?: string | null },
@@ -702,6 +729,26 @@ export function openStore(options: StoreOptions = {}): Store {
         });
 
         return { memories, episodes, vectors };
+      });
+    },
+
+    importMemory(input, ctx) {
+      requireWritable("importMemory");
+      const { sourceClient, scope } = gate(ctx, "import");
+      const resolvedScope = input.scope ?? scope;
+      // Invariant: the mutation and its audit row commit together or not
+      // at all -- a failed audit insert must not leave a mutated store
+      // with no trace of it in the §5 access log.
+      return db.tx(() => {
+        const result = importMemoryRepo(db, { ...input, scope: resolvedScope });
+        recordAudit(db, {
+          action: "import",
+          memoryId: result.memory?.id ?? input.id,
+          scope: result.memory?.scope ?? resolvedScope ?? null,
+          sourceClient,
+          details: { skipped: result.skipped, reason: result.reason ?? null },
+        });
+        return result;
       });
     },
 

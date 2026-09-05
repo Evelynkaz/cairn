@@ -7,6 +7,7 @@ import type { CallContext, Store } from "./store.js";
 import { setPrivacyMode } from "./privacy-settings.js";
 import { ensureVectorSpace, upsertVector } from "./repositories/vectors.js";
 import type { CairnDb } from "./db.js";
+import { uuidv7 } from "../util/id.js";
 
 function withStore<T>(fn: (store: Store, dir: string) => T): T {
   return withTempDir((dir) => {
@@ -148,6 +149,8 @@ const GATED_METHODS: Record<string, GatedInvoke> = {
   deleteEverything: (store, _id, ctx) => store.deleteEverything({ confirm: true }, ctx),
   episodes: (store, _id, ctx) => store.episodes({}, ctx),
   episode: (store, id, ctx) => store.episode(id, ctx),
+  importMemory: (store, _id, ctx) =>
+    store.importMemory({ id: uuidv7(), text: `gate probe ${uuidv7()}` }, ctx),
 };
 
 // Deliberately ungated -- administrative/dashboard-side surface, not

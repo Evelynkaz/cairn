@@ -10,6 +10,7 @@ import {
   LiveTextCollisionError,
   createMemory,
   getMemory,
+  importMemory,
   listMemories,
   memoriesAsOf,
   restoreMemory,
@@ -674,5 +675,82 @@ test("listMemories: tag filtering is AND, not OR", () => {
       result.items.map((m) => m.id),
       [both.id],
     );
+  });
+});
+
+test("importMemory: created_at is derived from the given id, not from Date.now()", () => {
+  withDb((db) => {
+    const oldId = uuidv7();
+    const result = importMemory(db, { id: oldId, text: "an old fact", tags: ["b", "a"] });
+    assert.equal(result.skipped, false);
+    assert.equal(result.memory?.id, oldId);
+    assert.equal(result.memory?.createdAt, timestampFromUuidv7(oldId));
+    assert.deepEqual(result.memory?.tags, ["a", "b"]);
+  });
+});
+
+test("importMemory: re-importing the same id is a no-op the second time", () => {
+  withDb((db) => {
+    const id = uuidv7();
+    const first = importMemory(db, { id, text: "imported once" });
+    assert.equal(first.skipped, false);
+
+    const second = importMemory(db, { id, text: "imported once" });
+    assert.equal(second.skipped, true);
+    assert.equal(second.reason, "duplicate-id");
+
+    const count = db.q("select count(*) as c from memories").get()?.["c"];
+    assert.equal(count, 1);
+  });
+});
+
+test("importMemory: content already live in the same scope is skipped, not duplicated", () => {
+  withDb((db) => {
+    createMemory(db, { text: "already live text", scope: "work" });
+
+    const result = importMemory(db, { id: uuidv7(), text: "already live text", scope: "work" });
+    assert.equal(result.skipped, true);
+    assert.equal(result.reason, "duplicate-content");
+
+    const count = db.q("select count(*) as c from memories").get()?.["c"];
+    assert.equal(count, 1);
+  });
+});
+
+test("importMemory: a malformed id is refused, not stored", () => {
+  withDb((db) => {
+    assert.throws(() => importMemory(db, { id: "not-a-uuid", text: "bad id" }));
+    const count = db.q("select count(*) as c from memories").get()?.["c"];
+    assert.equal(count, 0);
+  });
+});
+
+test("importMemory: an id embedding an implausible timestamp is refused", () => {
+  withDb((db) => {
+    // A uuidv7 whose timestamp bits encode 1970-01-01: well-formed, but not
+    // a plausible export from a Cairn store.
+    const ancientId = "00000000-0000-7000-8000-000000000000";
+    assert.throws(() => importMemory(db, { id: ancientId, text: "ancient" }));
+    const count = db.q("select count(*) as c from memories").get()?.["c"];
+    assert.equal(count, 0);
+  });
+});
+
+test("importMemory: tags, scope, importance and sourceClient all survive", () => {
+  withDb((db) => {
+    const id = uuidv7();
+    const result = importMemory(db, {
+      id,
+      text: "full fidelity",
+      scope: "work",
+      tags: ["x", "y"],
+      importance: 0.9,
+      sourceClient: "claude",
+    });
+    assert.equal(result.skipped, false);
+    assert.equal(result.memory?.scope, "work");
+    assert.deepEqual(result.memory?.tags, ["x", "y"]);
+    assert.equal(result.memory?.importance, 0.9);
+    assert.equal(result.memory?.sourceClient, "claude");
   });
 });
