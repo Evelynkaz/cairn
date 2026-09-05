@@ -20,6 +20,25 @@ function rowToEpisode(row: Row): Episode {
   };
 }
 
+// Shared by appendEpisode and importEpisode below -- the append path's only
+// side effect is this one INSERT (there is no FTS trigger on episodes, and
+// no tags to replace), so import reuses it rather than writing a parallel
+// insert that could drift from it.
+function insertEpisode(
+  db: CairnDb,
+  id: string,
+  content: string,
+  scope: string,
+  sourceClient: string | null,
+  metadata: Record<string, unknown>,
+  createdAt: number,
+): void {
+  db.q(
+    `INSERT INTO episodes (id, content, scope, source_client, metadata, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(id, content, scope, sourceClient, JSON.stringify(metadata), createdAt);
+}
+
 export function appendEpisode(
   db: CairnDb,
   input: {
@@ -35,12 +54,76 @@ export function appendEpisode(
   const sourceClient = input.sourceClient ?? null;
   const metadata = input.metadata ?? {};
 
-  db.q(
-    `INSERT INTO episodes (id, content, scope, source_client, metadata, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(id, input.content, scope, sourceClient, JSON.stringify(metadata), createdAt);
+  insertEpisode(db, id, input.content, scope, sourceClient, metadata, createdAt);
 
   return { id, content: input.content, scope, sourceClient, metadata, createdAt };
+}
+
+export type ImportEpisodeSkipReason = "duplicate-id";
+
+export interface ImportEpisodeResult {
+  episode: Episode | undefined;
+  skipped: boolean;
+  reason?: ImportEpisodeSkipReason;
+}
+
+// Earliest created_at we accept from an id's embedded timestamp -- same
+// reasoning and same value as memories.ts's EARLIEST_SANE_TIMESTAMP: uuidv7
+// as a format predates this codebase, so nothing genuinely exported from a
+// Cairn store can claim to be older than this project.
+const EARLIEST_SANE_TIMESTAMP = Date.UTC(2020, 0, 1);
+
+// Import-only insertion: an episode that already has an id (minted by the
+// EXPORTING store's uuidv7()) rather than one minted fresh here. This is
+// deliberately NOT "call appendEpisode but pass an id through" --
+// appendEpisode derives created_at from a freshly-minted id, which is
+// exactly wrong for import. created_at must be derived from the ORIGINAL
+// id, or every imported episode's creation time collapses to "now" and the
+// chronology that "take your memory with you" (BUILD_BRIEF §1) exists to
+// preserve is destroyed. So this function re-derives createdAt from
+// input.id itself (never trusting a createdAt field carried in the
+// archive), and otherwise reuses exactly the same side effect appendEpisode
+// relies on: insertEpisode above.
+export function importEpisode(
+  db: CairnDb,
+  input: {
+    id: string;
+    content: string;
+    scope?: string;
+    sourceClient?: string | null;
+    metadata?: Record<string, unknown>;
+  },
+): ImportEpisodeResult {
+  // Validate the id itself: a malformed id (from a hand-edited archive)
+  // must be refused, not stored, or created_at becomes nonsense.
+  // timestampFromUuidv7 already rejects anything that isn't a canonical
+  // UUIDv7; the range check below additionally catches a well-formed
+  // UUIDv7 whose embedded timestamp is not plausibly a real export.
+  const createdAt = timestampFromUuidv7(input.id);
+  const now = Date.now();
+  if (createdAt < EARLIEST_SANE_TIMESTAMP || createdAt > now + 24 * 60 * 60 * 1000) {
+    throw new Error(`episode ${input.id}: id does not embed a plausible timestamp (${createdAt})`);
+  }
+
+  const scope = input.scope ?? DEFAULT_SCOPE;
+  const sourceClient = input.sourceClient ?? null;
+  const metadata = input.metadata ?? {};
+
+  return db.tx(() => {
+    // Never overwrite: re-importing the same archive twice must be a
+    // no-op the second time.
+    const existing = db.q(`SELECT id FROM episodes WHERE id = ?`).get(input.id);
+    if (existing) {
+      return { episode: undefined, skipped: true, reason: "duplicate-id" };
+    }
+
+    insertEpisode(db, input.id, input.content, scope, sourceClient, metadata, createdAt);
+    const episode = getEpisode(db, input.id);
+    if (!episode) {
+      throw new Error(`episode ${input.id} not found immediately after import insert`);
+    }
+    return { episode, skipped: false };
+  });
 }
 
 export function getEpisode(db: CairnDb, id: string): Episode | undefined {

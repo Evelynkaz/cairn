@@ -9,7 +9,8 @@ import type { CairnDb, DbCapabilities } from "./db.js";
 import type { DriverFactory } from "./driver/index.js";
 import type { Memory, ClientRecord, Episode } from "./types.js";
 import { assertTableName, listVectorSpaces, type VectorSpaceRef } from "./repositories/vectors.js";
-import { appendEpisode, getEpisode, listEpisodes } from "./repositories/episodes.js";
+import { appendEpisode, getEpisode, importEpisode as importEpisodeRepo, listEpisodes } from "./repositories/episodes.js";
+import type { ImportEpisodeResult } from "./repositories/episodes.js";
 import {
   createMemory,
   getMemory,
@@ -210,9 +211,31 @@ export interface Store {
       supersededBy?: string | null;
       deletedAt?: number | null;
       redacted?: boolean;
+      // Best-effort, same reasoning as supersededBy above (see
+      // repositories/memories.ts's importMemory): wired up only if the
+      // referenced episode already exists in THIS store at import time, and
+      // left null rather than failing the whole import otherwise. archive.ts
+      // imports episodes before memories precisely so this reference holds
+      // in the ordinary case.
+      episodeId?: string | null;
     },
     ctx?: CallContext,
   ): ImportMemoryResult;
+
+  // Portability import for the episodic log, same shape and same reasoning
+  // as importMemory above: inserts under the CALLER-SUPPLIED id so created_at
+  // (derived from that id) survives the round trip, and never overwrites --
+  // an id that already exists comes back skipped rather than applied.
+  importEpisode(
+    input: {
+      id: string;
+      content: string;
+      scope?: string;
+      sourceClient?: string | null;
+      metadata?: Record<string, unknown>;
+    },
+    ctx?: CallContext,
+  ): ImportEpisodeResult;
 
   episodes(
     options?: { scope?: string; limit?: number; cursor?: string | null },
@@ -736,17 +759,48 @@ export function openStore(options: StoreOptions = {}): Store {
       requireWritable("importMemory");
       const { sourceClient, scope } = gate(ctx, "import");
       const resolvedScope = input.scope ?? scope;
+      const { episodeId, ...repoInput } = input;
       // Invariant: the mutation and its audit row commit together or not
       // at all -- a failed audit insert must not leave a mutated store
       // with no trace of it in the §5 access log.
       return db.tx(() => {
-        const result = importMemoryRepo(db, { ...input, scope: resolvedScope });
+        let result = importMemoryRepo(db, { ...repoInput, scope: resolvedScope });
+        // See the episodeId doc comment on the Store interface above: wired
+        // up only when the reference resolves in THIS store, exactly like
+        // importMemoryRepo already does for supersededBy, and never on a
+        // skip -- there is no row to attach it to.
+        if (!result.skipped && episodeId) {
+          const target = db.q(`SELECT id FROM episodes WHERE id = ?`).get(episodeId);
+          if (target) {
+            db.q(`UPDATE memories SET episode_id = ? WHERE id = ?`).run(episodeId, input.id);
+            result = { ...result, memory: getMemory(db, input.id) };
+          }
+        }
         recordAudit(db, {
           action: "import",
           memoryId: result.memory?.id ?? input.id,
           scope: result.memory?.scope ?? resolvedScope ?? null,
           sourceClient,
           details: { skipped: result.skipped, reason: result.reason ?? null },
+        });
+        return result;
+      });
+    },
+
+    importEpisode(input, ctx) {
+      requireWritable("importEpisode");
+      const { sourceClient, scope } = gate(ctx, "import");
+      const resolvedScope = input.scope ?? scope;
+      // Invariant: the mutation and its audit row commit together or not
+      // at all -- a failed audit insert must not leave a mutated store
+      // with no trace of it in the §5 access log.
+      return db.tx(() => {
+        const result = importEpisodeRepo(db, { ...input, scope: resolvedScope });
+        recordAudit(db, {
+          action: "import",
+          scope: result.episode?.scope ?? resolvedScope ?? null,
+          sourceClient,
+          details: { skipped: result.skipped, reason: result.reason ?? null, episodeId: input.id },
         });
         return result;
       });

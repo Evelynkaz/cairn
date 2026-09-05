@@ -128,10 +128,18 @@ test("writeZip output passes `unzip -t` and extracts byte-identical content", (t
     return;
   }
   withTempDir((dir) => {
+    // ASCII names only: "-O" (charset override) is not supported by every
+    // UnZip build (it fails on some CI images with usage output and a
+    // non-zero exit), so it is not portable to pass here, and without it a
+    // build can guess the wrong charset for a non-ASCII name. What this
+    // test is really checking -- that a standard tool can read our archive
+    // and the bytes survive -- doesn't need a non-ASCII name to prove;
+    // UTF-8 filename coverage is verified separately below via python3's
+    // zipfile, which honors the UTF-8 flag (bit 11) directly.
     const entries: ZipEntry[] = [
       { name: "hello.txt", data: Buffer.from("hello, world\n") },
       { name: "nested/dir/file.bin", data: randomBytes(2000) },
-      { name: "ünicode.txt", data: Buffer.from("café") },
+      { name: "cafe.txt", data: Buffer.from("cafe") },
     ];
     const archive = writeZip(entries);
     const archivePath = join(dir, "out.zip");
@@ -140,14 +148,7 @@ test("writeZip output passes `unzip -t` and extracts byte-identical content", (t
     execFileSync("unzip", ["-t", archivePath], { stdio: "pipe" });
 
     const extractDir = join(dir, "extracted");
-    // This UnZip build only honors our archive's UTF-8 flag (bit 11) on
-    // names when told which charset to assume for output, rather than
-    // deriving it from the flag itself -- "-O UTF-8" makes that explicit.
-    // The archive bytes are already correct UTF-8 with the flag set (that
-    // is what the python3 zipfile test below verifies independently); this
-    // is a quirk of this particular unzip build's auto-detection, not of
-    // our writer.
-    execFileSync("unzip", ["-O", "UTF-8", "-o", "-q", archivePath, "-d", extractDir]);
+    execFileSync("unzip", ["-o", "-q", archivePath, "-d", extractDir]);
     for (const entry of entries) {
       const extractedPath = join(extractDir, entry.name);
       assert.ok(existsSync(extractedPath), `expected ${extractedPath} to exist`);
@@ -166,6 +167,7 @@ test("writeZip output is readable by python3's zipfile module with matching cont
     const entries: ZipEntry[] = [
       { name: "a.txt", data: Buffer.from("alpha") },
       { name: "b/c.txt", data: Buffer.from("beta".repeat(500)) },
+      { name: "ünicode-日本語.txt", data: Buffer.from("café") },
     ];
     const archive = writeZip(entries);
     const archivePath = join(dir, "out.zip");

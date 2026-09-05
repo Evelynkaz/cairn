@@ -151,6 +151,8 @@ const GATED_METHODS: Record<string, GatedInvoke> = {
   episode: (store, id, ctx) => store.episode(id, ctx),
   importMemory: (store, _id, ctx) =>
     store.importMemory({ id: uuidv7(), text: `gate probe ${uuidv7()}` }, ctx),
+  importEpisode: (store, _id, ctx) =>
+    store.importEpisode({ id: uuidv7(), content: `gate probe ${uuidv7()}` }, ctx),
 };
 
 // Deliberately ungated -- administrative/dashboard-side surface, not

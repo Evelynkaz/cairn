@@ -32,6 +32,14 @@ export interface ImportResult {
   imported: number;
   skipped: number;
   memories: number;
+  // Same shape as the memory fields above, one level down: episodes are a
+  // separate archive entry with their own import outcome, since a memory
+  // and its source episode can be skipped independently (e.g. the episode
+  // was already live from a prior import but the memory referencing it was
+  // pruned by a scope filter, or vice versa).
+  episodesImported: number;
+  episodesSkipped: number;
+  episodes: number;
 }
 
 /** Thrown for anything wrong with the ARCHIVE's contents -- corrupted,
@@ -79,6 +87,7 @@ interface MemoryRecord {
   supersededBy: string | null;
   deletedAt: number | null;
   redacted: boolean;
+  episodeId: string | null;
 }
 
 interface EpisodeRecord {
@@ -145,6 +154,7 @@ export function exportArchive(store: Store, options: ExportOptions = {}): Export
           supersededBy: m.supersededBy,
           deletedAt: m.deletedAt,
           redacted: m.redacted,
+          episodeId: m.episodeId,
         };
         memoryLines.push(JSON.stringify(record));
         memories += 1;
@@ -206,6 +216,15 @@ export function exportArchive(store: Store, options: ExportOptions = {}): Export
   return { archive: writeZip(entries), memories, episodes };
 }
 
+interface RawEpisodeLine {
+  id?: unknown;
+  content?: unknown;
+  scope?: unknown;
+  sourceClient?: unknown;
+  metadata?: unknown;
+  createdAt?: unknown;
+}
+
 interface RawMemoryLine {
   id?: unknown;
   text?: unknown;
@@ -220,6 +239,7 @@ interface RawMemoryLine {
   supersededBy?: unknown;
   deletedAt?: unknown;
   redacted?: unknown;
+  episodeId?: unknown;
 }
 
 // Splits JSONL content into lines without a trailing empty entry for the
@@ -277,6 +297,47 @@ function parseMemoryLines(data: Buffer, fileName: string): MemoryRecord[] {
       supersededBy: typeof r.supersededBy === "string" ? r.supersededBy : null,
       deletedAt: typeof r.deletedAt === "number" ? r.deletedAt : null,
       redacted: r.redacted === true,
+      episodeId: typeof r.episodeId === "string" ? r.episodeId : null,
+    });
+  }
+  return records;
+}
+
+// Parses and validates episodes.jsonl. Same hostile-input treatment as
+// parseMemoryLines: a cap on total lines, and any malformed line refuses the
+// WHOLE file rather than silently dropping that one episode. The error
+// names the file and line number but never echoes the line's content, which
+// is episode content and may contain secrets.
+function parseEpisodeLines(data: Buffer, fileName: string): EpisodeRecord[] {
+  const lines = splitLines(data);
+  if (lines.length > MAX_LINES) {
+    throw new ArchiveFormatError(`${fileName} has ${lines.length} lines, exceeding the cap of ${MAX_LINES}`);
+  }
+
+  const records: EpisodeRecord[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const lineNumber = i + 1;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(lines[i]!);
+    } catch {
+      throw new ArchiveFormatError(`${fileName}:${lineNumber}: malformed JSON`);
+    }
+    if (typeof parsed !== "object" || parsed === null) {
+      throw new ArchiveFormatError(`${fileName}:${lineNumber}: not a JSON object`);
+    }
+    const r = parsed as RawEpisodeLine;
+    if (typeof r.id !== "string" || typeof r.content !== "string") {
+      throw new ArchiveFormatError(`${fileName}:${lineNumber}: missing required "id" or "content" field`);
+    }
+    records.push({
+      id: r.id,
+      content: r.content,
+      scope: typeof r.scope === "string" ? r.scope : DEFAULT_SCOPE,
+      sourceClient: typeof r.sourceClient === "string" ? r.sourceClient : null,
+      metadata:
+        typeof r.metadata === "object" && r.metadata !== null ? (r.metadata as Record<string, unknown>) : {},
+      createdAt: typeof r.createdAt === "number" ? r.createdAt : 0,
     });
   }
   return records;
@@ -337,11 +398,43 @@ export function importArchive(store: Store, archive: Buffer): ImportResult {
     }
   }
 
+  const episodesEntry = findEntry(entries, "episodes.jsonl");
+  if (!episodesEntry) {
+    throw new ArchiveFormatError("archive is missing episodes.jsonl");
+  }
+  const episodeRecords = parseEpisodeLines(episodesEntry.data, "episodes.jsonl");
+
   const memoriesEntry = findEntry(entries, "memories.jsonl");
   if (!memoriesEntry) {
     throw new ArchiveFormatError("archive is missing memories.jsonl");
   }
   const records = parseMemoryLines(memoriesEntry.data, "memories.jsonl");
+
+  // Episodes import BEFORE memories: a memory carries an episodeId, and
+  // memories.episode_id is a `REFERENCES episodes(id)` foreign key with
+  // PRAGMA foreign_keys=ON (storage/db.ts) -- inserting a memory ahead of
+  // the episode it references would fail that constraint. This also means
+  // an imported memory's episodeId resolves to a real row in the
+  // destination store, not just in the source it came from.
+  let episodesImported = 0;
+  let episodesSkipped = 0;
+  for (const record of episodeRecords) {
+    const result = store.importEpisode(
+      {
+        id: record.id,
+        content: record.content,
+        scope: record.scope,
+        sourceClient: record.sourceClient,
+        metadata: record.metadata,
+      },
+      CTX,
+    );
+    if (result.skipped) {
+      episodesSkipped += 1;
+    } else {
+      episodesImported += 1;
+    }
+  }
 
   // Import preserves the original ids from the exporting store rather than
   // minting fresh ones -- see the doc comment on
@@ -366,6 +459,7 @@ export function importArchive(store: Store, archive: Buffer): ImportResult {
         supersededBy: record.supersededBy,
         deletedAt: record.deletedAt,
         redacted: record.redacted,
+        episodeId: record.episodeId,
       },
       CTX,
     );
@@ -376,5 +470,12 @@ export function importArchive(store: Store, archive: Buffer): ImportResult {
     }
   }
 
-  return { imported, skipped, memories: records.length };
+  return {
+    imported,
+    skipped,
+    memories: records.length,
+    episodesImported,
+    episodesSkipped,
+    episodes: episodeRecords.length,
+  };
 }

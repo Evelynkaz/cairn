@@ -27,6 +27,7 @@ export type {
 export type { AuditAction, ListAuditOptions, ListAuditResult, ClientAuditCounts } from "./repositories/audit.js";
 
 export type { ImportMemoryResult, ImportMemorySkipReason } from "./repositories/memories.js";
+export type { ImportEpisodeResult, ImportEpisodeSkipReason } from "./repositories/episodes.js";
 
 export {
   recordRedactions,

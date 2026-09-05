@@ -121,10 +121,62 @@ test("re-importing the same archive into the same store imports nothing the seco
     const first = importArchive(store, archive);
     assert.equal(first.imported, 0); // already live in this same store
     assert.equal(first.skipped, 1);
+    assert.equal(first.episodesImported, 0); // already live from remember() above
+    assert.equal(first.episodesSkipped, 1);
 
     const second = importArchive(store, archive);
     assert.equal(second.imported, 0);
     assert.equal(second.skipped, 1);
+    assert.equal(second.episodesImported, 0);
+    assert.equal(second.episodesSkipped, 1);
+  });
+});
+
+test("round trip restores both memories and episodes, with original ids and createdAt", () => {
+  withStore((source) => {
+    const { memory: first, episodeId: firstEpisodeId } = source.remember({ content: "first fact" });
+    waitForNextMs();
+    const { memory: second, episodeId: secondEpisodeId } = source.remember({ content: "second fact" });
+
+    const sourceEpisodes = source.episodes().items;
+    assert.equal(sourceEpisodes.length, 2);
+
+    const { archive } = exportArchive(source);
+
+    withStore((dest) => {
+      const result = importArchive(dest, archive);
+      assert.equal(result.imported, 2);
+      assert.equal(result.skipped, 0);
+      assert.equal(result.episodesImported, 2);
+      assert.equal(result.episodesSkipped, 0);
+      assert.equal(result.episodes, 2);
+
+      const destEpisodes = dest.episodes().items;
+      assert.equal(destEpisodes.length, 2);
+      for (const original of sourceEpisodes) {
+        const imported = dest.episode(original.id);
+        assert.ok(imported, `episode ${original.id} was not imported`);
+        assert.equal(imported.id, original.id);
+        assert.equal(imported.createdAt, original.createdAt);
+        assert.equal(imported.content, original.content);
+        assert.equal(imported.scope, original.scope);
+        assert.equal(imported.sourceClient, original.sourceClient);
+        assert.deepEqual(imported.metadata, original.metadata);
+      }
+
+      // A memory's episodeId must still resolve to a real episode in the
+      // destination store, not merely to a value carried over from the
+      // source -- episodes import first (FK order) precisely so this holds.
+      for (const [memory, episodeId] of [
+        [first, firstEpisodeId],
+        [second, secondEpisodeId],
+      ] as const) {
+        const importedMemory = dest.get(memory.id);
+        assert.ok(importedMemory);
+        assert.equal(importedMemory?.episodeId, episodeId);
+        assert.ok(dest.episode(episodeId), `memory ${memory.id}'s episodeId does not resolve in the destination store`);
+      }
+    });
   });
 });
 

@@ -4,7 +4,8 @@ import { withTempDir, tempDbPath } from "../../testing/tmp.js";
 import { openDb } from "../db.js";
 import type { CairnDb } from "../db.js";
 import { timestampFromUuidv7 } from "../../util/id.js";
-import { appendEpisode, getEpisode, listEpisodes } from "./episodes.js";
+import { uuidv7 } from "../../util/id.js";
+import { appendEpisode, getEpisode, importEpisode, listEpisodes } from "./episodes.js";
 import { createMemory, getMemory } from "./memories.js";
 import { clampLimit } from "./paging.js";
 
@@ -108,6 +109,64 @@ test("listEpisodes filters by scope", () => {
     const result = listEpisodes(db, { scope: "work" });
     assert.equal(result.items.length, 1);
     assert.equal(result.items[0]?.scope, "work");
+  });
+});
+
+test("importEpisode inserts under the caller-supplied id, with created_at derived from it", () => {
+  withDb((db) => {
+    const id = uuidv7();
+    const result = importEpisode(db, {
+      id,
+      content: "imported content",
+      scope: "work",
+      sourceClient: "claude-desktop",
+      metadata: { channel: "chat" },
+    });
+
+    assert.equal(result.skipped, false);
+    assert.ok(result.episode);
+    assert.equal(result.episode?.id, id);
+    assert.equal(result.episode?.content, "imported content");
+    assert.equal(result.episode?.scope, "work");
+    assert.equal(result.episode?.sourceClient, "claude-desktop");
+    assert.deepEqual(result.episode?.metadata, { channel: "chat" });
+    assert.equal(result.episode?.createdAt, timestampFromUuidv7(id));
+  });
+});
+
+test("importEpisode: an id already present is skipped, never overwritten", () => {
+  withDb((db) => {
+    const original = appendEpisode(db, { content: "original" });
+
+    const result = importEpisode(db, { id: original.id, content: "attempted overwrite" });
+
+    assert.equal(result.skipped, true);
+    assert.equal(result.reason, "duplicate-id");
+    assert.equal(result.episode, undefined);
+    assert.deepEqual(getEpisode(db, original.id), original);
+  });
+});
+
+test("importEpisode: re-importing the same archive line twice is a no-op the second time", () => {
+  withDb((db) => {
+    const id = uuidv7();
+    const first = importEpisode(db, { id, content: "only once" });
+    assert.equal(first.skipped, false);
+
+    const second = importEpisode(db, { id, content: "only once" });
+    assert.equal(second.skipped, true);
+    assert.equal(second.reason, "duplicate-id");
+  });
+});
+
+test("importEpisode: a malformed uuidv7 is refused, not stored", () => {
+  withDb((db) => {
+    assert.throws(
+      () => importEpisode(db, { id: "not-a-real-uuid", content: "nope" }),
+      /not a canonical UUIDv7/,
+    );
+    const row = db.q(`SELECT COUNT(*) AS c FROM episodes`).get();
+    assert.equal(row?.["c"], 0);
   });
 });
 
