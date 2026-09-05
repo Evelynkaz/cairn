@@ -255,13 +255,15 @@ test("multiple findings splice correctly: adjacent (zero-gap), at start, at end"
 // maxFindings bounds pathological input
 // ---------------------------------------------------------------------------
 
-test("maxFindings bounds a pathological input and returns promptly", () => {
+test("a pathological input with many non-overlapping findings is fully redacted and returns promptly (CRITICAL-1: the cap must bound reporting, never redaction)", () => {
   const tokens = Array.from({ length: 10000 }, (_, i) => `bearer token${i}1234567890`);
   const text = tokens.join(" ");
   const start = Date.now();
   const findings = detectSecrets(text);
   const elapsed = Date.now() - start;
-  assert.ok(findings.length <= 100);
+  // Every one of the 10000 tokens must be found -- not silently capped --
+  // or the surplus would be stored raw with no signal anything was wrong.
+  assert.equal(findings.length, 10000);
   assert.ok(elapsed < 5000, `detectSecrets took too long: ${elapsed}ms`);
 });
 
@@ -278,4 +280,243 @@ test("maxFindings option is respected", () => {
 test("determinism: same input twice, identical output", () => {
   const text = `Authorization: Bearer abcdefghij1234567890 and AKIAIOSFODNN7EXAMPLE`;
   assert.deepEqual(detectSecrets(text), detectSecrets(text));
+});
+
+// ---------------------------------------------------------------------------
+// CRITICAL-2: maskPreview must never reveal trailing characters
+// ---------------------------------------------------------------------------
+
+test("CRITICAL-2: a short password preview reveals no trailing characters", () => {
+  const password = "hunter222";
+  const text = `postgres://admin:${password}@db/x`;
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "url-password");
+  assert.ok(!finding.preview.includes("hunter"));
+  assert.ok(!finding.preview.endsWith("222"));
+  assert.ok(!finding.preview.includes(password.slice(-4)));
+});
+
+test("CRITICAL-2: url-password and generic-bearer previews are fully masked regardless of length", () => {
+  const longPassword = "ThisIsAVeryLongPasswordValue1234567890";
+  const [urlFinding] = detectSecrets(`postgres://admin:${longPassword}@db/x`);
+  assert.equal(urlFinding?.kind, "url-password");
+  assert.equal(urlFinding.preview, "*".repeat(8));
+
+  const longToken = "a".repeat(40);
+  const [bearerFinding] = detectSecrets(`Authorization: Bearer ${longToken}`);
+  assert.equal(bearerFinding?.kind, "generic-bearer");
+  assert.equal(bearerFinding.preview, "*".repeat(8));
+});
+
+test("CRITICAL-2: a long, non-fully-masked kind shows only a leading prefix, never a tail", () => {
+  const secret = "AKIAIOSFODNN7EXAMPLE";
+  const [finding] = detectSecrets(`key=${secret}`);
+  assert.equal(finding?.preview, `AKIA${"*".repeat(8)}`);
+  assert.ok(!finding.preview.includes(secret.slice(-4)));
+});
+
+// ---------------------------------------------------------------------------
+// CRITICAL-3: generic-bearer must not truncate at '+' or '/'
+// ---------------------------------------------------------------------------
+
+test("CRITICAL-3: a base64 bearer token is redacted whole, no tail survives", () => {
+  const token = "YWJjZGVmZ2hpams+bG1ub3AQRSTUV=";
+  const text = `Authorization: Bearer ${token}`;
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "generic-bearer");
+  assert.equal(text.slice(finding.start, finding.end), token);
+  assert.equal(finding.end, text.length);
+});
+
+// ---------------------------------------------------------------------------
+// HIGH-4: PRIVATE_KEY_BLOCK header-only fallback
+// ---------------------------------------------------------------------------
+
+test("HIGH-4: a truncated PEM block (no END line) is still detected", () => {
+  const text = [
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu",
+    "KUpRKfFLfRYC9AIKjbJTWit+CqvjWYzvQwECAwEAAQJAIJLixBy2qpFoS4DSmoEm",
+  ].join("\n");
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "private-key-block");
+  assert.equal(finding.start, 0);
+  assert.equal(finding.end, text.length);
+});
+
+test("HIGH-4: a mismatched footer label (BEGIN RSA / END PRIVATE KEY) is still detected", () => {
+  const text = [
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu",
+    "-----END PRIVATE KEY-----",
+  ].join("\n");
+  const findings = detectSecrets(text);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0]?.kind, "private-key-block");
+  assert.equal(findings[0]?.start, 0);
+});
+
+test("HIGH-4: a lowercase BEGIN/END label is still detected", () => {
+  const text = [
+    "-----begin rsa private key-----",
+    "MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu",
+    "-----end rsa private key-----",
+  ].join("\n");
+  const findings = detectSecrets(text);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0]?.kind, "private-key-block");
+  assert.equal(findings[0]?.end, text.length);
+});
+
+// ---------------------------------------------------------------------------
+// HIGH-5: quoted aws_secret_access_key form
+// ---------------------------------------------------------------------------
+
+test("HIGH-5: the quoted JSON/YAML/tfvars aws_secret_access_key form is detected", () => {
+  const secret = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY01"; // 40 chars, synthetic
+  assert.equal(secret.length, 40);
+  const text = `"aws_secret_access_key": "${secret}"`;
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "aws-secret-access-key");
+  assert.equal(text.slice(finding.start, finding.end), secret);
+});
+
+// ---------------------------------------------------------------------------
+// HIGH-6: URL_PASSWORD shapes
+// ---------------------------------------------------------------------------
+
+test("HIGH-6: an empty user part is detected (redis://:password@host)", () => {
+  const password = "justapassword";
+  const text = `redis://:${password}@10.0.0.5:6379/0`;
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "url-password");
+  assert.equal(text.slice(finding.start, finding.end), password);
+});
+
+test("HIGH-6: a '/' inside the password is detected in full", () => {
+  const password = "pa/ss";
+  const text = `postgres://admin:${password}@host/db`;
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "url-password");
+  assert.equal(text.slice(finding.start, finding.end), password);
+});
+
+test("HIGH-6: http/https inline credentials are not flagged (example-text tradeoff)", () => {
+  assert.deepEqual(detectSecrets("https://user:guide@example.com/page"), []);
+});
+
+// ---------------------------------------------------------------------------
+// HIGH-7: newly added prefixed-token detectors
+// ---------------------------------------------------------------------------
+
+test("HIGH-7: gitlab-token: glpat- prefix", () => {
+  const secret = "glpat-" + "x".repeat(20);
+  const [finding] = detectSecrets(`token: ${secret}`);
+  assert.equal(finding?.kind, "gitlab-token");
+});
+
+test("HIGH-7: slack-token: xapp- prefix", () => {
+  const secret = "xapp-1-A0123456789-0123456789012-abcdefghijklmnopqrstuvwxyz";
+  const [finding] = detectSecrets(`SLACK_APP_TOKEN=${secret}`);
+  assert.equal(finding?.kind, "slack-token");
+});
+
+test("HIGH-7: slack-token: xoxe- prefix", () => {
+  const secret = "xoxe-1-" + "a".repeat(20);
+  const [finding] = detectSecrets(`SLACK_TOKEN=${secret}`);
+  assert.equal(finding?.kind, "slack-token");
+});
+
+test("HIGH-7: slack-webhook: incoming webhook URL", () => {
+  const url = "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX";
+  const [finding] = detectSecrets(`webhook: ${url}`);
+  assert.equal(finding?.kind, "slack-webhook");
+});
+
+test("HIGH-7: npm-token: npm_ prefix", () => {
+  const secret = "npm_" + "x".repeat(30);
+  const [finding] = detectSecrets(`.npmrc: //registry.npmjs.org/:_authToken=${secret}`);
+  assert.equal(finding?.kind, "npm-token");
+});
+
+test("HIGH-7: huggingface-token: hf_ prefix", () => {
+  const secret = "hf_" + "x".repeat(30);
+  const [finding] = detectSecrets(`HF_TOKEN=${secret}`);
+  assert.equal(finding?.kind, "huggingface-token");
+});
+
+test("HIGH-7: sendgrid-key: SG. prefix", () => {
+  const secret = `SG.${"x".repeat(22)}.${"y".repeat(43)}`;
+  const [finding] = detectSecrets(`SENDGRID_API_KEY=${secret}`);
+  assert.equal(finding?.kind, "sendgrid-key");
+});
+
+test("HIGH-7: pypi-token: pypi- prefix", () => {
+  const secret = "pypi-" + "A".repeat(30);
+  const [finding] = detectSecrets(`token: ${secret}`);
+  assert.equal(finding?.kind, "pypi-token");
+});
+
+test("HIGH-7: aws-session-token: only fires next to an aws_session_token assignment", () => {
+  const secret = "fakeSessionTokenfakeSessionTokenfakeSessionToken1234567890";
+  const [finding] = detectSecrets(`aws_session_token = "${secret}"`);
+  assert.equal(finding?.kind, "aws-session-token");
+});
+
+test("HIGH-7: putty-private-key: PuTTY-User-Key-File header", () => {
+  const text = [
+    "PuTTY-User-Key-File-3: ssh-rsa",
+    "Encryption: none",
+    "Comment: synthetic",
+    "Public-Lines: 1",
+    "AAAAB3NzaC1yc2EAAAA=",
+  ].join("\n");
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "putty-private-key");
+  assert.equal(finding.start, 0);
+});
+
+// ---------------------------------------------------------------------------
+// HIGH-8: .env-style assignment detector
+// ---------------------------------------------------------------------------
+
+test("HIGH-8: DB_PASSWORD=value is detected, only the value is redacted", () => {
+  const text = "DB_PASSWORD=hunter2hunter2";
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "env-secret");
+  assert.equal(text.slice(finding.start, finding.end), "hunter2hunter2");
+});
+
+test("HIGH-8: SECRET_KEY: value (colon form) is detected", () => {
+  const text = "SECRET_KEY: 8f14e45fceea167a5a36dedd4bea2543";
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "env-secret");
+  assert.equal(text.slice(finding.start, finding.end), "8f14e45fceea167a5a36dedd4bea2543");
+});
+
+test("HIGH-8: quoted API_TOKEN=\"value\" is detected", () => {
+  const text = 'API_TOKEN="abcdef0123456789"';
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "env-secret");
+  assert.equal(text.slice(finding.start, finding.end), "abcdef0123456789");
+});
+
+// ---------------------------------------------------------------------------
+// ReDoS: adversarial long input must not hang
+// ---------------------------------------------------------------------------
+
+test("adversarial input near every new/widened regex boundary completes quickly", () => {
+  const parts = [
+    "bearer " + "a+/~".repeat(5000), // GENERIC_BEARER widened charset
+    "-----BEGIN RSA PRIVATE KEY-----" + "\n".repeat(2000) + "x".repeat(20000), // PRIVATE_KEY header fallback
+    "PuTTY-User-Key-File-2:" + "y".repeat(50000), // PUTTY header fallback
+    "postgres://" + "a".repeat(5000) + ":" + "b".repeat(5000) + "@host/db", // URL_PASSWORD
+    "TOKEN=" + "z".repeat(50000), // ENV_KEY
+    '"aws_secret_access_key": "' + "w".repeat(50000) + '"', // AWS_SECRET_ACCESS_KEY
+  ];
+  const text = parts.join("\n\n");
+  const start = Date.now();
+  detectSecrets(text);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 5000, `detectSecrets took too long on adversarial input: ${elapsed}ms`);
 });

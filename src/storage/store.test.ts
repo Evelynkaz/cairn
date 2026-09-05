@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rmSync } from "node:fs";
+import { rmSync, readFileSync } from "node:fs";
 import { withTempDir, makeTempDir, tempDbPath } from "../testing/tmp.js";
 import { openStore } from "./store.js";
 import type { CallContext, Store } from "./store.js";
@@ -925,6 +925,251 @@ test("redactions() and redactionStats() return what recordRedactions wrote", () 
 // the very secret it existed to hide (commit 5b6a9f0). Guard it here: the
 // preview stored in `redactions` must never contain the raw secret in ANY
 // field of what Store.redactions() returns.
+test("update() in 'strict' mode refuses a secret and writes nothing", () => {
+  withStore((store) => {
+    const { memory } = store.remember({ content: "before" });
+    setPrivacyMode(store.db, "strict");
+
+    assert.throws(
+      () => store.update(memory.id, { text: `AWS key: ${AWS_KEY}` }),
+      /strict/,
+    );
+
+    const fetched = store.get(memory.id);
+    assert.equal(fetched?.text, "before");
+    assert.equal(dbContainsRawBytes(store.db, AWS_KEY), false);
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions WHERE action = 'blocked'`).all();
+    assert.equal(redactionRows.length, 1);
+    assert.equal(redactionRows[0]?.["memory_id"], memory.id);
+  });
+});
+
+test("update() in 'on' mode stores redacted text, sets redacted, and writes a redactions row; the raw secret is nowhere, including memories_fts", () => {
+  withStore((store) => {
+    const { memory } = store.remember({ content: "before" });
+    setPrivacyMode(store.db, "on");
+
+    const updated = store.update(memory.id, { text: `AWS key: ${AWS_KEY}` });
+
+    assert.equal(updated.redacted, true);
+    assert.match(updated.text, /\[redacted:aws-access-key-id\]/);
+    assert.ok(!updated.text.includes(AWS_KEY));
+
+    assert.equal(dbContainsRawBytes(store.db, AWS_KEY), false);
+
+    const ftsRows = store.db.q(`SELECT * FROM memories_fts`).all();
+    for (const row of ftsRows) {
+      for (const value of Object.values(row)) {
+        if (typeof value === "string") {
+          assert.ok(!value.includes(AWS_KEY));
+        }
+      }
+    }
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions WHERE action = 'redacted'`).all();
+    assert.equal(redactionRows.length, 1);
+    assert.equal(redactionRows[0]?.["memory_id"], memory.id);
+  });
+});
+
+test("supersede() in 'strict' mode refuses a secret and writes no replacement", () => {
+  withStore((store) => {
+    const { memory } = store.remember({ content: "old text" });
+    setPrivacyMode(store.db, "strict");
+
+    assert.throws(
+      () => store.supersede(memory.id, { text: `github token ${GH_TOKEN}` }),
+      /strict/,
+    );
+
+    const fetched = store.get(memory.id);
+    assert.equal(fetched?.text, "old text");
+    assert.equal(fetched?.validUntil, null);
+    assert.equal(countRows(store, "memories"), 1);
+    assert.equal(dbContainsRawBytes(store.db, GH_TOKEN), false);
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions WHERE action = 'blocked'`).all();
+    assert.equal(redactionRows.length, 1);
+  });
+});
+
+test("supersede() in 'on' mode stores redacted replacement text, sets redacted, and writes a redactions row; the raw secret is nowhere, including memories_fts", () => {
+  withStore((store) => {
+    const { memory } = store.remember({ content: "old text" });
+    setPrivacyMode(store.db, "on");
+
+    const { replacement } = store.supersede(memory.id, { text: `github token ${GH_TOKEN}` });
+
+    assert.equal(replacement.redacted, true);
+    assert.match(replacement.text, /\[redacted:github-token\]/);
+    assert.ok(!replacement.text.includes(GH_TOKEN));
+
+    assert.equal(dbContainsRawBytes(store.db, GH_TOKEN), false);
+
+    const ftsRows = store.db.q(`SELECT * FROM memories_fts`).all();
+    for (const row of ftsRows) {
+      for (const value of Object.values(row)) {
+        if (typeof value === "string") {
+          assert.ok(!value.includes(GH_TOKEN));
+        }
+      }
+    }
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions WHERE action = 'redacted'`).all();
+    assert.equal(redactionRows.length, 1);
+    assert.equal(redactionRows[0]?.["memory_id"], replacement.id);
+  });
+});
+
+test("setPrivacy does not persist to settings when CAIRN_PRIVACY is set", () => {
+  const original = process.env["CAIRN_PRIVACY"];
+  process.env["CAIRN_PRIVACY"] = "strict";
+  try {
+    withStore((store) => {
+      store.setPrivacy("off");
+
+      const row = store.db.q(`SELECT value FROM settings WHERE key = 'privacy.mode'`).get();
+      assert.equal(row, undefined);
+    });
+  } finally {
+    if (original === undefined) {
+      delete process.env["CAIRN_PRIVACY"];
+    } else {
+      process.env["CAIRN_PRIVACY"] = original;
+    }
+  }
+});
+
+test("importMemory in 'strict' mode refuses the whole import and does not trust the archive's own redacted:true claim", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "strict");
+    const id = uuidv7();
+
+    assert.throws(
+      () =>
+        store.importMemory({
+          id,
+          // A hostile archive claiming redacted: true must not bypass
+          // detection -- the flag stored is always re-derived, never trusted.
+          text: `AWS key: ${AWS_KEY}`,
+          redacted: true,
+        }),
+      /strict/,
+    );
+
+    assert.equal(store.get(id), undefined);
+    assert.equal(countRows(store, "memories"), 0);
+    assert.equal(dbContainsRawBytes(store.db, AWS_KEY), false);
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions WHERE action = 'blocked'`).all();
+    assert.equal(redactionRows.length, 1);
+  });
+});
+
+test("importMemory in 'on' mode stores redacted text, sets redacted, and writes a redactions row regardless of the archive's own redacted claim; the raw secret is nowhere, including memories_fts", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "on");
+    const id = uuidv7();
+
+    const result = store.importMemory({
+      id,
+      text: `AWS key: ${AWS_KEY}`,
+      // The archive claims false -- must not be trusted either.
+      redacted: false,
+    });
+
+    assert.ok(result.memory);
+    assert.equal(result.memory.redacted, true);
+    assert.match(result.memory.text, /\[redacted:aws-access-key-id\]/);
+    assert.ok(!result.memory.text.includes(AWS_KEY));
+
+    assert.equal(dbContainsRawBytes(store.db, AWS_KEY), false);
+
+    const ftsRows = store.db.q(`SELECT * FROM memories_fts`).all();
+    for (const row of ftsRows) {
+      for (const value of Object.values(row)) {
+        if (typeof value === "string") {
+          assert.ok(!value.includes(AWS_KEY));
+        }
+      }
+    }
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions WHERE action = 'redacted'`).all();
+    assert.equal(redactionRows.length, 1);
+    assert.equal(redactionRows[0]?.["memory_id"], id);
+  });
+});
+
+test("importEpisode in 'strict' mode refuses the whole import; 'on' mode stores redacted content and writes a redactions row", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "strict");
+    const blockedId = uuidv7();
+
+    assert.throws(
+      () => store.importEpisode({ id: blockedId, content: `github token ${GH_TOKEN}` }),
+      /strict/,
+    );
+    assert.equal(store.episode(blockedId), undefined);
+    assert.equal(countRows(store, "episodes"), 0);
+    assert.equal(dbContainsRawBytes(store.db, GH_TOKEN), false);
+
+    setPrivacyMode(store.db, "on");
+    const redactedId = uuidv7();
+    const result = store.importEpisode({ id: redactedId, content: `github token ${GH_TOKEN}` });
+
+    assert.ok(result.episode);
+    assert.match(result.episode.content, /\[redacted:github-token\]/);
+    assert.ok(!result.episode.content.includes(GH_TOKEN));
+    assert.equal(dbContainsRawBytes(store.db, GH_TOKEN), false);
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions WHERE action = 'redacted'`).all();
+    assert.equal(redactionRows.length, 1);
+    assert.equal(redactionRows[0]?.["episode_id"], redactedId);
+  });
+});
+
+test("forget() hides the memory's provenance episode from the default episode read path; restore() reveals it again", () => {
+  withStore((store) => {
+    const { memory, episodeId } = store.remember({ content: "please forget this too" });
+    store.forget(memory.id);
+
+    assert.equal(store.episode(episodeId), undefined);
+    assert.ok(!store.episodes().items.some((e) => e.id === episodeId));
+
+    assert.ok(store.episode(episodeId, undefined, { includeDeleted: true }));
+    assert.ok(
+      store.episodes({ includeDeleted: true }).items.some((e) => e.id === episodeId),
+    );
+
+    store.restore(memory.id);
+    assert.ok(store.episode(episodeId));
+    assert.ok(store.episodes().items.some((e) => e.id === episodeId));
+  });
+});
+
+test("deleteEverything leaves no raw bytes of deleted content in the database file", () => {
+  withTempDir((dir) => {
+    const path = tempDbPath(dir);
+    // Deliberately NOT shaped like a secret (see AWS_KEY/GH_TOKEN above):
+    // this test is about deleteEverything's VACUUM/secure_delete leaving no
+    // trace at all, not about §10 redaction -- a secret-shaped marker would
+    // get redacted at write time (the default privacy mode is "on"),
+    // masking the very thing this test needs to observe.
+    const marker = "MARKER-PHRASE-FOR-VACUUM-TEST-1234567890";
+    const store = openStore({ path });
+    for (let i = 0; i < 5; i++) {
+      store.remember({ content: `${marker} entry ${i}` });
+    }
+    store.deleteEverything({ confirm: true });
+    store.close();
+
+    const bytes = readFileSync(path);
+    const occurrences = bytes.toString("latin1").split(marker).length - 1;
+    assert.equal(occurrences, 0);
+  });
+});
+
 test("redactions() never returns an unmasked secret", () => {
   withStore((store) => {
     setPrivacyMode(store.db, "on");
@@ -939,15 +1184,179 @@ test("redactions() never returns an unmasked secret", () => {
           assert.ok(!value.includes(GH_TOKEN), `field leaked the raw GitHub token: ${value}`);
         }
       }
-      // Not just "no full value" -- assert the actual masking shape
-      // (maskPreview: 4 leading + "…" + 4 trailing chars for anything over 8
-      // chars long), so a regression that keeps, say, 16 trailing chars of a
-      // 20-char key still fails this guard.
+      // Not just "no full value" -- a trailing slice of a short value can be
+      // most of it (the CVE-shaped bug ../privacy/detectors.ts's maskPreview
+      // comment describes), so masking was tightened to NEVER reveal
+      // trailing characters: a fixed-length run of asterisks, optionally
+      // preceded by up to a 4-char leading prefix (a type signal like
+      // "AKIA"/"ghp_", not entropy) for values long enough that the prefix
+      // isn't itself most of the value. Assert both the fixed shape AND that
+      // no substring of the original secret longer than that 4-char prefix
+      // ever appears in the preview, so a regression that widens the
+      // revealed prefix (or un-masks a "fully masked" kind) still fails this
+      // guard even if it keeps some other shape that happens to match a
+      // looser regex.
       assert.match(
         item.preview,
-        /^.{4}….{4}$/u,
-        `preview did not match the expected 4…4 mask shape: ${item.preview}`,
+        /^(?:.{4})?\*{8}$/u,
+        `preview did not match the expected [4-char prefix]+asterisks mask shape: ${item.preview}`,
       );
+      for (const secret of [AWS_KEY, GH_TOKEN]) {
+        for (let len = 5; len <= secret.length; len++) {
+          for (let start = 0; start + len <= secret.length; start++) {
+            assert.ok(
+              !item.preview.includes(secret.slice(start, start + len)),
+              `preview leaked a ${len}-char substring of the secret beyond the leading prefix: ${item.preview}`,
+            );
+          }
+        }
+      }
     }
+  });
+});
+
+// Same caps as src/dashboard/api.ts's clampTags/clampScope/64 KiB content
+// bound -- see store.ts's own comment above assertTagsWithinCap for why they
+// are restated here rather than imported. A single caller-supplied `tags`
+// array re-applied to every entry of a paste import, with no cap anywhere,
+// measured at 7.9 minutes of synchronous work from a 23,798-byte request;
+// the HTTP boundary is fixed in api.ts, but every MCP tool call reaches
+// remember()/update()/supersede()/import* directly, bypassing it entirely.
+const OVER_CAP_TAGS = Array.from({ length: 2000 }, (_, i) => `tag-${i}`);
+const OVERLONG_CONTENT = "x".repeat(65537);
+
+test("remember refuses 2,000 tags but still succeeds unchanged with a handful", () => {
+  withStore((store) => {
+    assert.throws(
+      () => store.remember({ content: "too many tags", tags: OVER_CAP_TAGS }),
+      /tags exceeds the cap/,
+    );
+    assert.equal(countRows(store, "memories"), 0);
+
+    const { memory } = store.remember({ content: "a few tags", tags: ["a", "b", "c"] });
+    assert.deepEqual(memory.tags, ["a", "b", "c"]);
+  });
+});
+
+test("remember refuses a single over-long tag", () => {
+  withStore((store) => {
+    assert.throws(
+      () => store.remember({ content: "one bad tag", tags: ["x".repeat(65)] }),
+      /tag exceeds the cap of 64 characters/,
+    );
+    assert.equal(countRows(store, "memories"), 0);
+  });
+});
+
+test("remember refuses over-long content with a fixed message; normal content still succeeds", () => {
+  withStore((store) => {
+    assert.throws(
+      () => store.remember({ content: OVERLONG_CONTENT }),
+      /content exceeds the cap of 65536 characters/,
+    );
+    assert.equal(countRows(store, "memories"), 0);
+
+    const { memory } = store.remember({ content: "a perfectly normal memory" });
+    assert.equal(memory.text, "a perfectly normal memory");
+  });
+});
+
+test("update refuses over-cap tags and over-long text, and a normal patch still succeeds", () => {
+  withStore((store) => {
+    const { memory } = store.remember({ content: "before" });
+
+    assert.throws(
+      () => store.update(memory.id, { tags: OVER_CAP_TAGS }),
+      /tags exceeds the cap/,
+    );
+    assert.throws(
+      () => store.update(memory.id, { text: OVERLONG_CONTENT }),
+      /text exceeds the cap of 65536 characters/,
+    );
+    assert.equal(store.get(memory.id)?.text, "before");
+
+    const updated = store.update(memory.id, { text: "after", tags: ["ok"] });
+    assert.equal(updated.text, "after");
+    assert.deepEqual(updated.tags, ["ok"]);
+  });
+});
+
+test("supersede refuses over-cap tags and over-long text, and a normal call still succeeds", () => {
+  withStore((store) => {
+    const { memory } = store.remember({ content: "original" });
+
+    assert.throws(
+      () => store.supersede(memory.id, { text: "replacement", tags: OVER_CAP_TAGS }),
+      /tags exceeds the cap/,
+    );
+    assert.throws(
+      () => store.supersede(memory.id, { text: OVERLONG_CONTENT }),
+      /text exceeds the cap of 65536 characters/,
+    );
+    // Neither refused call produced a replacement row.
+    assert.equal(countRows(store, "memories"), 1);
+
+    const { replacement } = store.supersede(memory.id, { text: "replacement", tags: ["ok"] });
+    assert.equal(replacement.text, "replacement");
+  });
+});
+
+// The audit's "N entries x unbounded tags" amplification is exactly the
+// import path (a pasted archive re-applies one tags array across every
+// parsed entry), so an over-cap `tags` array is refused the same way as
+// remember's -- and, matching the existing strict-mode refusal shape for
+// import, refuses the WHOLE import rather than silently dropping the tags
+// or importing that one line untagged.
+test("importMemory refuses (not truncates) over-cap tags, and a normal import still succeeds", () => {
+  withStore((store) => {
+    const badId = uuidv7();
+    assert.throws(
+      () => store.importMemory({ id: badId, text: "imported", tags: OVER_CAP_TAGS }),
+      /tags exceeds the cap/,
+    );
+    assert.equal(store.get(badId), undefined);
+
+    const goodId = uuidv7();
+    const result = store.importMemory({ id: goodId, text: "imported", tags: ["ok"] });
+    assert.deepEqual(result.memory?.tags, ["ok"]);
+  });
+});
+
+test("importMemory and importEpisode both refuse over-long text/content with a fixed message", () => {
+  withStore((store) => {
+    assert.throws(
+      () => store.importMemory({ id: uuidv7(), text: OVERLONG_CONTENT }),
+      /text exceeds the cap of 65536 characters/,
+    );
+    assert.throws(
+      () => store.importEpisode({ id: uuidv7(), content: OVERLONG_CONTENT }),
+      /content exceeds the cap of 65536 characters/,
+    );
+  });
+});
+
+// The property most at risk from adding a new early return ahead of every
+// write: the cap check must never come at the cost of skipping redaction on
+// an otherwise-valid write, on ANY of the four ingest paths.
+test("redaction still fires on all four ingest paths (remember/update/supersede/import) after the tag/content caps", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "on");
+
+    const { memory } = store.remember({ content: `AWS key: ${AWS_KEY}`, tags: ["ok"] });
+    assert.equal(memory.redacted, true);
+    assert.ok(!memory.text.includes(AWS_KEY));
+
+    const updated = store.update(memory.id, { text: `GitHub token: ${GH_TOKEN}`, tags: ["ok"] });
+    assert.ok(!updated.text.includes(GH_TOKEN));
+
+    const { replacement } = store.supersede(memory.id, { text: `AWS key: ${AWS_KEY}`, tags: ["ok"] });
+    assert.ok(!replacement.text.includes(AWS_KEY));
+
+    const importedId = uuidv7();
+    const importResult = store.importMemory({ id: importedId, text: `GitHub token: ${GH_TOKEN}`, tags: ["ok"] });
+    assert.ok(!importResult.memory?.text.includes(GH_TOKEN));
+
+    assert.equal(dbContainsRawBytes(store.db, AWS_KEY), false);
+    assert.equal(dbContainsRawBytes(store.db, GH_TOKEN), false);
   });
 });

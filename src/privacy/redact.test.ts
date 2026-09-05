@@ -72,3 +72,18 @@ test("determinism: same input, same mode, identical output", () => {
 test("DEFAULT_PRIVACY_MODE is 'on'", () => {
   assert.equal(DEFAULT_PRIVACY_MODE, "on");
 });
+
+// ---------------------------------------------------------------------------
+// CRITICAL-1: the finding cap must bound reporting, never redaction
+// ---------------------------------------------------------------------------
+
+test("CRITICAL-1: 150 secrets in one input are all redacted, none survive raw in the output", () => {
+  const keys = Array.from({ length: 150 }, (_, i) => `AKIA${String(i).padStart(16, "0")}`);
+  const text = keys.join(" ");
+  const result = redactText(text, "on");
+  assert.equal(result.findings.length, 150);
+  for (const key of keys) {
+    assert.ok(!result.text.includes(key), `raw key ${key} must not survive redaction`);
+  }
+  assert.equal((result.text.match(/\[redacted:aws-access-key-id\]/g) ?? []).length, 150);
+});

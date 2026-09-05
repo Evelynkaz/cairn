@@ -238,10 +238,21 @@ export interface Store {
   ): ImportEpisodeResult;
 
   episodes(
-    options?: { scope?: string; limit?: number; cursor?: string | null },
+    options?: {
+      scope?: string;
+      limit?: number;
+      cursor?: string | null;
+      // §10: a forgotten memory's provenance episode is excluded by
+      // default, same as a forgotten memory itself -- opt in to see it.
+      includeDeleted?: boolean;
+    },
     ctx?: CallContext,
   ): { items: Episode[]; nextCursor: string | null };
-  episode(id: string, ctx?: CallContext): Episode | undefined;
+  episode(
+    id: string,
+    ctx?: CallContext,
+    options?: { includeDeleted?: boolean },
+  ): Episode | undefined;
 
   auditLog(options?: Parameters<typeof listAudit>[1]): ReturnType<typeof listAudit>;
   clientStats(options?: { since?: number; limit?: number }): ReturnType<typeof countAuditByClient>;
@@ -280,9 +291,116 @@ function summarizeKindCounts(findings: readonly Finding[]): { kind: SecretKind; 
   return [...counts.entries()].map(([kind, count]) => ({ kind, count }));
 }
 
+// §10 "keep the source, but not the secret": forget()/restore() mark the
+// forgotten memory's provenance episode alongside it, rather than editing
+// episodes.content (append-only, §5) or requiring a schema change. A plain
+// JSON key on the existing metadata column, cleared by restore(), is enough
+// for episodes()/episode() below to exclude it by default -- the same
+// includeDeleted-style opt-in memories already have.
+const FORGOTTEN_KEY = "_forgotten";
+
+function markEpisodeForgotten(db: CairnDb, episodeId: string | null | undefined, forgotten: boolean): void {
+  if (!episodeId) return;
+  const episode = getEpisode(db, episodeId);
+  if (!episode) return;
+  const metadata = { ...episode.metadata };
+  if (forgotten) {
+    metadata[FORGOTTEN_KEY] = true;
+  } else {
+    delete metadata[FORGOTTEN_KEY];
+  }
+  db.q(`UPDATE episodes SET metadata = ? WHERE id = ?`).run(JSON.stringify(metadata), episodeId);
+}
+
+function isEpisodeForgotten(episode: Episode): boolean {
+  return episode.metadata[FORGOTTEN_KEY] === true;
+}
+
+// A security audit found a single caller-supplied `tags` array re-applied to
+// every entry parsed out of a paste import, with nothing anywhere capping
+// tag count, tag length, scope length or memory length: a 23,798-byte
+// request produced 7.9 minutes of synchronous work on the single-threaded
+// daemon, freezing the dashboard and every MCP client on the machine for the
+// duration. src/dashboard/api.ts's clampTags/clampScope close that off for
+// every HTTP caller, but `remember`/`update`/`supersede`/the import methods
+// on THIS Store are the one chokepoint every write path shares -- HTTP,
+// every MCP tool, and both import methods all call in here -- so the bound
+// has to live here too, or an MCP client (which never touches api.ts) still
+// reaches an unbounded store. These limits are the SAME numbers api.ts
+// enforces (32 tags, 64 chars/tag, 128 chars of scope); store.ts cannot
+// import them from the dashboard layer without introducing a cycle (api.ts
+// already depends on store.ts, not the reverse), so they are restated here
+// deliberately -- a different number in each place would be worse than
+// either number alone, so keep these two literally in sync by hand if they
+// ever change.
+//
+// A cap is refused with a thrown Error, never silently truncated: api.ts
+// already decided a 400 is right at the HTTP boundary because the caller
+// can fix the request and retry; the same reasoning holds one layer down --
+// a caller close enough to hit the store directly (every MCP tool) can
+// equally retry with a shorter list, whereas truncating would silently drop
+// tags a user asked to keep, which is data loss they never asked for and
+// never observe.
+const MAX_TAGS = 32;
+const MAX_TAG_LENGTH = 64;
+const MAX_SCOPE_LENGTH = 128;
+
+// Separately, nothing anywhere bounded a memory's own TEXT length: a 4 MB
+// memory made list_memories's default page return 7.8 MB, and a 20 MB one
+// crashed the ingest path with a raw V8 "Maximum call stack size exceeded"
+// out of the redaction regex (../privacy/detectors.ts runs against this
+// exact string on every one of the four ingest paths below) -- surfaced
+// straight to the client, and a persistent one: every later list/recall
+// pays for one oversized write forever, which is exactly the "bound every
+// tool's output" rule (BUILD_BRIEF §12) this violates. 64 KiB is chosen as
+// comfortably larger than any real note, transcript excerpt or pasted
+// snippet this product's memories are for (§1: not document storage), while
+// keeping the redaction regex pass, the FTS index and every paginated read
+// far away from the input sizes that produced the measured crash. Checked
+// and refused BEFORE redactText ever runs, for the same reason the regex
+// crashed in the first place -- an over-cap string must never reach that
+// pass at all, so refusing here also doubles as the fix for the stack
+// exhaustion, not just the byte-count amplification.
+const MAX_CONTENT_LENGTH = 65536;
+
+function assertTagsWithinCap(tags: string[] | undefined): void {
+  if (tags === undefined) return;
+  if (tags.length > MAX_TAGS) {
+    throw new Error(`tags exceeds the cap of ${MAX_TAGS}`);
+  }
+  for (const tag of tags) {
+    if (tag.length > MAX_TAG_LENGTH) {
+      throw new Error(`a tag exceeds the cap of ${MAX_TAG_LENGTH} characters`);
+    }
+  }
+}
+
+function assertScopeWithinCap(scope: string | undefined): void {
+  if (scope !== undefined && scope.length > MAX_SCOPE_LENGTH) {
+    throw new Error(`scope exceeds the cap of ${MAX_SCOPE_LENGTH} characters`);
+  }
+}
+
+// `field` names the offending parameter ("content"/"text") only -- per
+// BUILD_BRIEF §10, an error must never carry memory content or a filesystem
+// path, so this message states the limit and the field name, never the
+// value.
+function assertContentWithinCap(content: string, field: string): void {
+  if (content.length > MAX_CONTENT_LENGTH) {
+    throw new Error(`${field} exceeds the cap of ${MAX_CONTENT_LENGTH} characters`);
+  }
+}
+
 export function openStore(options: StoreOptions = {}): Store {
   const db = openDb({ path: options.path, driver: options.driver, readOnly: options.readOnly });
   const readOnly = options.readOnly ?? false;
+  // §10: the .db file is sold as one copyable artifact with no encryption
+  // (deferred to v2), so a hard-deleted secret must not simply linger in a
+  // freed page waiting for VACUUM (deleteEverything's own VACUUM call
+  // handles reclaiming the freed pages themselves). secure_delete is a
+  // per-connection pragma, not a stored setting -- it does not write to the
+  // db file, so it is safe to set even on a read-only connection.
+  db.exec("PRAGMA secure_delete=ON");
   const defaultProvider = options.provider ?? null;
   const defaultSpace = options.space ?? null;
 
@@ -342,6 +460,9 @@ export function openStore(options: StoreOptions = {}): Store {
 
     remember(input, ctx) {
       requireWritable("remember");
+      assertContentWithinCap(input.content, "content");
+      assertTagsWithinCap(input.tags);
+      assertScopeWithinCap(input.scope);
       const { sourceClient, scope } = gate(ctx, "remember");
       const resolvedScope = input.scope ?? scope;
 
@@ -554,12 +675,73 @@ export function openStore(options: StoreOptions = {}): Store {
 
     update(id, patch, ctx) {
       requireWritable("update");
+      if (patch.text !== undefined) assertContentWithinCap(patch.text, "text");
+      assertTagsWithinCap(patch.tags);
       const { sourceClient, scope } = gate(ctx, "update_memory");
-      // Invariant: the mutation and its audit row commit together or not
-      // at all -- a failed audit insert must not leave a mutated store
-      // with no trace of it in the §5 access log.
+
+      // §10 redaction runs BEFORE anything is written, mirroring remember()
+      // exactly: update() is just as capable of putting a secret in
+      // memories.text (and memories_fts) as remember() is, and skipped this
+      // entirely before this fix.
+      let textToStore: string | undefined = patch.text;
+      let findings: Finding[] = [];
+      if (patch.text !== undefined) {
+        const current = getMemory(db, id);
+        const { mode: privacyMode } = resolvePrivacyMode(db);
+        const redaction = redactText(patch.text, privacyMode);
+
+        if (privacyMode === "strict" && redaction.blocked) {
+          // Recorded OUTSIDE the write transaction, same shape as
+          // remember()'s strict-mode refusal above.
+          recordRedactions(
+            db,
+            redaction.findings.map((finding) => ({
+              memoryId: id,
+              episodeId: current?.episodeId ?? null,
+              scope: current?.scope ?? scope ?? null,
+              sourceClient,
+              kind: finding.kind,
+              preview: finding.preview,
+              action: "blocked",
+            })),
+          );
+          // Same message shape as remember()'s refusal (and the same
+          // prefix): src/dashboard/api.ts's isStrictRedactionRefusal
+          // matches on it to answer this as a refusal rather than a 500.
+          throw new Error(
+            `remember refused: found ${summarizeFindings(redaction.findings)}; privacy mode is "strict"`,
+          );
+        }
+
+        textToStore = redaction.text;
+        findings = redaction.findings;
+      }
+
+      // Invariant: the mutation, any redaction rows, and the audit row
+      // commit together or not at all -- a failure partway through must not
+      // leave a mutated store with no trace of it in the §5 access log, or
+      // a redacted memory whose finding was never recorded.
       return db.tx(() => {
-        const memory = updateMemory(db, id, patch);
+        let memory = updateMemory(db, id, { ...patch, text: textToStore });
+        if (findings.length > 0) {
+          // updateMemory (repositories/memories.ts) has no `redacted`
+          // column support; set it directly here, same pattern as
+          // importMemory's own direct UPDATE below.
+          db.q(`UPDATE memories SET redacted = 1 WHERE id = ?`).run(memory.id);
+          memory = getMemory(db, memory.id) ?? memory;
+          recordRedactions(
+            db,
+            findings.map((finding) => ({
+              memoryId: memory.id,
+              episodeId: memory.episodeId,
+              scope: memory.scope,
+              sourceClient,
+              kind: finding.kind,
+              preview: finding.preview,
+              action: "redacted",
+            })),
+          );
+        }
         recordAudit(db, {
           action: "update_memory",
           memoryId: memory.id,
@@ -579,6 +761,9 @@ export function openStore(options: StoreOptions = {}): Store {
       return db.tx(() => {
         const memory = getMemory(db, id);
         const ok = softDeleteMemory(db, id);
+        if (ok) {
+          markEpisodeForgotten(db, memory?.episodeId, true);
+        }
         recordAudit(db, {
           action: "forget",
           memoryId: id,
@@ -596,7 +781,25 @@ export function openStore(options: StoreOptions = {}): Store {
       const { sourceClient, scope } = gate(ctx, confirm ? "forget" : "list_memories");
       const effectiveScope = options.scope ?? scope;
       const limit = clampLimit(options.limit);
-      const result = await search(db, query, { scope: effectiveScope, limit }, retrievalDeps(undefined, undefined));
+      // Deliberately does NOT inherit search()'s default relevance/distance
+      // floors (DEFAULT_MIN_RELEVANCE / DEFAULT_MAX_VECTOR_DISTANCE in
+      // ../retrieval/search.ts): those floors are tuned for injecting
+      // memories into a prompt (get_context), where a marginal match is
+      // noise and should be dropped. A query-shaped delete wants the
+      // opposite -- "forget everything about X" must show the user
+      // everything that plausibly matches, not silently hide a candidate
+      // the floor happened to score near 0. This is safe specifically
+      // because forgetWhere is preview-then-confirm: the human sees the
+      // full match list here and decides, so being generous costs nothing,
+      // while being stingy would hide matches the user asked for and never
+      // knows were dropped. Do not "align" this with get_context's floors --
+      // the two callers want opposite things on purpose.
+      const result = await search(
+        db,
+        query,
+        { scope: effectiveScope, limit, minRelevance: 0, maxVectorDistance: 2 },
+        retrievalDeps(undefined, undefined),
+      );
       const matches = result.hits.map((hit) => ({ id: hit.id, text: hit.text, scope: hit.scope }));
 
       // Safety property: a query-shaped forget NEVER deletes without an
@@ -623,6 +826,7 @@ export function openStore(options: StoreOptions = {}): Store {
         for (const match of matches) {
           if (softDeleteMemory(db, match.id)) {
             deletedMatches.push(match);
+            markEpisodeForgotten(db, getMemory(db, match.id)?.episodeId, true);
           }
         }
         recordAudit(db, {
@@ -645,6 +849,9 @@ export function openStore(options: StoreOptions = {}): Store {
       return db.tx(() => {
         const memory = getMemory(db, id);
         const ok = restoreMemory(db, id);
+        if (ok) {
+          markEpisodeForgotten(db, memory?.episodeId, false);
+        }
         recordAudit(db, {
           action: "restore",
           memoryId: id,
@@ -658,17 +865,68 @@ export function openStore(options: StoreOptions = {}): Store {
 
     supersede(oldId, input, ctx) {
       requireWritable("supersede");
+      assertContentWithinCap(input.text, "text");
+      assertTagsWithinCap(input.tags);
       const { sourceClient, scope } = gate(ctx, "update_memory");
-      // Invariant: the mutation and its audit row commit together or not
-      // at all -- a failed audit insert must not leave a mutated store
-      // with no trace of it in the §5 access log.
+
+      // §10 redaction runs BEFORE anything is written, mirroring remember()
+      // and update() above: supersede() writes a brand-new memory row from
+      // input.text and skipped this entirely before this fix.
+      const old = getMemory(db, oldId);
+      const { mode: privacyMode } = resolvePrivacyMode(db);
+      const redaction = redactText(input.text, privacyMode);
+
+      if (privacyMode === "strict" && redaction.blocked) {
+        // Recorded OUTSIDE the write transaction, same shape as remember()'s
+        // and update()'s strict-mode refusal above.
+        recordRedactions(
+          db,
+          redaction.findings.map((finding) => ({
+            memoryId: oldId,
+            episodeId: old?.episodeId ?? null,
+            scope: old?.scope ?? scope ?? null,
+            sourceClient,
+            kind: finding.kind,
+            preview: finding.preview,
+            action: "blocked",
+          })),
+        );
+        // Same message shape (and prefix) as remember()'s and update()'s
+        // refusal: src/dashboard/api.ts's isStrictRedactionRefusal matches
+        // on it to answer this as a refusal rather than a 500.
+        throw new Error(
+          `remember refused: found ${summarizeFindings(redaction.findings)}; privacy mode is "strict"`,
+        );
+      }
+
+      const redacted = redaction.findings.length > 0;
+
+      // Invariant: the mutation, any redaction rows, and the audit row
+      // commit together or not at all -- a failure partway through must not
+      // leave a mutated store with no trace of it in the §5 access log, or
+      // a redacted memory whose finding was never recorded.
       return db.tx(() => {
         const result = supersedeMemory(db, oldId, {
-          text: input.text,
+          text: redaction.text,
           tags: input.tags,
           importance: input.importance,
           sourceClient,
+          redacted,
         });
+        if (redacted) {
+          recordRedactions(
+            db,
+            redaction.findings.map((finding) => ({
+              memoryId: result.replacement.id,
+              episodeId: result.replacement.episodeId,
+              scope: result.replacement.scope,
+              sourceClient,
+              kind: finding.kind,
+              preview: finding.preview,
+              action: "redacted",
+            })),
+          );
+        }
         // No dedicated "supersede" action exists in the §6-capped audit
         // vocabulary; supersede replaces a memory's content (the old row is
         // marked superseded, a new one takes its place), which is closest
@@ -716,7 +974,7 @@ export function openStore(options: StoreOptions = {}): Store {
       // Invariant: the purge and its audit row commit together or not at
       // all -- a failed audit insert must not leave a purged store with no
       // trace of it in the §5 access log.
-      return db.tx(() => {
+      const result = db.tx(() => {
         const memoryCount = db.q(`SELECT COUNT(*) AS c FROM memories`).get();
         const episodeCount = db.q(`SELECT COUNT(*) AS c FROM episodes`).get();
         const memories = memoryCount ? Number(memoryCount["c"]) : 0;
@@ -753,18 +1011,76 @@ export function openStore(options: StoreOptions = {}): Store {
 
         return { memories, episodes, vectors };
       });
+      // VACUUM cannot run inside a transaction, so it must be OUTSIDE
+      // db.tx above -- and it runs only once the purge has actually
+      // committed. secure_delete=ON (set on connection open below) already
+      // overwrites freed pages, but §10 sells the .db as one copyable
+      // artifact, and SQLite still leaves the freed pages themselves in the
+      // file until VACUUM reclaims them; a failure here must not undo (it
+      // cannot -- the purge already committed) or hide the purge result.
+      try {
+        db.exec("VACUUM");
+      } catch {
+        // Best-effort: see the comment above.
+      }
+      return result;
     },
 
     importMemory(input, ctx) {
       requireWritable("importMemory");
+      assertContentWithinCap(input.text, "text");
+      assertTagsWithinCap(input.tags);
+      assertScopeWithinCap(input.scope);
       const { sourceClient, scope } = gate(ctx, "import");
       const resolvedScope = input.scope ?? scope;
-      const { episodeId, ...repoInput } = input;
-      // Invariant: the mutation and its audit row commit together or not
-      // at all -- a failed audit insert must not leave a mutated store
-      // with no trace of it in the §5 access log.
+      const { episodeId, redacted: _claimedRedacted, ...repoInput } = input;
+
+      // §10 redaction runs BEFORE anything is written, mirroring remember():
+      // an archive is a file from anywhere, and import is exactly the
+      // "ingest" path §10 requires this to run on. `input.redacted` (the
+      // archive's own claim) is NEVER trusted -- destructured above and
+      // discarded -- because a hostile archive could set it to true and
+      // skip past a reviewer who trusts the flag, or set it to false with
+      // no consequence; the flag actually stored is always re-derived from
+      // what redactText finds here.
+      const { mode: privacyMode } = resolvePrivacyMode(db);
+      const redaction = redactText(input.text, privacyMode);
+
+      if (privacyMode === "strict" && redaction.blocked) {
+        recordRedactions(
+          db,
+          redaction.findings.map((finding) => ({
+            memoryId: input.id,
+            episodeId: episodeId ?? null,
+            scope: resolvedScope ?? null,
+            sourceClient,
+            kind: finding.kind,
+            preview: finding.preview,
+            action: "blocked",
+          })),
+        );
+        // Refuses the WHOLE import, not just this one line: importMemory is
+        // called from inside archive.ts's own outer db.tx() (see
+        // importArchive), so this throw unwinds and rolls back every line
+        // already imported by this call, the same all-or-nothing guarantee
+        // the import already makes for a malformed id or a bad checksum. An
+        // import is one explicit, retryable user action -- unlike a stream
+        // of remembers -- so failing the whole archive on one offending
+        // line is the simpler, safer default; refusing only that line would
+        // mean the import "half worked" with no single result to retry.
+        throw new Error(
+          `import refused: found ${summarizeFindings(redaction.findings)}; privacy mode is "strict"`,
+        );
+      }
+
+      const redacted = redaction.findings.length > 0;
+
+      // Invariant: the mutation, any redaction rows, and the audit row
+      // commit together or not at all -- a failure partway through must not
+      // leave a mutated store with no trace of it in the §5 access log, or
+      // a redacted memory whose finding was never recorded.
       return db.tx(() => {
-        let result = importMemoryRepo(db, { ...repoInput, scope: resolvedScope });
+        let result = importMemoryRepo(db, { ...repoInput, text: redaction.text, scope: resolvedScope, redacted });
         // See the episodeId doc comment on the Store interface above: wired
         // up only when the reference resolves in THIS store, exactly like
         // importMemoryRepo already does for supersededBy, and never on a
@@ -775,6 +1091,20 @@ export function openStore(options: StoreOptions = {}): Store {
             db.q(`UPDATE memories SET episode_id = ? WHERE id = ?`).run(episodeId, input.id);
             result = { ...result, memory: getMemory(db, input.id) };
           }
+        }
+        if (!result.skipped && redacted && result.memory) {
+          recordRedactions(
+            db,
+            redaction.findings.map((finding) => ({
+              memoryId: result.memory?.id ?? input.id,
+              episodeId: result.memory?.episodeId ?? null,
+              scope: result.memory?.scope ?? resolvedScope ?? null,
+              sourceClient,
+              kind: finding.kind,
+              preview: finding.preview,
+              action: "redacted",
+            })),
+          );
         }
         recordAudit(db, {
           action: "import",
@@ -789,13 +1119,58 @@ export function openStore(options: StoreOptions = {}): Store {
 
     importEpisode(input, ctx) {
       requireWritable("importEpisode");
+      assertContentWithinCap(input.content, "content");
+      assertScopeWithinCap(input.scope);
       const { sourceClient, scope } = gate(ctx, "import");
       const resolvedScope = input.scope ?? scope;
-      // Invariant: the mutation and its audit row commit together or not
-      // at all -- a failed audit insert must not leave a mutated store
-      // with no trace of it in the §5 access log.
+
+      // §10 redaction runs BEFORE anything is written, same reasoning as
+      // importMemory above -- an episode's content is just as much an
+      // ingest path as a memory's text is.
+      const { mode: privacyMode } = resolvePrivacyMode(db);
+      const redaction = redactText(input.content, privacyMode);
+
+      if (privacyMode === "strict" && redaction.blocked) {
+        recordRedactions(
+          db,
+          redaction.findings.map((finding) => ({
+            memoryId: null,
+            episodeId: input.id,
+            scope: resolvedScope ?? null,
+            sourceClient,
+            kind: finding.kind,
+            preview: finding.preview,
+            action: "blocked",
+          })),
+        );
+        // Same all-or-nothing reasoning as importMemory's own strict refusal
+        // above -- this throw unwinds archive.ts's outer db.tx() too.
+        throw new Error(
+          `import refused: found ${summarizeFindings(redaction.findings)}; privacy mode is "strict"`,
+        );
+      }
+
+      const redacted = redaction.findings.length > 0;
+
+      // Invariant: the mutation, any redaction rows, and the audit row
+      // commit together or not at all -- see importMemory's own comment
+      // above.
       return db.tx(() => {
-        const result = importEpisodeRepo(db, { ...input, scope: resolvedScope });
+        const result = importEpisodeRepo(db, { ...input, content: redaction.text, scope: resolvedScope });
+        if (!result.skipped && redacted && result.episode) {
+          recordRedactions(
+            db,
+            redaction.findings.map((finding) => ({
+              memoryId: null,
+              episodeId: result.episode?.id ?? input.id,
+              scope: result.episode?.scope ?? resolvedScope ?? null,
+              sourceClient,
+              kind: finding.kind,
+              preview: finding.preview,
+              action: "redacted",
+            })),
+          );
+        }
         recordAudit(db, {
           action: "import",
           scope: result.episode?.scope ?? resolvedScope ?? null,
@@ -812,31 +1187,38 @@ export function openStore(options: StoreOptions = {}): Store {
       // the §6-capped audit vocabulary.
       const { sourceClient, scope } = gate(ctx, "list_memories");
       const effectiveScope = options.scope ?? scope;
-      const result = listEpisodes(db, { ...options, scope: effectiveScope });
+      const { includeDeleted, ...listOptions } = options;
+      const result = listEpisodes(db, { ...listOptions, scope: effectiveScope });
+      // §10: a forgotten memory's provenance episode must not be readable
+      // by default, same as the forgotten memory itself -- see
+      // markEpisodeForgotten's doc comment above.
+      const items = includeDeleted ? result.items : result.items.filter((e) => !isEpisodeForgotten(e));
       if (!readOnly) {
         recordAudit(db, {
           action: "list_memories",
           scope: effectiveScope ?? null,
           sourceClient,
-          resultCount: result.items.length,
+          resultCount: items.length,
         });
       }
-      return result;
+      return { items, nextCursor: result.nextCursor };
     },
 
-    episode(id, ctx) {
+    episode(id, ctx, options = {}) {
       const { sourceClient, scope } = gate(ctx, "list_memories");
       const item = getEpisode(db, id);
+      // See episodes() above -- same default-hidden rule.
+      const visible = item && (options.includeDeleted || !isEpisodeForgotten(item)) ? item : undefined;
       if (!readOnly) {
         recordAudit(db, {
           action: "list_memories",
           memoryId: null,
           scope: scope ?? null,
           sourceClient,
-          resultCount: item ? 1 : 0,
+          resultCount: visible ? 1 : 0,
         });
       }
-      return item;
+      return visible;
     },
 
     auditLog(options) {
@@ -877,15 +1259,21 @@ export function openStore(options: StoreOptions = {}): Store {
       // at all -- a failed audit insert must not leave redaction switched
       // with no trace of it in the §5 access log.
       return db.tx(() => {
-        setPrivacyMode(db, mode);
-        // Re-resolve rather than trust setPrivacyMode's return value: env
-        // beats settings (see privacy-settings.ts), so a stored write here can
-        // be immediately overridden by CAIRN_PRIVACY. Returning the raw write
-        // result would report a mode that is not actually in effect. (This
-        // reads process.env via resolvePrivacyMode; it stays inside the
-        // transaction only incidentally -- its correctness does not depend
-        // on the transaction, and it must run after setPrivacyMode either way.)
-        const config = resolvePrivacyMode(db);
+        // Resolve BEFORE writing: env beats settings (see
+        // privacy-settings.ts), so if the env var is what's actually in
+        // effect, persisting `mode` into settings would silently contradict
+        // it the moment the daemon restarts without that env var -- exactly
+        // the dashboard's own "cannot override an environment variable"
+        // promise. Still audited either way, with the requested value
+        // preserved, so the attempt is findable in the access log.
+        const before = resolvePrivacyMode(db);
+        let config: PrivacyConfig;
+        if (before.source === "env") {
+          config = before;
+        } else {
+          setPrivacyMode(db, mode);
+          config = resolvePrivacyMode(db);
+        }
         recordAudit(db, {
           action: "privacy_mode",
           sourceClient: ctx?.sourceClient ?? null,

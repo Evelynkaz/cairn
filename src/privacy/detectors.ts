@@ -6,16 +6,25 @@
 export type SecretKind =
   | "aws-access-key-id"
   | "aws-secret-access-key"
+  | "aws-session-token"
   | "github-token"
+  | "gitlab-token"
   | "openai-key"
   | "anthropic-key"
   | "slack-token"
+  | "slack-webhook"
   | "google-api-key"
   | "stripe-key"
   | "jwt"
   | "private-key-block"
+  | "putty-private-key"
   | "url-password"
-  | "generic-bearer";
+  | "generic-bearer"
+  | "npm-token"
+  | "huggingface-token"
+  | "sendgrid-key"
+  | "pypi-token"
+  | "env-secret";
 
 export interface Finding {
   kind: SecretKind;
@@ -27,7 +36,11 @@ export interface Finding {
   preview: string;
 }
 
-const DEFAULT_MAX_FINDINGS = 100;
+// Only bounds what detectSecrets RETURNS/callers display. It must never
+// bound what gets redacted: an unreturned finding whose span was never
+// spliced out is a secret stored raw with no signal that anything was
+// wrong. See the accepted-candidates loop below, which has no cap.
+const DEFAULT_MAX_FINDINGS = Infinity;
 
 interface Candidate {
   kind: SecretKind;
@@ -39,10 +52,23 @@ interface Candidate {
   priority: number;
 }
 
-function maskPreview(value: string): string {
-  const len = value.length;
-  if (len <= 8) return "*".repeat(len);
-  return `${value.slice(0, 4)}…${value.slice(len - 4)}`;
+// Masks a matched span for display/persistence. Never reveals trailing
+// characters (a trailing slice of a short value can be most of it — see the
+// CVE-shaped bug this replaced). Below ~20 chars the value is short enough
+// that even a 4-char prefix is a large fraction of it, so it is fully
+// masked with a FIXED-length run of asterisks (fixed so the preview itself
+// does not leak the value's true length). At or above ~20 chars, a leading
+// prefix is shown so a user can tell WHICH token this was (e.g. "AKIA",
+// "ghp_") — never to help identify the value. For kinds where even the
+// prefix is entropy rather than a type signal, the value is masked
+// entirely regardless of length.
+const FULLY_MASKED_KINDS: ReadonlySet<SecretKind> = new Set(["url-password", "generic-bearer"]);
+const MASK = "*".repeat(8);
+
+function maskPreview(value: string, kind: SecretKind): string {
+  if (FULLY_MASKED_KINDS.has(kind)) return MASK;
+  if (value.length < 20) return MASK;
+  return `${value.slice(0, 4)}${MASK}`;
 }
 
 // Extracts [start, end] for a regex group using the 'd' (hasIndices) flag.
@@ -72,6 +98,14 @@ function collectSimple(
   return out;
 }
 
+// Finds the next blank line (or end of input) after `from`, for detectors
+// that redact "from a header to the end of the block" when there is no
+// well-formed closing delimiter to anchor on.
+function endOfBlock(text: string, from: number): number {
+  const blank = /\r?\n[ \t]*\r?\n/.exec(text.slice(from));
+  return blank ? from + blank.index : text.length;
+}
+
 // AWS access key id: AKIA (long-term) or ASIA (temporary/STS) + 16 uppercase
 // alphanumeric characters. Does NOT match lowercase or shorter look-alikes.
 const AWS_ACCESS_KEY_ID = /(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])/gd;
@@ -79,9 +113,18 @@ const AWS_ACCESS_KEY_ID = /(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-
 // AWS secret access key: a 40-char base64-ish string is far too common on
 // its own, so this only fires when it appears as the value of an
 // `aws_secret_access_key`-style assignment. Deliberately does NOT match a
-// bare 40-char string anywhere else in the text.
+// bare 40-char string anywhere else in the text. Key name and value may
+// each optionally be quoted, so both `aws_secret_access_key=VALUE` and the
+// JSON/YAML/tfvars `"aws_secret_access_key": "VALUE"` form are covered.
 const AWS_SECRET_ACCESS_KEY =
-  /aws_secret_access_key\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})["']?/gid;
+  /["']?aws_secret_access_key["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{40})["']?/gid;
+
+// AWS session token: like the secret key above, only fires next to its own
+// assignment (session tokens have no fixed prefix and are otherwise
+// indistinguishable from arbitrary base64). Length is variable (real tokens
+// run to several hundred characters), so this only sets a floor.
+const AWS_SESSION_TOKEN =
+  /["']?aws_session_token["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{20,})["']?/gid;
 
 // GitHub fine-grained/classic tokens: ghp_/gho_/ghu_/ghs_/ghr_ prefixes each
 // followed by 36+ alphanumerics.
@@ -91,6 +134,10 @@ const GITHUB_TOKEN = /(?<![A-Za-z0-9_])(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}(
 // alphanumeric/underscore body.
 const GITHUB_PAT = /(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}(?![A-Za-z0-9_])/gd;
 
+// GitLab personal access token: glpat- prefix + a long alphanumeric/dash
+// body. Fixed prefix, effectively zero false-positive risk.
+const GITLAB_TOKEN = /(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/gd;
+
 // Anthropic key: sk-ant- prefix. Checked BEFORE the generic OpenAI sk-
 // pattern so an Anthropic key is not also (mis)labelled as an OpenAI key.
 const ANTHROPIC_KEY = /(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/gd;
@@ -99,8 +146,17 @@ const ANTHROPIC_KEY = /(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_
 // literal "sk-" never matches on its own.
 const OPENAI_KEY = /(?<![A-Za-z0-9_-])sk-(?:proj-)?[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/gd;
 
-// Slack token: xoxb-/xoxa-/xoxp-/xoxr-/xoxs- prefix + a dash-delimited body.
-const SLACK_TOKEN = /(?<![A-Za-z0-9_-])xox[baprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9_-])/gd;
+// Slack token: xoxb-/xoxa-/xoxp-/xoxr-/xoxs-/xoxe- prefix + a dash-delimited
+// body.
+const SLACK_TOKEN = /(?<![A-Za-z0-9_-])xox[baprse]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9_-])/gd;
+
+// Slack app-level token: xapp- prefix + a dash-delimited body.
+const SLACK_XAPP_TOKEN = /(?<![A-Za-z0-9_-])xapp-[A-Za-z0-9-]{10,}(?![A-Za-z0-9_-])/gd;
+
+// Slack incoming webhook: a fixed, distinctive URL shape. Posting to it is
+// equivalent to holding the credential.
+const SLACK_WEBHOOK =
+  /(?<![A-Za-z0-9._-])https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9]+\/[A-Za-z0-9]+\/[A-Za-z0-9]+(?![A-Za-z0-9])/gd;
 
 // Google API key: AIza + 35 alphanumeric/underscore/dash characters (the
 // fixed length Google issues them at).
@@ -109,6 +165,18 @@ const GOOGLE_API_KEY = /(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])
 // Stripe key: sk_/rk_/pk_ + live/test + a long alphanumeric body. A test key
 // is still a credential, so both live and test variants are flagged.
 const STRIPE_KEY = /(?<![A-Za-z0-9_-])(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{10,}(?![A-Za-z0-9_-])/gd;
+
+// npm publish token: npm_ prefix + a long alphanumeric body.
+const NPM_TOKEN = /(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{20,}(?![A-Za-z0-9_])/gd;
+
+// HuggingFace token: hf_ prefix + a long alphanumeric body.
+const HUGGINGFACE_TOKEN = /(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{20,}(?![A-Za-z0-9_])/gd;
+
+// SendGrid API key: SG. + two dot-separated base64url-ish segments.
+const SENDGRID_KEY = /(?<![A-Za-z0-9._-])SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/gd;
+
+// PyPI upload token: pypi- prefix + a long alphanumeric/dash/underscore body.
+const PYPI_TOKEN = /(?<![A-Za-z0-9_-])pypi-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/gd;
 
 // JWT: three dot-separated base64url segments where the first segment
 // decodes to JSON containing an "alg" key. The decode check is what keeps
@@ -149,18 +217,104 @@ function collectJwt(text: string): Candidate[] {
 
 // Private key block: a full PEM-style -----BEGIN ... PRIVATE KEY----- through
 // the matching -----END ... PRIVATE KEY----- (same label on both ends via
-// the backreference), including the body.
-const PRIVATE_KEY_BLOCK = /-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/gd;
+// the backreference, matched case-insensitively), including the body.
+const PRIVATE_KEY_BLOCK = /-----BEGIN ([A-Za-z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/gid;
 
-// URL password: scheme://user:password@host. Only the password span itself
-// is captured — the scheme, user and host are not secrets.
-const URL_PASSWORD = /(?<![A-Za-z0-9+.-])[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s:@/]+:([^\s@/]+)@/gd;
+// Header-only fallback: any BEGIN ... PRIVATE KEY header, regardless of
+// whether a matching END is ever found (a truncated paste, a mismatched
+// footer, or an inconsistent label must never produce zero findings and
+// store the entire key body — see collectPrivateKeyBlocks below).
+const PRIVATE_KEY_HEADER = /-----BEGIN ([A-Za-z0-9 ]*PRIVATE KEY)-----/gid;
+
+function collectPrivateKeyBlocks(text: string): Candidate[] {
+  const out: Candidate[] = [];
+  const fullSpans: Array<[number, number]> = [];
+  for (const match of text.matchAll(PRIVATE_KEY_BLOCK)) {
+    const span = groupSpan(match, 0);
+    if (span === null) continue;
+    out.push({ kind: "private-key-block", start: span[0], end: span[1], priority: -1 });
+    fullSpans.push(span);
+  }
+  for (const match of text.matchAll(PRIVATE_KEY_HEADER)) {
+    const span = groupSpan(match, 0);
+    if (span === null) continue;
+    const [headerStart, headerEnd] = span;
+    const coveredByFullMatch = fullSpans.some(
+      ([fStart, fEnd]) => headerStart >= fStart && headerStart < fEnd,
+    );
+    if (coveredByFullMatch) continue;
+    out.push({
+      kind: "private-key-block",
+      start: headerStart,
+      end: endOfBlock(text, headerEnd),
+      priority: -1,
+    });
+  }
+  return out;
+}
+
+// PuTTY private key file: PuTTY-User-Key-File-<version>: header through the
+// end of the block (PuTTY's own format has no closing delimiter, only a
+// trailing blank line or end of input).
+const PUTTY_HEADER = /PuTTY-User-Key-File-\d+:/gid;
+
+function collectPutty(text: string): Candidate[] {
+  const out: Candidate[] = [];
+  for (const match of text.matchAll(PUTTY_HEADER)) {
+    const span = groupSpan(match, 0);
+    if (span === null) continue;
+    out.push({
+      kind: "putty-private-key",
+      start: span[0],
+      end: endOfBlock(text, span[1]),
+      priority: 12,
+    });
+  }
+  return out;
+}
+
+// URL password: scheme://[user]:password@host. The user part is optional
+// (redis://:password@host is a common shape) and the password may itself
+// contain '/' (anchored on the '@' rather than excluding '/'), so only the
+// scheme, user and host are excluded from the captured span. http/https are
+// skipped: inline credentials in an http(s) URL are overwhelmingly example
+// text ("https://user:guide@example.com"), and flagging them trades a real
+// false-positive class for very little true-positive coverage.
+const URL_PASSWORD =
+  /(?<![A-Za-z0-9+.-])(?!https?:\/\/)[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s:@]*:([^\s@]+)@/gd;
 
 // Generic bearer token: "Authorization: Bearer <token>" or bare
 // "bearer <token>", case-insensitive. Only the token itself is captured.
 // Requires a plausible token length so bare "Bearer" with nothing after it
-// never matches.
-const GENERIC_BEARER = /bearer\s+([A-Za-z0-9\-_.=]{10,})(?![A-Za-z0-9_-])/gid;
+// never matches. Charset includes the full base64 alphabet (+, /) and the
+// base64url tilde extension, with a boundary that excludes all of them, so
+// a base64 bearer token is never truncated at its first '+' or '/' (a
+// partial match is worse than none: it still records a finding, so a
+// caller believes the secret was fully handled while its tail survives).
+const GENERIC_BEARER = /bearer\s+([A-Za-z0-9\-_.+/=~]{10,})(?![A-Za-z0-9_\-.+/=~])/gid;
+
+// .env-style assignment: KEY=value or KEY: value where KEY's name contains
+// one of a fixed list of secret-signalling substrings. Only the VALUE is
+// redacted. The key-name requirement is what keeps this precise enough to
+// ship as a default-on detector — a pasted .env file is the single most
+// likely way a secret reaches this store (BUILD_BRIEF §10), and unlike the
+// rest of this module (precision over recall) an explicitly named secret is
+// worth the small false-positive cost (e.g. "TOKEN: see docs").
+const ENV_KEY = /(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]{0,63})\s*[:=]\s*["']?([^\s"'#]+)["']?/gd;
+const ENV_SECRET_NAME = /PASSWORD|PASSWD|SECRET|TOKEN|APIKEY|API_KEY|PRIVATE_KEY|CREDENTIALS/i;
+
+function collectEnvAssignments(text: string): Candidate[] {
+  const out: Candidate[] = [];
+  for (const match of text.matchAll(ENV_KEY)) {
+    const key = match[1];
+    if (key === undefined || !ENV_SECRET_NAME.test(key)) continue;
+    const span = groupSpan(match, 2);
+    if (span === null) continue;
+    const [start, end] = span;
+    if (end > start) out.push({ kind: "env-secret", start, end, priority: 20 });
+  }
+  return out;
+}
 
 function collectAll(text: string): Candidate[] {
   return [
@@ -174,10 +328,50 @@ function collectAll(text: string): Candidate[] {
     ...collectSimple(text, "google-api-key", 6, GOOGLE_API_KEY),
     ...collectSimple(text, "stripe-key", 7, STRIPE_KEY),
     ...collectJwt(text),
-    ...collectSimple(text, "private-key-block", -1, PRIVATE_KEY_BLOCK),
+    ...collectPrivateKeyBlocks(text),
     ...collectSimple(text, "url-password", 9, URL_PASSWORD, 1),
     ...collectSimple(text, "generic-bearer", 10, GENERIC_BEARER, 1),
+    ...collectSimple(text, "gitlab-token", 11, GITLAB_TOKEN),
+    ...collectPutty(text),
+    ...collectSimple(text, "slack-token", 13, SLACK_XAPP_TOKEN),
+    ...collectSimple(text, "slack-webhook", 13, SLACK_WEBHOOK),
+    ...collectSimple(text, "npm-token", 14, NPM_TOKEN),
+    ...collectSimple(text, "huggingface-token", 15, HUGGINGFACE_TOKEN),
+    ...collectSimple(text, "sendgrid-key", 16, SENDGRID_KEY),
+    ...collectSimple(text, "pypi-token", 17, PYPI_TOKEN),
+    ...collectSimple(text, "aws-session-token", 18, AWS_SESSION_TOKEN, 1),
+    ...collectEnvAssignments(text),
   ];
+}
+
+// Resolves overlaps in `sorted` (already ordered by preference: longer
+// match first, ties broken by detector specificity then position) into a
+// disjoint set, kept sorted by `start` throughout via binary-search
+// insertion. This is O(n log n) rather than the naive O(n^2) "compare every
+// candidate against every previously accepted one" — load-bearing once
+// CRITICAL-1 removed the early cap, since a pathological input can produce
+// many thousands of non-overlapping candidates and this runs on the write
+// path.
+function resolveOverlaps(sorted: readonly Candidate[]): Candidate[] {
+  const accepted: Candidate[] = [];
+  for (const candidate of sorted) {
+    // Binary search for the first accepted interval whose start is >=
+    // candidate.start.
+    let lo = 0;
+    let hi = accepted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((accepted[mid] as Candidate).start < candidate.start) lo = mid + 1;
+      else hi = mid;
+    }
+    const before = lo > 0 ? accepted[lo - 1] : undefined;
+    const after = lo < accepted.length ? accepted[lo] : undefined;
+    const overlapsBefore = before !== undefined && before.end > candidate.start;
+    const overlapsAfter = after !== undefined && after.start < candidate.end;
+    if (overlapsBefore || overlapsAfter) continue;
+    accepted.splice(lo, 0, candidate);
+  }
+  return accepted;
 }
 
 /**
@@ -186,6 +380,14 @@ function collectAll(text: string): Candidate[] {
  * memory product that is worse than a miss — a missed token is a risk the
  * user may already be managing, a corrupted memory is the product breaking
  * its core promise. No entropy heuristics; only the specific shapes above.
+ *
+ * Every non-overlapping finding is detected and returned unconditionally —
+ * `maxFindings` (default: unbounded) only trims the size of the array this
+ * function RETURNS, for a caller that wants to bound what it displays or
+ * logs. It must never be used to bound what gets redacted: a finding a
+ * caller never sees but that also never got spliced out is a secret stored
+ * raw with no signal anything went wrong (this was CRITICAL-1). Callers
+ * that redact text must always use the FULL, unsliced return.
  *
  * Results are sorted by `start`, with overlaps resolved by preferring the
  * longer match (ties broken by detector specificity) so a caller can splice
@@ -205,19 +407,12 @@ export function detectSecrets(text: string, options?: { maxFindings?: number }):
     return a.start - b.start;
   });
 
-  const accepted: Candidate[] = [];
-  for (const candidate of candidates) {
-    if (accepted.length >= maxFindings) break;
-    const overlaps = accepted.some((a) => candidate.start < a.end && a.start < candidate.end);
-    if (!overlaps) accepted.push(candidate);
-  }
-
-  accepted.sort((a, b) => a.start - b.start);
+  const accepted = resolveOverlaps(candidates);
 
   return accepted.slice(0, maxFindings).map((c) => ({
     kind: c.kind,
     start: c.start,
     end: c.end,
-    preview: maskPreview(text.slice(c.start, c.end)),
+    preview: maskPreview(text.slice(c.start, c.end), c.kind),
   }));
 }
