@@ -1,0 +1,25 @@
+{
+  // Unit tests for the browser-only UI code (see tsconfig.ui.json). They run
+  // under node --test, so unlike the UI code itself they need "types":
+  // ["node"] for node:test / node:assert to resolve, while still using the
+  // same "lib" (DOM) since they import browser-typed modules. Same
+  // rootDir/outDir as tsconfig.ui.json so emitted tests land beside the
+  // modules they import and their relative "./x.js" specifiers keep
+  // resolving.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "rootDir": "src/dashboard/ui",
+    "outDir": "dist/dashboard/ui",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "sourceMap": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/dashboard/ui/**/*.test.ts"]
+}

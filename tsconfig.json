@@ -15,5 +15,10 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  // This project is Node-only and has no DOM lib. The browser SPA under
+  // src/dashboard/ui is compiled by tsconfig.ui.json (and its tests by
+  // tsconfig.uitest.json). Removing this exclude makes the root compiler
+  // try to type-check browser code against Node-only libs.
+  "exclude": ["src/dashboard/ui/**"]
 }

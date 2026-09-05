@@ -1,0 +1,23 @@
+{
+  // Browser-only code: "types": [] is load-bearing, it keeps browser code from
+  // referencing Node globals. Unit tests for this code need node:test /
+  // node:assert, so they are excluded here and compiled separately by
+  // tsconfig.uitest.json, which adds "types": ["node"] for tests only.
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "rootDir": "src/dashboard/ui",
+    "outDir": "dist/dashboard/ui",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "sourceMap": true,
+    "skipLibCheck": true,
+    "types": []
+  },
+  "include": ["src/dashboard/ui/**/*.ts"],
+  "exclude": ["src/dashboard/ui/**/*.test.ts"]
+}

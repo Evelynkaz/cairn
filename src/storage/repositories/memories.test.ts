@@ -7,6 +7,7 @@ import type { CairnDb } from "../db.js";
 import { timestampFromUuidv7, uuidv7 } from "../../util/id.js";
 import { contentHash } from "../../util/text.js";
 import {
+  LiveTextCollisionError,
   createMemory,
   getMemory,
   listMemories,
@@ -35,15 +36,37 @@ function withDb<T>(fn: (db: CairnDb) => T): T {
 // same-timestamp fixtures for the keyset pagination test below.
 function rawInsertMemory(
   db: CairnDb,
-  overrides: Partial<{ id: string; text: string; scope: string; createdAt: number; contentHash: string }> = {},
+  overrides: Partial<{
+    id: string;
+    text: string;
+    scope: string;
+    sourceClient: string | null;
+    createdAt: number;
+    updatedAt: number;
+    contentHash: string;
+  }> = {},
 ): string {
   const id = overrides.id ?? uuidv7();
   const createdAt = overrides.createdAt ?? timestampFromUuidv7(id);
+  // Defaults to createdAt like the rest of this fixture, but a caller can
+  // diverge it -- a row that has been "edited" has updated_at > created_at,
+  // and several tests below need that divergence to be visible at all.
+  const updatedAt = overrides.updatedAt ?? createdAt;
   const text = overrides.text ?? id;
   db.q(
-    `INSERT INTO memories (id, text, scope, importance, created_at, updated_at, valid_from, content_hash)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, text, overrides.scope ?? "default", 0.5, createdAt, createdAt, createdAt, overrides.contentHash ?? contentHash(text));
+    `INSERT INTO memories (id, text, scope, source_client, importance, created_at, updated_at, valid_from, content_hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    text,
+    overrides.scope ?? "default",
+    overrides.sourceClient ?? null,
+    0.5,
+    createdAt,
+    updatedAt,
+    createdAt,
+    overrides.contentHash ?? contentHash(text),
+  );
   return id;
 }
 
@@ -319,7 +342,7 @@ test("supersedeMemory with the old row's own text succeeds", () => {
   });
 });
 
-test("supersedeMemory colliding with a different live memory throws, naming the conflicting id", () => {
+test("supersedeMemory colliding with a different live memory throws a typed LiveTextCollisionError naming the conflicting id", () => {
   withDb((db) => {
     const { memory: a } = createMemory(db, { text: "will be superseded" });
     const { memory: b } = createMemory(db, { text: "already live text" });
@@ -328,6 +351,17 @@ test("supersedeMemory colliding with a different live memory throws, naming the 
       () => supersedeMemory(db, a.id, { text: "already live text" }),
       new RegExp(b.id),
     );
+    try {
+      supersedeMemory(db, a.id, { text: "already live text" });
+      assert.fail("expected supersedeMemory to throw");
+    } catch (err) {
+      // Callers (the dashboard API) must be able to detect this
+      // structurally, not by matching this error's message text -- that
+      // message is free to change and has already drifted once.
+      assert.ok(err instanceof LiveTextCollisionError);
+      assert.equal(err.code, "live_text_collision");
+      assert.equal(err.conflictingId, b.id);
+    }
   });
 });
 
@@ -350,7 +384,7 @@ test("touchMemory increments access_count, leaves updated_at untouched, and leav
   });
 });
 
-test("updateMemory colliding with another live memory throws, naming the conflicting id", () => {
+test("updateMemory colliding with another live memory throws a typed LiveTextCollisionError naming the conflicting id", () => {
   withDb((db) => {
     const { memory: a } = createMemory(db, { text: "alpha fact" });
     const { memory: b } = createMemory(db, { text: "beta fact" });
@@ -359,6 +393,14 @@ test("updateMemory colliding with another live memory throws, naming the conflic
       () => updateMemory(db, b.id, { text: "alpha fact" }),
       new RegExp(a.id),
     );
+    try {
+      updateMemory(db, b.id, { text: "alpha fact" });
+      assert.fail("expected updateMemory to throw");
+    } catch (err) {
+      assert.ok(err instanceof LiveTextCollisionError);
+      assert.equal(err.code, "live_text_collision");
+      assert.equal(err.conflictingId, a.id);
+    }
   });
 });
 
@@ -423,6 +465,194 @@ test("Memory.seq is populated and matches the row's seq column", () => {
     const { memory } = createMemory(db, { text: "has a seq" });
     const row = db.q("select seq from memories where id = ?").get(memory.id);
     assert.equal(memory.seq, Number(row?.["seq"]));
+  });
+});
+
+test("listMemories: sourceClient filters exactly that client", () => {
+  withDb((db) => {
+    const mine = rawInsertMemory(db, { text: "mine", sourceClient: "app-a" });
+    rawInsertMemory(db, { text: "not mine", sourceClient: "app-b" });
+    rawInsertMemory(db, { text: "anonymous" });
+
+    const result = listMemories(db, { sourceClient: "app-a" });
+    assert.deepEqual(result.items.map((m) => m.id), [mine]);
+  });
+});
+
+test("listMemories: since is inclusive, until is exclusive", () => {
+  withDb((db) => {
+    const before = rawInsertMemory(db, { text: "before", createdAt: 1000 });
+    const atSince = rawInsertMemory(db, { text: "at since", createdAt: 2000 });
+    const inRange = rawInsertMemory(db, { text: "in range", createdAt: 2500 });
+    const atUntil = rawInsertMemory(db, { text: "at until", createdAt: 3000 });
+    const after = rawInsertMemory(db, { text: "after", createdAt: 4000 });
+
+    const result = listMemories(db, { since: 2000, until: 3000 });
+    const ids = new Set(result.items.map((m) => m.id));
+    assert.equal(ids.has(before), false);
+    assert.equal(ids.has(atSince), true);
+    assert.equal(ids.has(inRange), true);
+    assert.equal(ids.has(atUntil), false);
+    assert.equal(ids.has(after), false);
+  });
+});
+
+// Regression for the concern that the since/until filter and the
+// ORDER BY/keyset cursor could end up reading two different clocks
+// (created_at for the filter, updated_at for the sort/cursor). listMemories
+// uses created_at for all three, so a row's updated_at must have zero
+// effect on whether it is included or where it sorts -- these fixtures
+// deliberately set updated_at far from created_at, including on rows that
+// straddle the since/until boundary on one clock but not the other, so a
+// regression that started reading updated_at anywhere in this path would
+// show up as a wrong inclusion/exclusion or a wrong order here.
+test("listMemories: since/until and ordering are governed by created_at, never by updated_at", () => {
+  withDb((db) => {
+    // In range on created_at, but "edited" long after the until boundary --
+    // must still be included and must not be pulled to the front by that
+    // late updated_at, since ordering does not use updated_at either.
+    const editedAfterWindow = rawInsertMemory(db, {
+      text: "in range, edited after until",
+      createdAt: 2000,
+      updatedAt: 9000,
+    });
+    // Out of range on created_at (>= until), but "edited" so its updated_at
+    // falls inside [since, until) -- must still be excluded.
+    const outOfRangeUpdatedInWindow = rawInsertMemory(db, {
+      text: "out of range, updated_at inside window",
+      createdAt: 3500,
+      updatedAt: 2500,
+    });
+    // Out of range on created_at (< since), but "edited" so its updated_at
+    // falls inside [since, until) -- must still be excluded.
+    const beforeRangeUpdatedInWindow = rawInsertMemory(db, {
+      text: "before range, updated_at inside window",
+      createdAt: 800,
+      updatedAt: 2200,
+    });
+    // A normal in-range row, unedited, to check relative ordering against
+    // editedAfterWindow.
+    const normalInRange = rawInsertMemory(db, {
+      text: "in range, unedited",
+      createdAt: 2400,
+      updatedAt: 2400,
+    });
+
+    const result = listMemories(db, { since: 2000, until: 3000 });
+    const ids = result.items.map((m) => m.id);
+    assert.deepEqual(new Set(ids), new Set([editedAfterWindow, normalInRange]));
+    assert.equal(ids.includes(outOfRangeUpdatedInWindow), false);
+    assert.equal(ids.includes(beforeRangeUpdatedInWindow), false);
+    // Ordering must follow created_at (2400 before 2000), not updated_at
+    // (which would put editedAfterWindow, updated_at 9000, first).
+    assert.deepEqual(ids, [normalInRange, editedAfterWindow]);
+  });
+});
+
+test("listMemories: scope, tags, sourceClient, and since/until compose with AND", () => {
+  withDb((db) => {
+    const { memory } = createMemory(db, {
+      text: "matches every filter",
+      scope: "work",
+      tags: ["urgent"],
+    });
+    db.q(`UPDATE memories SET source_client = ? WHERE id = ?`).run("app-a", memory.id);
+
+    createMemory(db, { text: "wrong scope", scope: "personal", tags: ["urgent"] });
+    createMemory(db, { text: "wrong tag", scope: "work", tags: ["later"] });
+    const { memory: wrongClient } = createMemory(db, { text: "wrong client", scope: "work", tags: ["urgent"] });
+    db.q(`UPDATE memories SET source_client = ? WHERE id = ?`).run("app-b", wrongClient.id);
+
+    const result = listMemories(db, {
+      scope: "work",
+      tags: ["urgent"],
+      sourceClient: "app-a",
+      since: memory.createdAt,
+      until: memory.createdAt + 1,
+    });
+    assert.deepEqual(result.items.map((m) => m.id), [memory.id]);
+  });
+});
+
+// The important regression: a caller-supplied created_at range and the
+// keyset cursor's own (created_at, id) comparison are two independent AND
+// terms. Mixing 60 matching rows (a third of which share one created_at,
+// to stress the tuple comparison) with 60 non-matching rows across a page
+// size that forces at least 3 pages, and checking every matching row was
+// seen exactly once, is the case a naive `created_at < ?`-only cursor (or
+// a merged/collapsed range+cursor predicate) gets wrong. updated_at is
+// deliberately scattered far from created_at on every row (including ones
+// that straddle the `since` boundary on one clock but not the other), so a
+// regression that started ordering, cursoring, or filtering by updated_at
+// anywhere in this path would surface as a skipped/repeated/wrongly
+// included row here, not just in a single-page test.
+test("keyset pagination through a filtered result set visits every matching row exactly once, and no non-matching row", () => {
+  withDb((db) => {
+    const sharedTs = 1_700_000_000_000;
+    const matching = new Set<string>();
+    for (let i = 0; i < 20; i += 1) {
+      matching.add(
+        rawInsertMemory(db, {
+          text: `match shared ${i}`,
+          sourceClient: "app-a",
+          createdAt: sharedTs,
+          updatedAt: sharedTs + 1_000_000 - i,
+        }),
+      );
+    }
+    for (let i = 0; i < 40; i += 1) {
+      matching.add(
+        rawInsertMemory(db, {
+          text: `match spread ${i}`,
+          sourceClient: "app-a",
+          createdAt: sharedTs + 1 + i,
+          updatedAt: sharedTs - 1_000_000 - i,
+        }),
+      );
+    }
+    // Non-matching rows interleaved across the same timestamp range, some
+    // sharing the same created_at as matching rows, to make sure the
+    // sourceClient predicate -- not just the range -- survives paging.
+    // updated_at is set INSIDE the [since, ...) window even though
+    // created_at is not, so a filter that read updated_at would wrongly
+    // include these.
+    for (let i = 0; i < 30; i += 1) {
+      rawInsertMemory(db, {
+        text: `other client ${i}`,
+        sourceClient: "app-b",
+        createdAt: sharedTs + i,
+        updatedAt: sharedTs + i,
+      });
+    }
+    for (let i = 0; i < 30; i += 1) {
+      rawInsertMemory(db, {
+        text: `outside range ${i}`,
+        sourceClient: "app-a",
+        createdAt: sharedTs - 100 - i,
+        updatedAt: sharedTs + i,
+      });
+    }
+
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    for (let page = 0; page < 50; page += 1) {
+      const result = listMemories(db, { sourceClient: "app-a", since: sharedTs, limit: 7, cursor });
+      assert.ok(result.items.length <= 7);
+      for (const item of result.items) {
+        assert.equal(item.sourceClient, "app-a");
+        assert.ok(item.createdAt >= sharedTs);
+      }
+      seen.push(...result.items.map((m) => m.id));
+      cursor = result.nextCursor;
+      pages += 1;
+      if (cursor === null) break;
+    }
+
+    assert.ok(pages >= 3, `expected at least 3 pages, got ${pages}`);
+    assert.equal(seen.length, matching.size);
+    assert.equal(new Set(seen).size, seen.length, "no row was repeated across pages");
+    assert.deepEqual(new Set(seen), matching);
   });
 });
 

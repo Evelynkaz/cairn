@@ -119,6 +119,9 @@ export interface Store {
     options?: {
       scope?: string;
       tags?: string[];
+      sourceClient?: string;
+      since?: number;
+      until?: number;
       includeDeleted?: boolean;
       includeSuperseded?: boolean;
       limit?: number;

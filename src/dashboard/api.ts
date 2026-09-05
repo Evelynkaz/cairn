@@ -10,11 +10,11 @@ import { VALID_PRIVACY_MODES } from "../storage/index.js";
 import type { PrivacyMode } from "../storage/index.js";
 import type { MemoryEvent, MemoryEventBus } from "../mcp/events.js";
 import { PayloadTooLargeError, readJsonBody, sendJson, tokenMatches } from "../daemon/http.js";
+import { DASHBOARD_CLIENT } from "../config/identity.js";
+import { LiveTextCollisionError } from "../storage/repositories/memories.js";
 
-// The identity every store call the dashboard itself makes is stamped
-// with, so the §9 access log tells the truth about what the dashboard
-// (as opposed to some other MCP client) read and wrote.
-export const DASHBOARD_CLIENT = "cairn-dashboard";
+// Re-exported for callers that already import it from here.
+export { DASHBOARD_CLIENT };
 
 export interface DashboardApiDeps {
   store: Store;
@@ -82,6 +82,20 @@ function parseBoolParam(url: URL, name: string): boolean | undefined {
 function parseStringParam(url: URL, name: string): string | undefined {
   const raw = url.searchParams.get(name);
   return raw === null ? undefined : raw;
+}
+
+// Like parseIntParam, but a present, non-blank, non-numeric value is a
+// client mistake (a hand-typed filter, a stale bookmark) and must be
+// rejected with 400 rather than silently treated as "no filter" -- unlike
+// parseIntParam's callers elsewhere, which already tolerate that.
+function parseRequiredIntParam(url: URL, name: string): number | undefined {
+  const raw = url.searchParams.get(name);
+  if (raw === null || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new HttpError(400, `${name} must be numeric`);
+  }
+  return n;
 }
 
 // Turns the repository's "malformed ... cursor" throw into a 400 instead
@@ -175,6 +189,9 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     const cursor = parseStringParam(url, "cursor") ?? null;
     const includeDeleted = parseBoolParam(url, "includeDeleted");
     const includeSuperseded = parseBoolParam(url, "includeSuperseded");
+    const sourceClient = parseStringParam(url, "sourceClient");
+    const since = parseRequiredIntParam(url, "since");
+    const until = parseRequiredIntParam(url, "until");
 
     if (q !== undefined && q.trim() !== "") {
       const result = await store.recall(q, { scope, tags, limit }, CTX);
@@ -182,7 +199,10 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       return;
     }
 
-    const result = store.list({ scope, tags, includeDeleted, includeSuperseded, limit, cursor }, CTX);
+    const result = store.list(
+      { scope, tags, sourceClient, since, until, includeDeleted, includeSuperseded, limit, cursor },
+      CTX,
+    );
     sendJson(res, 200, { mode: "list", items: result.items, nextCursor: result.nextCursor });
   }
 
@@ -202,8 +222,15 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     if (typeof body["text"] === "string") patch.text = body["text"];
     if (Array.isArray(body["tags"])) patch.tags = body["tags"].map(String);
     if (body["importance"] !== undefined) patch.importance = validateImportance(body["importance"]);
-    if (!store.get(id, { includeDeleted: true, includeSuperseded: true }, CTX)) {
+    const current = store.get(id, { includeDeleted: true, includeSuperseded: true }, CTX);
+    if (!current) {
       throw new HttpError(404, "not found");
+    }
+    // A superseded memory is history (§5): editing it is a request the
+    // store's rules forbid, not a server fault -- answer it as a conflict
+    // rather than letting store.update's throw fall into the generic 500.
+    if (current.validUntil !== null) {
+      throw new HttpError(409, "conflict");
     }
     const memory = store.update(id, patch, CTX);
     sendJson(res, 200, memory);
@@ -230,7 +257,20 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     if (!store.get(id, { includeDeleted: true, includeSuperseded: true }, CTX)) {
       throw new HttpError(404, "not found");
     }
-    const result = store.supersede(id, { text, tags, importance }, CTX);
+    // No pre-check is possible here without duplicating the store's own
+    // live-hash lookup (Store exposes no "does this text collide" query) --
+    // catch the store's typed collision error instead and map it to 409,
+    // without ever forwarding the store's message (which may embed memory
+    // text) to the caller.
+    let result;
+    try {
+      result = store.supersede(id, { text, tags, importance }, CTX);
+    } catch (err) {
+      if (err instanceof LiveTextCollisionError) {
+        throw new HttpError(409, "conflict");
+      }
+      throw err;
+    }
     sendJson(res, 200, { superseded: result.superseded, replacement: result.replacement });
   }
 

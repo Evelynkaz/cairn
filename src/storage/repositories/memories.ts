@@ -10,6 +10,21 @@ import { contentHash } from "../../util/text.js";
 import { bool, num, numOrNull, str, strOrNull } from "./row.js";
 import { clampLimit, decodeCursor, encodeCursor } from "./paging.js";
 
+// Thrown by updateMemory/supersedeMemory when the requested text would
+// collide with another live memory's content_hash in the same scope. A
+// typed error (not a message string) so a caller like the dashboard API can
+// detect this structurally instead of pattern-matching a message meant for
+// a human -- the message text itself remains free to change.
+export class LiveTextCollisionError extends Error {
+  readonly code = "live_text_collision";
+  readonly conflictingId: string;
+  constructor(message: string, conflictingId: string) {
+    super(message);
+    this.name = "LiveTextCollisionError";
+    this.conflictingId = conflictingId;
+  }
+}
+
 const MEMORY_COLUMNS =
   "id, seq, text, scope, source_client, importance, created_at, updated_at, " +
   "last_accessed, access_count, valid_from, valid_until, superseded_by, " +
@@ -161,6 +176,13 @@ export function listMemories(
   options: {
     scope?: string;
     tags?: string[];
+    sourceClient?: string;
+    // Filters on created_at, independent of the keyset cursor's own
+    // (created_at, id) predicate below. `since` is inclusive, `until` is
+    // exclusive -- i.e. `[since, until)` -- kept consistent with each other
+    // so range filters compose without an off-by-one at either end.
+    since?: number;
+    until?: number;
     includeDeleted?: boolean;
     includeSuperseded?: boolean;
     limit?: number;
@@ -181,6 +203,18 @@ export function listMemories(
     conditions.push("scope = ?");
     params.push(options.scope);
   }
+  if (options.sourceClient !== undefined) {
+    conditions.push("source_client = ?");
+    params.push(options.sourceClient);
+  }
+  if (options.since !== undefined) {
+    conditions.push("created_at >= ?");
+    params.push(options.since);
+  }
+  if (options.until !== undefined) {
+    conditions.push("created_at < ?");
+    params.push(options.until);
+  }
   // AND semantics: one EXISTS clause per requested tag. A fixed placeholder
   // per tag keeps this fragment simple, but note the resulting SQL text
   // (and therefore db.q's cache key) still varies with the NUMBER of tags
@@ -192,6 +226,12 @@ export function listMemories(
     );
     params.push(tag);
   }
+  // Additional AND term, kept separate from the since/until range above:
+  // the cursor compares the full (created_at, id) tuple against the last
+  // row of the PREVIOUS page, which is a different comparison than a
+  // caller-supplied created_at range and must not be merged with it or
+  // collapsed into the same operator, or rows sharing a created_at at the
+  // filter's boundary get skipped or repeated across pages.
   if (options.cursor) {
     const { ts, id } = decodeCursor(options.cursor, "memories");
     conditions.push("(created_at < ? OR (created_at = ? AND id < ?))");
@@ -245,8 +285,10 @@ export function updateMemory(
           .q(`SELECT id FROM memories_live WHERE scope = ? AND content_hash = ? AND id != ?`)
           .get(current.scope, hash, id);
         if (conflict) {
-          throw new Error(
-            `text collides with live memory ${str(conflict, "id")} in scope "${current.scope}"`,
+          const conflictId = str(conflict, "id");
+          throw new LiveTextCollisionError(
+            `text collides with live memory ${conflictId} in scope "${current.scope}"`,
+            conflictId,
           );
         }
       }
@@ -340,7 +382,11 @@ export function supersedeMemory(
       .q(`SELECT id FROM memories_live WHERE scope = ? AND content_hash = ? AND id != ?`)
       .get(scope, hash, oldId);
     if (conflict) {
-      throw new Error(`text collides with live memory ${str(conflict, "id")} in scope "${scope}"`);
+      const conflictId = str(conflict, "id");
+      throw new LiveTextCollisionError(
+        `text collides with live memory ${conflictId} in scope "${scope}"`,
+        conflictId,
+      );
     }
 
     const id = uuidv7();

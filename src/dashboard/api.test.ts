@@ -275,21 +275,21 @@ test("PATCH with importance outside 0..1 is 400, not 500", async () => {
   assert.equal(res.status, 400);
 });
 
-test("PATCH on a superseded memory is a plain 500 with no message leak", async () => {
+test("PATCH on a superseded memory is a 409 conflict with no message leak", async () => {
   const memory = ctx.store.remember({ content: "will be superseded via api test" }, { sourceClient: "other" })
     .memory;
   ctx.store.supersede(memory.id, { text: "already superseded replacement" }, { sourceClient: "other" });
   const res = await call(ctx, "PATCH", `/api/memories/${memory.id}`, { body: { text: "edited" } });
-  assert.equal(res.status, 500);
-  assert.deepEqual(res.body, { error: "internal error" });
+  assert.equal(res.status, 409);
+  assert.deepEqual(res.body, { error: "conflict" });
 });
 
-test("a supersede whose text collides with a live memory is a plain 500 with no message leak", async () => {
+test("a supersede whose text collides with a live memory is a 409 conflict with no message leak", async () => {
   const a = ctx.store.remember({ content: "alpha collision text" }, { sourceClient: "other" }).memory;
   const b = ctx.store.remember({ content: "bravo collision text" }, { sourceClient: "other" }).memory;
   const res = await call(ctx, "POST", `/api/memories/${b.id}/supersede`, { body: { text: "alpha collision text" } });
-  assert.equal(res.status, 500);
-  assert.deepEqual(res.body, { error: "internal error" });
+  assert.equal(res.status, 409);
+  assert.deepEqual(res.body, { error: "conflict" });
 });
 
 test("no CORS headers, and OPTIONS is not answered as a preflight", async () => {
@@ -370,6 +370,34 @@ test("/api/stats reflects a known fixture", async () => {
   assert.equal(fixtureTag?.count, 2);
   assert.equal(body.vectors, ctx.store.capabilities.vectors);
   assert.equal(body.journalMode, ctx.store.capabilities.journalMode);
+});
+
+test("GET /api/memories?sourceClient=...&since=...&until=... filters as expected", async () => {
+  const now = Date.now();
+  const { memory: inRange } = ctx.store.remember({ content: "since/until fixture in range" }, { sourceClient: "filter-app" });
+  const outOfRange = await call(ctx, "GET", `/api/memories?sourceClient=filter-app&since=${now + 1_000_000}`);
+  assert.equal(outOfRange.status, 200);
+  assert.ok(!(outOfRange.body as { items: Array<{ id: string }> }).items.some((i) => i.id === inRange.id));
+
+  const bySourceClient = await call(ctx, "GET", "/api/memories?sourceClient=filter-app");
+  assert.equal(bySourceClient.status, 200);
+  const bySourceClientBody = bySourceClient.body as { items: Array<{ id: string; sourceClient: string | null }> };
+  assert.ok(bySourceClientBody.items.some((i) => i.id === inRange.id));
+  assert.ok(bySourceClientBody.items.every((i) => i.sourceClient === "filter-app"));
+
+  const inWindow = await call(ctx, "GET", `/api/memories?sourceClient=filter-app&since=${inRange.createdAt}&until=${inRange.createdAt + 1}`);
+  assert.equal(inWindow.status, 200);
+  assert.ok((inWindow.body as { items: Array<{ id: string }> }).items.some((i) => i.id === inRange.id));
+
+  ctx.store.forget(inRange.id);
+});
+
+test("a non-numeric since/until on GET /api/memories is 400", async () => {
+  const badSince = await call(ctx, "GET", "/api/memories?since=not-a-number");
+  assert.equal(badSince.status, 400);
+
+  const badUntil = await call(ctx, "GET", "/api/memories?until=not-a-number");
+  assert.equal(badUntil.status, 400);
 });
 
 test("SSE: connects, receives a published event, and close() leaves no open handle", async () => {

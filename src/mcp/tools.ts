@@ -12,7 +12,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { CallContext, Memory, SearchHit } from "../storage/index.js";
 import type { McpDeps } from "./deps.js";
-import { DASHBOARD_CLIENT } from "../dashboard/api.js";
+import { DASHBOARD_CLIENT } from "../config/identity.js";
 
 // The label used when a connected client did not identify itself (a bare
 // stdio pipe, or a client that skips clientInfo). Kept distinct from `null`
