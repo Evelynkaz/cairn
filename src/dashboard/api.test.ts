@@ -686,3 +686,140 @@ test("GET /api/memories?q=... (search mode) never echoes a failing embedding pro
     await teardown(failCtx);
   }
 });
+
+function chatGptConversationWithCustomInstructions(contextData: Record<string, unknown>): unknown {
+  return {
+    title: "Some chat",
+    mapping: {
+      "root-node-id": { message: null },
+      "system-node-id": {
+        message: {
+          author: { role: "system" },
+          metadata: {
+            is_user_system_message: true,
+            user_context_message_data: contextData,
+          },
+        },
+      },
+    },
+  };
+}
+
+test("POST /api/import/pasted imports a realistic pasted blob, findable via store.list", async () => {
+  const blob = [
+    "- Works as a backend engineer",
+    "1. Lives in Berlin",
+    "",
+    "2) Prefers Vim",
+    "   ",
+    "Plain line memory",
+  ].join("\n");
+
+  const res = await call(ctx, "POST", "/api/import/pasted", { body: { text: blob } });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { imported: 4, skipped: 0 });
+
+  const list = ctx.store.list({});
+  const texts = list.items.map((m) => m.text);
+  assert.ok(texts.includes("Works as a backend engineer"));
+  assert.ok(texts.includes("Lives in Berlin"));
+  assert.ok(texts.includes("Prefers Vim"));
+  assert.ok(texts.includes("Plain line memory"));
+});
+
+test("re-posting the same pasted text imports nothing the second time (content-hash dedupe)", async () => {
+  const blob = "- A distinct dedupe-check memory\n- Another distinct dedupe-check memory";
+
+  const first = await call(ctx, "POST", "/api/import/pasted", { body: { text: blob } });
+  assert.equal(first.status, 200);
+  assert.deepEqual(first.body, { imported: 2, skipped: 0 });
+
+  const second = await call(ctx, "POST", "/api/import/pasted", { body: { text: blob } });
+  assert.equal(second.status, 200);
+  assert.deepEqual(second.body, { imported: 0, skipped: 2 });
+});
+
+test("POST /api/import/pasted applies scope and tags", async () => {
+  const res = await call(ctx, "POST", "/api/import/pasted", {
+    body: { text: "A scoped-and-tagged import fixture", scope: "import-scope", tags: ["from-paste"] },
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { imported: 1, skipped: 0 });
+
+  const list = ctx.store.list({ scope: "import-scope" });
+  const item = list.items.find((m) => m.text === "A scoped-and-tagged import fixture");
+  assert.ok(item);
+  assert.equal(item?.scope, "import-scope");
+  assert.ok(item?.tags.includes("from-paste"));
+});
+
+test("POST /api/import/pasted publishes a list_changed event on the bus", async () => {
+  const events: Array<{ type: string }> = [];
+  const unsubscribe = ctx.bus.subscribe((event) => events.push(event));
+  try {
+    const res = await call(ctx, "POST", "/api/import/pasted", { body: { text: "An event-publishing fixture" } });
+    assert.equal(res.status, 200);
+    assert.ok(events.some((e) => e.type === "list_changed"));
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("POST /api/import/chatgpt imports found custom instructions", async () => {
+  const conversations = [
+    chatGptConversationWithCustomInstructions({
+      about_user_message: "Works as a backend engineer.",
+      about_model_message: "Be concise.",
+    }),
+  ];
+
+  const res = await call(ctx, "POST", "/api/import/chatgpt", { body: { conversations } });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { imported: 2, skipped: 0, found: 2 });
+
+  const list = ctx.store.list({});
+  const texts = list.items.map((m) => m.text);
+  assert.ok(texts.includes("Works as a backend engineer."));
+  assert.ok(texts.includes("Be concise."));
+});
+
+test("POST /api/import/chatgpt with no custom instructions returns found: 0, not an error", async () => {
+  const conversations = [
+    {
+      title: "Ordinary chat",
+      mapping: {
+        "root-node-id": { message: null },
+      },
+    },
+  ];
+
+  const res = await call(ctx, "POST", "/api/import/chatgpt", { body: { conversations } });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, { imported: 0, skipped: 0, found: 0 });
+});
+
+test("POST /api/import/chatgpt with a non-export body returns 400 and echoes none of the input", async () => {
+  const secret = "sk-super-secret-user-conversation-content-do-not-leak";
+  const res = await call(ctx, "POST", "/api/import/chatgpt", { body: { conversations: secret } });
+  assert.equal(res.status, 400);
+  const raw = JSON.stringify(res.body);
+  assert.ok(!raw.includes(secret));
+});
+
+test("401 without a bearer token on both import routes", async () => {
+  const pasted = await call(ctx, "POST", "/api/import/pasted", { token: null, body: { text: "x" } });
+  assert.equal(pasted.status, 401);
+
+  const chatgpt = await call(ctx, "POST", "/api/import/chatgpt", { token: null, body: { conversations: [] } });
+  assert.equal(chatgpt.status, 401);
+});
+
+test("an oversized body is refused on both import routes", async () => {
+  const oversized = "x".repeat(5 * 1024 * 1024);
+
+  const pasted = await call(ctx, "POST", "/api/import/pasted", { body: { text: oversized } });
+  assert.equal(pasted.status, 413);
+
+  const chatgpt = await call(ctx, "POST", "/api/import/chatgpt", { body: { conversations: oversized } });
+  assert.equal(chatgpt.status, 413);
+});

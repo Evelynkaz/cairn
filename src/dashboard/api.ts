@@ -12,6 +12,7 @@ import type { MemoryEvent, MemoryEventBus } from "../mcp/events.js";
 import { PayloadTooLargeError, readJsonBody, sendJson, tokenMatches } from "../daemon/http.js";
 import { DASHBOARD_CLIENT } from "../config/identity.js";
 import { LiveTextCollisionError } from "../storage/repositories/memories.js";
+import { extractCustomInstructions, ImporterFormatError, parsePastedMemories } from "../portability/importers/index.js";
 
 // Re-exported for callers that already import it from here.
 export { DASHBOARD_CLIENT };
@@ -493,6 +494,83 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     sendJson(res, 200, result);
   }
 
+  // §1/§12's lock-in-escape hook, wired to the dashboard rather than a
+  // ninth MCP tool (§2's ≤7 ceiling): a deliberate, user-initiated,
+  // one-time paste. Writes through store.remember under the dashboard's
+  // own call context so redaction, dedupe and the audit trail apply
+  // exactly as they do for any other write -- these are new memories with
+  // no id of their own, so minting fresh ones (not the id-preserving
+  // importMemory path) is correct here.
+  async function handleImportPasted(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = asRecord(await readBody(req));
+    const text = body["text"];
+    if (typeof text !== "string") {
+      throw new HttpError(400, "text is required");
+    }
+    const scope = typeof body["scope"] === "string" ? body["scope"] : undefined;
+    const tags = Array.isArray(body["tags"]) ? body["tags"].map(String) : undefined;
+
+    const parsed = parsePastedMemories(text);
+    let imported = 0;
+    let skipped = 0;
+    for (const entry of parsed) {
+      const result = store.remember({ content: entry.text, scope, tags }, CTX);
+      if (result.deduped) {
+        skipped++;
+      } else {
+        imported++;
+      }
+    }
+    if (imported > 0) {
+      bus?.publish({ type: "list_changed", sourceSessionId: DASHBOARD_CLIENT });
+    }
+    sendJson(res, 200, { imported, skipped });
+  }
+
+  // Same rationale as handleImportPasted above, for the one officially-
+  // confirmed structured field in a ChatGPT export (§16 milestone 10):
+  // custom instructions. A parse failure is a client mistake (not a
+  // ChatGPT export), answered with ImporterFormatError's own message --
+  // which by construction never echoes the input -- so no further
+  // scrubbing is needed here, unlike the no-echo rule elsewhere in this
+  // file that guards against exactly that.
+  async function handleImportChatGpt(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = asRecord(await readBody(req));
+    const scope = typeof body["scope"] === "string" ? body["scope"] : undefined;
+
+    let instructions;
+    try {
+      instructions = extractCustomInstructions(body["conversations"]);
+    } catch (err) {
+      if (err instanceof ImporterFormatError) {
+        throw new HttpError(400, err.message);
+      }
+      throw err;
+    }
+
+    const fields: { value: string | undefined; tag: string }[] = [
+      { value: instructions.aboutUser, tag: "chatgpt-about-user" },
+      { value: instructions.aboutModel, tag: "chatgpt-about-model" },
+    ];
+    const found = fields.filter((f) => f.value !== undefined && f.value.length > 0).length;
+
+    let imported = 0;
+    let skipped = 0;
+    for (const field of fields) {
+      if (field.value === undefined || field.value.length === 0) continue;
+      const result = store.remember({ content: field.value, scope, tags: ["chatgpt-import", field.tag] }, CTX);
+      if (result.deduped) {
+        skipped++;
+      } else {
+        imported++;
+      }
+    }
+    if (imported > 0) {
+      bus?.publish({ type: "list_changed", sourceSessionId: DASHBOARD_CLIENT });
+    }
+    sendJson(res, 200, { imported, skipped, found });
+  }
+
   function handleEvents(req: IncomingMessage, res: ServerResponse): void {
     if (sseStreams.size >= MAX_SSE_STREAMS) {
       sendJson(res, 503, { error: "too many active event streams; try again later" });
@@ -691,6 +769,21 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       await handleRedactions(res, url);
       return;
+    }
+
+    // /api/import/pasted, /api/import/chatgpt
+    if (segments[0] === "import") {
+      if (segments.length === 2 && segments[1] === "pasted") {
+        if (method !== "POST") throw new HttpError(405, "method not allowed");
+        await handleImportPasted(req, res);
+        return;
+      }
+      if (segments.length === 2 && segments[1] === "chatgpt") {
+        if (method !== "POST") throw new HttpError(405, "method not allowed");
+        await handleImportChatGpt(req, res);
+        return;
+      }
+      throw new HttpError(404, "not found");
     }
 
     throw new HttpError(404, "not found");
