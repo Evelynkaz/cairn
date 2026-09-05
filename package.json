@@ -1,5 +1,5 @@
 {
-  "name": "cairn",
+  "name": "cairn-mem",
   "version": "0.1.0",
   "type": "module",
   "description": "Persistent memory for your AI that you actually own — local-first, shared across every MCP client, one command to install, a dashboard to see and edit everything. No cloud, no account, no API key.",

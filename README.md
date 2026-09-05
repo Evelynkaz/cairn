@@ -22,11 +22,11 @@
 - **Privacy.** The built-in memory in most AI products is cloud-hosted, and increasingly the local, private, UI-having options (like mem0's OpenMemory) are being discontinued in favor of hosted accounts.
 - **Vendor lock-in.** Memory tied to one product is memory you can't take with you, inspect, or delete on your own terms.
 
-Cairn's wedge: **local-first**, **zero-config** (`npx cairn` and you're running, no Docker/Postgres/keys), **zero-inference writes** (storing a memory never calls an LLM), **MIT-licensed** (the strongest local incumbents are AGPL), a **real dashboard** (most memory servers ship none), and **portable** — including importers that pull your existing Claude/ChatGPT memories in.
+Cairn's wedge: **local-first**, **zero-config** (`npx cairn-mem` and you're running, no Docker/Postgres/keys), **zero-inference writes** (storing a memory never calls an LLM), **MIT-licensed** (the strongest local incumbents are AGPL), a **real dashboard** (most memory servers ship none), and **portable** — including importers that pull your existing Claude/ChatGPT memories in.
 
 ## Install
 
-Not yet published to npm — `npx cairn` is planned but not yet available.
+Not yet published to npm — `npx cairn-mem` is planned but not yet available.
 Today, run it from a clone:
 
 ```bash
@@ -34,7 +34,7 @@ git clone https://github.com/Evelynkaz/cairn.git
 cd cairn
 npm install
 npm run build
-node dist/cli/index.js        # equivalent to the future `npx cairn`
+node dist/cli/index.js        # equivalent to the future `npx cairn-mem`
 node dist/cli/index.js setup  # wire up Claude Desktop / Claude Code / Cursor
 node dist/cli/index.js ui     # open the dashboard
 ```
@@ -86,7 +86,7 @@ at ingest, the dashboard API, `cairn setup` / `cairn ui`, the Claude Code
 SessionStart recall hook, and export/import with pasted Claude/ChatGPT text
 and ChatGPT custom-instructions importers — all under test.
 
-**Still open before v1 is "done":** publishing to npm so `npx cairn` works,
+**Still open before v1 is "done":** publishing to npm so `npx cairn-mem` works,
 an automated browser test for the dashboard (it has been reviewed by hand,
 but nothing checks it in CI), and the release housekeeping in
 `docs/BUILD_BRIEF.md` §13/§15 (hero GIF, cross-OS smoke test of the

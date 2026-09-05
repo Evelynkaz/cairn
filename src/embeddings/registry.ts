@@ -1,5 +1,5 @@
 // Embedding configuration and consent resolution. BUILD_BRIEF §2 requires
-// `npx cairn` to work immediately with no model download, so the default
+// `npx cairn-mem` to work immediately with no model download, so the default
 // here is FTS-only ("off"), and a real provider is only ever used after the
 // user has explicitly consented to a download.
 

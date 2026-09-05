@@ -3,7 +3,7 @@
   "mcpServers": {
     "cairn": {
       "command": "npx",
-      "args": ["-y", "cairn@latest"]
+      "args": ["-y", "cairn-mem@latest"]
     }
   }
 }

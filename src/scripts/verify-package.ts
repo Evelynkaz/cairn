@@ -1,4 +1,4 @@
-// CI check: proves `npm pack` ships exactly what `npx cairn` needs and
+// CI check: proves `npm pack` ships exactly what `npx cairn-mem` needs and
 // nothing else. Run after `npm run build` (see .github/workflows/ci.yml),
 // next to "Verify sqlite-vec loadable extension" -- same idea, different
 // failure mode: package.json's `files` field is an easy silent regression

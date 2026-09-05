@@ -3,7 +3,7 @@
 ## Status: not yet published to npm
 
 The package is prepared for publication (0.1.0, no `"private"` flag) but is
-not yet on the npm registry. `npx cairn` is the eventual zero-config install
+not yet on the npm registry. `npx cairn-mem` is the eventual zero-config install
 path, but until it is actually published, the only way to run Cairn is from
 a clone. These are the exact
 commands from the README — do not drift from them:
@@ -13,13 +13,13 @@ git clone https://github.com/Evelynkaz/cairn.git
 cd cairn
 npm install
 npm run build
-node dist/cli/index.js        # equivalent to the future `npx cairn`
+node dist/cli/index.js        # equivalent to the future `npx cairn-mem`
 node dist/cli/index.js setup  # wire up Claude Desktop / Claude Code / Cursor
 node dist/cli/index.js ui     # open the dashboard
 ```
 
 Everywhere below, read `cairn <command>` as `node dist/cli/index.js <command>`
-run from inside the clone (or as `npx -y cairn@latest <command>` once it is
+run from inside the clone (or as `npx -y cairn-mem@latest <command>` once it is
 published).
 
 ## CRITICAL SAFETY RULE: never run `cairn setup` without `--dry-run` first
@@ -66,7 +66,7 @@ if Claude Desktop is installed. The entry it writes (see
   "mcpServers": {
     "cairn": {
       "command": "npx",
-      "args": ["-y", "cairn@latest"]
+      "args": ["-y", "cairn-mem@latest"]
     }
   }
 }
@@ -82,7 +82,7 @@ as above. Claude Code writes to this file continuously while it's running,
 so `cairn setup` warns and prefers a safer route:
 
 ```bash
-claude mcp add cairn -- npx -y cairn@latest
+claude mcp add cairn -- npx -y cairn-mem@latest
 ```
 
 Close Claude Code before letting `cairn setup` touch `~/.claude.json`
@@ -94,7 +94,7 @@ equivalent to hand-editing:
   "mcpServers": {
     "cairn": {
       "command": "npx",
-      "args": ["-y", "cairn@latest"]
+      "args": ["-y", "cairn-mem@latest"]
     }
   }
 }
@@ -116,7 +116,7 @@ its parent directory) exists. Same entry shape (see
   "mcpServers": {
     "cairn": {
       "command": "npx",
-      "args": ["-y", "cairn@latest"]
+      "args": ["-y", "cairn-mem@latest"]
     }
   }
 }

@@ -48,7 +48,7 @@ test("created: no file writes a fresh config with only mcpServers.cairn", () => 
     const written = JSON.parse(readFileSync(configPath, "utf8"));
     assert.deepEqual(Object.keys(written), ["mcpServers"]);
     assert.deepEqual(Object.keys(written.mcpServers), ["cairn"]);
-    assert.deepEqual(written.mcpServers.cairn, { command: "npx", args: ["-y", "cairn@latest"] });
+    assert.deepEqual(written.mcpServers.cairn, { command: "npx", args: ["-y", "cairn-mem@latest"] });
   });
 });
 
@@ -75,7 +75,7 @@ test("updated: existing servers and unrelated top-level keys survive, backup hol
     const updated = JSON.parse(readFileSync(configPath, "utf8"));
     assert.deepEqual(updated.mcpServers.other, original.mcpServers.other);
     assert.deepEqual(updated.mcpServers.another, original.mcpServers.another);
-    assert.deepEqual(updated.mcpServers.cairn, { command: "npx", args: ["-y", "cairn@latest"] });
+    assert.deepEqual(updated.mcpServers.cairn, { command: "npx", args: ["-y", "cairn-mem@latest"] });
     assert.deepEqual(updated.someOtherTopLevelKey, original.someOtherTopLevelKey);
   });
 });
@@ -165,7 +165,7 @@ test("dryRun: updated outcome, original file and backups untouched", () => {
 test("dryRun: unchanged outcome when cairn entry already matches, no writes", () => {
   withTempDir((dir) => {
     const configPath = join(dir, "mcp.json");
-    const original = { mcpServers: { cairn: { command: "npx", args: ["-y", "cairn@latest"] } } };
+    const original = { mcpServers: { cairn: { command: "npx", args: ["-y", "cairn-mem@latest"] } } };
     writeFileSync(configPath, JSON.stringify(original, null, 2), "utf8");
 
     const mtimeBefore = statSync(configPath).mtimeMs;
@@ -186,7 +186,7 @@ test("http entry shape uses a custom port", () => {
 test("stdio entry shape ignores port", () => {
   withTempDir((dir) => {
     const t = target(join(dir, "mcp.json"), { transport: "stdio" });
-    assert.deepEqual(cairnServerEntry(t, { port: 9999 }), { command: "npx", args: ["-y", "cairn@latest"] });
+    assert.deepEqual(cairnServerEntry(t, { port: 9999 }), { command: "npx", args: ["-y", "cairn-mem@latest"] });
   });
 });
 
@@ -271,7 +271,7 @@ test("BOM: a UTF-8 BOM-prefixed config is parsed and updated, not rejected", () 
     assert.equal(result.outcome, "updated");
     const updated = JSON.parse(readFileSync(configPath, "utf8"));
     assert.deepEqual(updated.mcpServers.other, original.mcpServers.other);
-    assert.deepEqual(updated.mcpServers.cairn, { command: "npx", args: ["-y", "cairn@latest"] });
+    assert.deepEqual(updated.mcpServers.cairn, { command: "npx", args: ["-y", "cairn-mem@latest"] });
   });
 });
 
@@ -283,7 +283,7 @@ test("empty file: a zero-byte config is treated as 'created', not unparsable", (
     const result = applyToClient(target(configPath));
     assert.equal(result.outcome, "created");
     const written = JSON.parse(readFileSync(configPath, "utf8"));
-    assert.deepEqual(written.mcpServers.cairn, { command: "npx", args: ["-y", "cairn@latest"] });
+    assert.deepEqual(written.mcpServers.cairn, { command: "npx", args: ["-y", "cairn-mem@latest"] });
   });
 });
 
@@ -341,7 +341,7 @@ test("replaced: an existing different cairn entry is reported 'replaced', backed
     assert.deepEqual(backupContent, original);
 
     const updated = JSON.parse(readFileSync(configPath, "utf8"));
-    assert.deepEqual(updated.mcpServers.cairn, { command: "npx", args: ["-y", "cairn@latest"] });
+    assert.deepEqual(updated.mcpServers.cairn, { command: "npx", args: ["-y", "cairn-mem@latest"] });
   });
 });
 

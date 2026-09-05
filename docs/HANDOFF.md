@@ -92,7 +92,7 @@ cairn -- local-first memory MCP server
 Usage:
   cairn                          run as the stdio MCP shim when not on a
                                   terminal (this is what an MCP client's
-                                  {"command":"npx","args":["-y","cairn@latest"]}
+                                  {"command":"npx","args":["-y","cairn-mem@latest"]}
                                   launches); otherwise print status
   cairn mcp                      always run the stdio MCP shim
   cairn daemon                   run the daemon in the foreground
@@ -218,8 +218,8 @@ throughout the commit bodies in `git log`:
 
 ## 7. Open decisions that belong to the human
 
-- **The package name.** BUILD_BRIEF §0 flags `cairn` as a placeholder pending npm-name / GitHub-org / `.dev`-domain / trademark verification, with `Marrow` and `Loam` as fallbacks (possible suffix: `cairn-mcp`, `usecairn`). `package.json` currently says `"name": "cairn"`. This needs a human to actually check availability before publish.
-- **Publishing.** `package.json` is publishable as of 0.1.0 (no `"private"` key), but `cairn setup` (`src/setup/apply.ts`, `src/cli/commands.ts`, `src/cli/index.ts`) writes `npx -y cairn@latest` into every client config it generates. That line will not work for any real user until the package is actually published under whatever name §0 settles on — what blocks publication is the unresolved package name above, not the `private` flag — a human decision (npm account, publish flow), not an agent one.
+- **The package name.** Settled: the npm package name is `cairn-mem`. `cairn` is taken by an unrelated React Native styling library, `cairn-memory` is taken by an active direct competitor, and `cairn-mcp` is taken by another project. The product name stays Cairn and the bin stays `cairn`; `package.json` now says `"name": "cairn-mem"`.
+- **Publishing.** `package.json` is publishable as of 0.1.0 (no `"private"` key), and `cairn setup` (`src/setup/apply.ts`, `src/cli/commands.ts`, `src/cli/index.ts`) now writes `npx -y cairn-mem@latest` into every client config it generates. That line will not work for any real user until the package is actually published — what remains is the human publish step itself (creating/using an npm account, running `npm publish`), not a naming decision.
 - **The demo/hero GIF.** BUILD_BRIEF §15 wants a hero GIF (Claude tells it something, Cursor recalls it) and a launch demo GIF (VHS/asciinema) — both need a human at a screen with a working dashboard. The dashboard exists now (M7 shipped) and the vendor importers are reachable from it (M10 shipped), so this is unblocked except for the human and the screen.
 
 ## 8. What comes next

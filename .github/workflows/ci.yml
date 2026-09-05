@@ -81,11 +81,11 @@ jobs:
           # CAIRN_HOME is derived here (not in the step's `env:` block) so the
           # normalised $RUNNER_TEMP above is what it's built from.
           export CAIRN_HOME="$RUNNER_TEMP/cairn-home"
-          # The npm package name is an open question (BUILD_BRIEF; the name "cairn" is
-          # already taken on npm), so derive the install directory from package.json's
-          # `name` at run time instead of hardcoding it -- that also does the right
-          # thing for a scoped name like `@scope/pkg`. Export it so the next step,
-          # which can't call node from an `env:` value, can reuse it.
+          # The npm package name is settled (`cairn-mem`), but this still derives the
+          # install directory from package.json's `name` at run time instead of
+          # hardcoding it, so a future rename can't silently break this job -- that
+          # also does the right thing for a scoped name like `@scope/pkg`. Export it
+          # so the next step, which can't call node from an `env:` value, can reuse it.
           PKG_DIR=$(node -p "require('./package.json').name")
           CLI="$RUNNER_TEMP/install/node_modules/$PKG_DIR/dist/cli/index.js"
           echo "CLI_PATH=$CLI" >> "$GITHUB_ENV"

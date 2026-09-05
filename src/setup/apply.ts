@@ -50,7 +50,7 @@ export function cairnServerEntry(target: ClientTarget, options: { port?: number 
     const port = options.port ?? DEFAULT_PORT;
     return { url: `http://127.0.0.1:${port}/mcp`, type: "http" };
   }
-  return { command: "npx", args: ["-y", "cairn@latest"] };
+  return { command: "npx", args: ["-y", "cairn-mem@latest"] };
 }
 
 function backupSuffix(): string {

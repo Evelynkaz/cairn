@@ -13,7 +13,7 @@ section number when you deviate or resolve an ambiguity from it.
   permissive **MIT** license in a tier where the leaders are AGPL, (4) a genuinely good
   curation dashboard, (5) portability + importers from Claude/ChatGPT memory.
 - Non-negotiables: local-first & offline by default; **no telemetry, ever**; zero-config
-  (`npx cairn`, no Docker/Postgres/forced model download to start — ship an instant
+  (`npx cairn-mem`, no Docker/Postgres/forced model download to start — ship an instant
   FTS-only mode); **≤ ~7 MCP tools** (tool sprawl measurably degrades client accuracy);
   privacy is a feature (secret/PII redaction at ingest, deletion first-class); the
   dashboard is a product; cross-client shared memory (one store, many clients).
@@ -80,7 +80,7 @@ section number when you deviate or resolve an ambiguity from it.
 
 ## Definition of done (v1) — §13
 
-- `npx cairn` runs zero-config, no keys, no Docker, smoke-tested on macOS/Windows/Linux.
+- `npx cairn-mem` runs zero-config, no keys, no Docker, smoke-tested on macOS/Windows/Linux.
 - `cairn setup` wires Claude Desktop, Claude Code, and Cursor; the "tell Claude → ask
   Cursor" cross-client demo works end-to-end.
 - All ≤7 tools implemented with bounded output.

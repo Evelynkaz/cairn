@@ -2,8 +2,10 @@
 
 > Paste this whole document as the initial spec for the AI coding agent in a fresh repo.
 > It is the single source of truth for what to build, why, and in what order.
-> (Name "Cairn" is a placeholder — verify npm name / GitHub org / `.dev` domain / trademark
-> before publishing; fallbacks: **Marrow**, **Loam**. Use a suffix if needed: `cairn-mcp`, `usecairn`.)
+> (Name "Cairn" is the product name — settled. The npm package name is `cairn-mem`:
+> `cairn` is taken by an unrelated React Native styling library, `cairn-memory` is taken
+> by an active direct competitor, and `cairn-mcp` is taken by another project. The bin
+> stays `cairn`; only the npm package specifier is `cairn-mem`.)
 
 ---
 
@@ -163,12 +165,12 @@ Design it to be the README hero screenshot. A clean, fast, editable table + sear
 
 ## 11. INSTALL & CROSS-CLIENT SETUP
 
-- **One command:** `npx cairn` (primary). Optional `uvx`-style / single binary later.
+- **One command:** `npx cairn-mem` (primary). Optional `uvx`-style / single binary later.
 - **`cairn setup`** auto-writes the MCP config into **Claude Desktop, Claude Code, and Cursor** (detect installed clients, back up existing config, be idempotent). Document manual config for Windsurf/VS Code/others.
 - **`cairn ui`** opens the dashboard. **`cairn`** with no args runs/attaches the daemon.
 - Config snippets to generate:
-  - stdio (Claude Desktop/Cursor): `{"mcpServers":{"cairn":{"command":"npx","args":["-y","cairn@latest"]}}}`
-  - Claude Code: `claude mcp add cairn -- npx -y cairn@latest` (or `--transport http http://127.0.0.1:PORT/mcp`)
+  - stdio (Claude Desktop/Cursor): `{"mcpServers":{"cairn":{"command":"npx","args":["-y","cairn-mem@latest"]}}}`
+  - Claude Code: `claude mcp add cairn -- npx -y cairn-mem@latest` (or `--transport http http://127.0.0.1:PORT/mcp`)
   - HTTP (shared daemon): `{"mcpServers":{"cairn":{"url":"http://127.0.0.1:PORT/mcp","type":"http"}}}`
 - **The cross-client demo must work end-to-end:** store a fact via Claude, recall it via Cursor (same daemon, same file).
 

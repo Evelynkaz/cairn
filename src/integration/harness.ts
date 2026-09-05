@@ -5,14 +5,14 @@
 // the same entrypoints and argv shapes a real install does.
 //
 // One deliberate substitution: BUILD_BRIEF §11's stdio snippet is
-// `{"command":"npx","args":["-y","cairn@latest"]}`, but the package is not
+// `{"command":"npx","args":["-y","cairn-mem@latest"]}`, but the package is not
 // published yet, so `startStdioClient` below spawns the LOCAL BUILD
 // (`dist/cli/index.js`, this repo's own bin entrypoint) with `process.execPath`
 // as the command instead of `npx`. Everything downstream of "a process gets
 // spawned with no subcommand and a non-TTY stdin" is identical to what a
 // real MCP host does -- same entrypoint, same dispatch-on-TTY logic in
 // src/cli/index.ts, same shim, same ensureDaemon() auto-start. What this
-// substitution does NOT prove: that `npx -y cairn@latest` itself resolves
+// substitution does NOT prove: that `npx -y cairn-mem@latest` itself resolves
 // and runs correctly from the public registry. That hop is untested here by
 // necessity and must be covered by an actual `npx` smoke test once the
 // package is published (BUILD_BRIEF §13's "smoke-tested on macOS/Windows/
@@ -269,7 +269,7 @@ export function findProjectRoot(): string {
     const candidate = join(dir, "package.json");
     if (existsSync(candidate)) {
       const pkg = JSON.parse(readFileSync(candidate, "utf8")) as { name?: string };
-      if (pkg.name === "cairn") {
+      if (pkg.name === "cairn-mem") {
         return dir;
       }
     }

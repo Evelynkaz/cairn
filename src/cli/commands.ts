@@ -57,7 +57,7 @@ const HELP_TEXT = `cairn -- local-first memory MCP server
 Usage:
   cairn                          run as the stdio MCP shim when not on a
                                   terminal (this is what an MCP client's
-                                  {"command":"npx","args":["-y","cairn@latest"]}
+                                  {"command":"npx","args":["-y","cairn-mem@latest"]}
                                   launches); otherwise print status
   cairn mcp                      always run the stdio MCP shim
   cairn daemon                   run the daemon in the foreground
@@ -261,11 +261,11 @@ function humanOutcome(outcome: ApplyOutcome): string {
   }
 }
 
-const CLAUDE_CODE_HINT = "Claude Code can also be configured directly: claude mcp add cairn -- npx -y cairn@latest";
+const CLAUDE_CODE_HINT = "Claude Code can also be configured directly: claude mcp add cairn -- npx -y cairn-mem@latest";
 
 const CLAUDE_CODE_LIVE_WRITE_NOTE =
   "note: ~/.claude.json is written continuously by a running Claude Code -- close it before running this, " +
-  "or prefer the safer alternative: claude mcp add cairn -- npx -y cairn@latest";
+  "or prefer the safer alternative: claude mcp add cairn -- npx -y cairn-mem@latest";
 
 // Resolves the OS home directory the same way resolveCairnHome() does
 // (env override, then the real OS home) so `setup`, which never touches

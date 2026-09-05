@@ -357,11 +357,11 @@ test("9. the generated config is the config that works: cairnServerEntry names t
   const entry = cairnServerEntry(target);
 
   // BUILD_BRIEF §11's documented stdio snippet, verbatim.
-  assert.deepEqual(entry, { command: "npx", args: ["-y", "cairn@latest"] });
+  assert.deepEqual(entry, { command: "npx", args: ["-y", "cairn-mem@latest"] });
 
   // Closing the loop harness.ts's own header comment names: the "npx"
   // command above is a stand-in for this project's own package, and
-  // package.json's `bin.cairn` is what `npx cairn` ultimately resolves to.
+  // package.json's `bin.cairn` is what `npx cairn-mem` ultimately resolves to.
   // Deriving the expected path from package.json itself (not a hardcoded
   // relative depth) is what proves the two ends of that substitution still
   // agree, rather than merely asserting harness.ts agrees with itself.

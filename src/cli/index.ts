@@ -2,7 +2,7 @@
 // The `cairn` bin (package.json's bin.cairn -> dist/cli/index.js).
 //
 // BUILD_BRIEF §11 specifies the stdio client config as
-// {"command":"npx","args":["-y","cairn@latest"]} -- no subcommand. That
+// {"command":"npx","args":["-y","cairn-mem@latest"]} -- no subcommand. That
 // means a bare `cairn`, when launched BY an MCP client, must BE the stdio
 // shim. When a human runs it in a terminal instead, it should report status
 // -- nobody wants a terminal command that silently hangs waiting for JSON-RPC
@@ -30,7 +30,7 @@ import type { CommandContext } from "./commands.js";
 // happens as a side effect of importing the storage layer (commands.js ->
 // lifecycle.js -> storage/db.js -> storage/driver/node-sqlite.ts). That is
 // our own implementation detail, not something the user chose or can act
-// on, and `npx cairn` is this project's zero-config front door (BUILD_BRIEF
+// on, and `npx cairn-mem` is this project's zero-config front door (BUILD_BRIEF
 // §2) -- a scary experimental-feature warning as the very first line of
 // output makes it look broken. This suppresses ONLY that one warning:
 // it saves Node's own default "warning" listener and re-delegates every

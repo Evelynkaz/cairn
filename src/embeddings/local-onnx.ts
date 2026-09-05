@@ -3,7 +3,7 @@
 // therefore declared in package.json as an OPTIONAL PEER dependency, not a
 // regular or optional dependency: npm installs `optionalDependencies`
 // automatically on every install, which would pull that weight into every
-// `npx cairn` run (including FTS-only users) and break the §2 zero-config,
+// `npx cairn-mem` run (including FTS-only users) and break the §2 zero-config,
 // instant-start promise. An optional PEER dependency is never auto-installed,
 // so the runtime only shows up once the user explicitly installs it (e.g.
 // `npm install --prefix <CAIRN_HOME> @huggingface/transformers`) --

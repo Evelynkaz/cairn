@@ -1,7 +1,7 @@
 # Example configs
 
 These are **placeholders**. Cairn does not have a published package yet —
-`npx -y cairn@latest` will not work until v1 ships. The configs here show the
+`npx -y cairn-mem@latest` will not work until v1 ships. The configs here show the
 shape of the setup that `cairn setup` will eventually write automatically;
 they're useful for previewing the intended integration.
 

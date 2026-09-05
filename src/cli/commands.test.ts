@@ -262,7 +262,7 @@ test("setup: a live, non-dry-run run against a fully isolated home configures al
     assert.ok(existsSync(claudeDesktopPath));
     assert.deepEqual(JSON.parse(readFileSync(claudeCodePath, "utf8")).mcpServers.cairn, {
       command: "npx",
-      args: ["-y", "cairn@latest"],
+      args: ["-y", "cairn-mem@latest"],
     });
     assert.ok(ctx.lines.out.some((l) => l.includes("close it") || l.includes("claude mcp add")));
   });
