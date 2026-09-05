@@ -292,6 +292,59 @@ test("a supersede whose text collides with a live memory is a 409 conflict with 
   assert.deepEqual(res.body, { error: "conflict" });
 });
 
+test("PATCH whose text collides with a different live memory is a 409 conflict with no message leak", async () => {
+  const a = ctx.store.remember({ content: "alpha patch collision text" }, { sourceClient: "other" }).memory;
+  const b = ctx.store.remember({ content: "bravo patch collision text" }, { sourceClient: "other" }).memory;
+  const res = await call(ctx, "PATCH", `/api/memories/${b.id}`, { body: { text: "alpha patch collision text" } });
+  assert.equal(res.status, 409);
+  assert.deepEqual(res.body, { error: "conflict" });
+
+  const unchanged = ctx.store.get(b.id, {}, { sourceClient: "other" });
+  assert.equal(unchanged?.text, "bravo patch collision text");
+});
+
+test("restoring a memory whose text was re-remembered while deleted is a 409 conflict with no message leak", async () => {
+  const original = ctx.store.remember({ content: "restore collision text" }, { sourceClient: "other" }).memory;
+  ctx.store.forget(original.id, { sourceClient: "other" });
+  ctx.store.remember({ content: "restore collision text" }, { sourceClient: "other" });
+
+  const res = await call(ctx, "POST", `/api/memories/${original.id}/restore`);
+  assert.equal(res.status, 409);
+  assert.deepEqual(res.body, { error: "conflict" });
+});
+
+test("bulk restore where the middle id collides reports that id ok:false and actually restores the others", async () => {
+  const a = ctx.store.remember({ content: "bulk-restore alpha" }, { sourceClient: "other" }).memory;
+  const collidingText = ctx.store.remember({ content: "bulk-restore collides" }, { sourceClient: "other" }).memory;
+  const c = ctx.store.remember({ content: "bulk-restore charlie" }, { sourceClient: "other" }).memory;
+  ctx.store.forget(a.id, { sourceClient: "other" });
+  ctx.store.forget(collidingText.id, { sourceClient: "other" });
+  ctx.store.forget(c.id, { sourceClient: "other" });
+  // Re-remember the middle one's text as a new live row, so restoring the
+  // original (deleted) row collides.
+  ctx.store.remember({ content: "bulk-restore collides" }, { sourceClient: "other" });
+
+  const res = await call(ctx, "POST", "/api/memories/bulk", {
+    body: { op: "restore", ids: [a.id, collidingText.id, c.id] },
+  });
+  assert.equal(res.status, 200);
+  const body = res.body as { results: Array<{ id: string; ok: boolean; reason?: string }> };
+  const byId = new Map(body.results.map((r) => [r.id, r]));
+  assert.equal(byId.get(a.id)?.ok, true);
+  assert.equal(byId.get(collidingText.id)?.ok, false);
+  assert.equal(byId.get(c.id)?.ok, true);
+
+  // Assert the store state directly, not just the response body: a
+  // response that claims success over an unapplied write is the failure
+  // mode this test exists to catch.
+  const storeA = ctx.store.get(a.id, { includeDeleted: true }, { sourceClient: "other" });
+  const storeCollide = ctx.store.get(collidingText.id, { includeDeleted: true }, { sourceClient: "other" });
+  const storeC = ctx.store.get(c.id, { includeDeleted: true }, { sourceClient: "other" });
+  assert.equal(storeA?.deletedAt, null);
+  assert.notEqual(storeCollide?.deletedAt, null);
+  assert.equal(storeC?.deletedAt, null);
+});
+
 test("no CORS headers, and OPTIONS is not answered as a preflight", async () => {
   const res = await call(ctx, "GET", "/api/memories");
   assert.equal(res.headers["access-control-allow-origin"], undefined);

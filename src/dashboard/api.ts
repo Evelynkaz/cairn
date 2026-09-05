@@ -232,7 +232,18 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     if (current.validUntil !== null) {
       throw new HttpError(409, "conflict");
     }
-    const memory = store.update(id, patch, CTX);
+    // Same rationale as handleSupersedeMemory below: catch the store's typed
+    // collision error and map it to 409, without ever forwarding its
+    // message (which may embed memory text) to the caller.
+    let memory;
+    try {
+      memory = store.update(id, patch, CTX);
+    } catch (err) {
+      if (err instanceof LiveTextCollisionError) {
+        throw new HttpError(409, "conflict");
+      }
+      throw err;
+    }
     sendJson(res, 200, memory);
   }
 
@@ -242,7 +253,18 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
   }
 
   async function handleRestoreMemory(res: ServerResponse, id: string): Promise<void> {
-    const restored = store.restore(id, CTX);
+    // Same rationale as handleSupersedeMemory below: catch the store's typed
+    // collision error and map it to 409, without ever forwarding its
+    // message (which may embed memory text) to the caller.
+    let restored;
+    try {
+      restored = store.restore(id, CTX);
+    } catch (err) {
+      if (err instanceof LiveTextCollisionError) {
+        throw new HttpError(409, "conflict");
+      }
+      throw err;
+    }
     sendJson(res, 200, { restored });
   }
 
@@ -287,9 +309,23 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     if (ids.length > MAX_BULK_IDS) {
       throw new HttpError(400, `ids exceeds the cap of ${MAX_BULK_IDS}`);
     }
+    // Contract: each id is applied one at a time through the same gated,
+    // audited single-id store methods used by the non-bulk routes -- this
+    // is NOT one atomic transaction across ids. A collision (or any other
+    // failure) on one id must not undo or block the ids already committed,
+    // so each id is caught individually and reported in its own result
+    // rather than aborting -- or worse, having already partially committed
+    // -- the whole request.
     const results = (ids as string[]).map((id) => {
-      const ok = op === "forget" ? store.forget(id, CTX) : store.restore(id, CTX);
-      return { id, ok };
+      try {
+        const ok = op === "forget" ? store.forget(id, CTX) : store.restore(id, CTX);
+        return { id, ok };
+      } catch (err) {
+        if (err instanceof LiveTextCollisionError) {
+          return { id, ok: false, reason: "conflict" as const };
+        }
+        throw err;
+      }
     });
     sendJson(res, 200, { op, results, count: results.length });
   }

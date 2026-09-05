@@ -1,20 +1,22 @@
-// Drives the SSE frame parser directly with the daemon's actual byte
-// stream (see src/dashboard/api.ts's heartbeat, ":\r\n\r\n" -- CRLF) rather
-// than only being exercisable through a live connection.
+// Drives the SSE frame parser directly against raw byte streams, including
+// a CRLF-framed one. Our own daemon (src/dashboard/api.ts) always writes
+// LF-framed events and heartbeats, never CRLF -- but the SSE spec permits a
+// producer to use CRLF, so the parser must handle it too rather than only
+// being exercisable through a live connection to our own daemon.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createSseFrameParser, parseSseEvent } from "./api-client.js";
 
-// A CRLF-framed heartbeat followed by a CRLF-framed real event -- the exact
-// shape the daemon emits.
+// A CRLF-framed heartbeat followed by a CRLF-framed real event -- a
+// hypothetical CRLF producer, not a shape our own daemon emits.
 const HEARTBEAT = ":\r\n\r\n";
 const REAL_EVENT = 'data: {"type":"updated"}\r\n\r\n';
 const RAW = HEARTBEAT + REAL_EVENT;
 
-test("before the fix: naive indexOf('\\n\\n') splitting never finds a boundary in a CRLF stream", () => {
-  // This is exactly the old parser's loop body, run against the daemon's
-  // real CRLF-framed bytes.
+test("naive indexOf('\\n\\n') splitting never finds a boundary in a CRLF stream", () => {
+  // This is exactly the old parser's loop body, run against a hypothetical
+  // CRLF-framed producer's bytes.
   let buffer = RAW;
   const frames: string[] = [];
   let sepIndex = buffer.indexOf("\n\n");
@@ -25,16 +27,17 @@ test("before the fix: naive indexOf('\\n\\n') splitting never finds a boundary i
   }
   // Every "\n" in a CRLF stream is immediately preceded by "\r", so a
   // literal "\n\n" never occurs -- zero frames come out, and the whole
-  // stream sits in `buffer` forever, growing on every future write. This is
-  // the observed-before behaviour: the real event is silently lost.
+  // stream sits in `buffer` forever, growing on every future write. A naive
+  // parser would silently lose the real event here.
   assert.deepEqual(frames, []);
   assert.equal(buffer, RAW);
 });
 
-test("after the fix: the frame parser yields the event past a CRLF heartbeat", () => {
+test("the frame parser yields the event past a CRLF heartbeat", () => {
   const parser = createSseFrameParser();
   const events = parser.push(RAW);
-  // Observed after: the event reaches the caller instead of vanishing.
+  // The CRLF-to-LF normalization means the event reaches the caller instead
+  // of vanishing, even though our own daemon never actually sends CRLF.
   assert.deepEqual(events, [{ type: "updated" }]);
 });
 

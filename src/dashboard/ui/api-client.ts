@@ -205,12 +205,13 @@ export function parseSseEvent(raw: string): StreamEvent | null {
   }
 }
 
-// Buffers raw decoded chunks and yields complete SSE frames. The daemon's
-// heartbeat is ":\r\n\r\n" (CRLF) while a normal event frame may be "\n\n"
-// -- normalizing CRLF to LF up front means a single "\n\n" split handles
-// both, a frame split across a chunk boundary (partial frames stay in the
-// buffer until the next push), and a heartbeat immediately followed by a
-// real event in the same chunk.
+// Buffers raw decoded chunks and yields complete SSE frames. Per the SSE
+// spec a producer may legitimately terminate lines with CRLF instead of LF;
+// our own daemon (src/dashboard/api.ts) always writes LF ("\n\n"), but
+// normalizing CRLF to LF up front means a single "\n\n" split handles a
+// CRLF-framed source too, a frame split across a chunk boundary (partial
+// frames stay in the buffer until the next push), and a heartbeat
+// immediately followed by a real event in the same chunk.
 export function createSseFrameParser(): { push: (chunk: string) => StreamEvent[] } {
   let buffer = "";
   return {

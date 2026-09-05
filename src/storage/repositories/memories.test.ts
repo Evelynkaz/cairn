@@ -252,7 +252,7 @@ test("soft delete hides a memory from listMemories; restore brings it back; the 
   });
 });
 
-test("restoreMemory throws, naming both ids, when the text was re-remembered as a new row while deleted", () => {
+test("restoreMemory throws a typed LiveTextCollisionError, naming both ids, when the text was re-remembered as a new row while deleted", () => {
   withDb((db) => {
     const { memory: original } = createMemory(db, { text: "I use vim" });
     softDeleteMemory(db, original.id);
@@ -263,6 +263,13 @@ test("restoreMemory throws, naming both ids, when the text was re-remembered as 
       () => restoreMemory(db, original.id),
       new RegExp(`${original.id}.*${replacement.id}`),
     );
+    try {
+      restoreMemory(db, original.id);
+      assert.fail("expected restoreMemory to throw");
+    } catch (err) {
+      assert.ok(err instanceof LiveTextCollisionError);
+      assert.equal(err.conflictingId, replacement.id);
+    }
   });
 });
 

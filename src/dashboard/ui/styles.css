@@ -377,6 +377,10 @@ textarea {
   opacity: 0.65;
 }
 
+.row-badge-superseded {
+  opacity: 0.65;
+}
+
 .cell-text {
   max-width: 28rem;
 }
@@ -386,6 +390,11 @@ textarea {
   cursor: pointer;
   display: block;
   max-width: 28rem;
+}
+
+.text-toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .text-toggle.truncated {
@@ -511,4 +520,9 @@ textarea {
   cursor: pointer;
   padding: 0 0.35rem;
   color: inherit;
+}
+
+.toast-close:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }

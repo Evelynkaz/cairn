@@ -6,15 +6,18 @@
   "compilerOptions": {
     "target": "ES2023",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
-    "module": "ES2022",
-    "moduleResolution": "Bundler",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "rootDir": "src/dashboard/ui",
     "outDir": "dist/dashboard/ui",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
-    "sourceMap": true,
+    // The daemon's static file server serves an explicit content-type
+    // allowlist that excludes ".map", so an emitted source map is a
+    // guaranteed 404 and unnecessary weight in the published package.
+    "sourceMap": false,
     "skipLibCheck": true,
     "types": []
   },

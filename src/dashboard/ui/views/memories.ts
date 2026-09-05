@@ -203,7 +203,12 @@ export function mountMemoriesView(container: HTMLElement): () => void {
         message: "Memory forgotten.",
         actionLabel: "Undo",
         onAction: () => {
-          void restoreMemory(id).then(() => load());
+          void restoreMemory(id)
+            .then(() => load())
+            .catch((err) => {
+              error = err instanceof ApiError ? err.message : "Could not undo that forget.";
+              render();
+            });
         },
       });
     } catch (err) {
@@ -237,7 +242,12 @@ export function mountMemoriesView(container: HTMLElement): () => void {
         message: `Forgot ${okIds.length} ${okIds.length === 1 ? "memory" : "memories"}.`,
         actionLabel: "Undo",
         onAction: () => {
-          void bulkOp("restore", okIds).then(() => load());
+          void bulkOp("restore", okIds)
+            .then(() => load())
+            .catch((err) => {
+              error = err instanceof ApiError ? err.message : "Could not undo that bulk forget.";
+              render();
+            });
         },
       });
     } catch (err) {
@@ -476,7 +486,7 @@ export function mountMemoriesView(container: HTMLElement): () => void {
 
     return el("tr", { class: "editing-row" }, [
       el("td", {}, []),
-      el("td", { colspan: "8" }, [
+      el("td", { colspan: "9" }, [
         el("div", { class: "edit-form" }, [
           el("label", { class: "field-label" }, ["Text", textArea]),
           el("div", { class: "edit-form-row" }, [
@@ -571,16 +581,16 @@ export function mountMemoriesView(container: HTMLElement): () => void {
 
     const thead = el("thead", {}, [
       el("tr", {}, [
-        el("th", {}, [selectAll]),
-        el("th", {}, ["Text"]),
-        el("th", {}, ["Scope"]),
-        el("th", {}, ["Tags"]),
-        el("th", {}, ["Importance"]),
-        el("th", {}, ["Source"]),
-        el("th", {}, ["Created"]),
-        el("th", {}, ["Updated"]),
-        el("th", {}, ["Status"]),
-        el("th", {}, ["Actions"]),
+        el("th", { scope: "col" }, [selectAll]),
+        el("th", { scope: "col" }, ["Text"]),
+        el("th", { scope: "col" }, ["Scope"]),
+        el("th", { scope: "col" }, ["Tags"]),
+        el("th", { scope: "col" }, ["Importance"]),
+        el("th", { scope: "col" }, ["Source"]),
+        el("th", { scope: "col" }, ["Created"]),
+        el("th", { scope: "col" }, ["Updated"]),
+        el("th", { scope: "col" }, ["Status"]),
+        el("th", { scope: "col" }, ["Actions"]),
       ]),
     ]);
 

@@ -336,8 +336,10 @@ export function restoreMemory(db: CairnDb, id: string): boolean {
       .q(`SELECT id FROM memories_live WHERE scope = ? AND content_hash = ? AND id != ?`)
       .get(current.scope, current.contentHash, id);
     if (conflict) {
-      throw new Error(
-        `cannot restore memory ${id}: its text is already live as memory ${str(conflict, "id")}`,
+      const conflictId = str(conflict, "id");
+      throw new LiveTextCollisionError(
+        `cannot restore memory ${id}: its text is already live as memory ${conflictId}`,
+        conflictId,
       );
     }
     const result = db
