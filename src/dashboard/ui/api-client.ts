@@ -109,6 +109,13 @@ export interface ListMemoriesParams {
   q?: string;
   scope?: string;
   tags?: string[];
+  sourceClient?: string;
+  // Filters on createdAt: `since` is inclusive, `until` is exclusive --
+  // i.e. `[since, until)` -- matching src/storage/repositories/memories.ts's
+  // listMemories, so callers converting a date-only UI value must add a day
+  // to `until` rather than treat both ends the same way.
+  since?: number;
+  until?: number;
   limit?: number;
   cursor?: string | null;
   includeDeleted?: boolean;
@@ -139,6 +146,9 @@ export function listMemories(params: ListMemoriesParams): Promise<ListMemoriesRe
   if (params.q) sp.set("q", params.q);
   if (params.scope) sp.set("scope", params.scope);
   if (params.tags && params.tags.length > 0) sp.set("tags", params.tags.join(","));
+  if (params.sourceClient) sp.set("sourceClient", params.sourceClient);
+  if (params.since !== undefined) sp.set("since", String(params.since));
+  if (params.until !== undefined) sp.set("until", String(params.until));
   if (params.limit !== undefined) sp.set("limit", String(params.limit));
   if (params.cursor) sp.set("cursor", params.cursor);
   if (params.includeDeleted) sp.set("includeDeleted", "1");
@@ -170,6 +180,26 @@ export interface BulkResult {
 
 export function bulkOp(op: "forget" | "restore", ids: string[]): Promise<BulkResult> {
   return request<BulkResult>("POST", "/api/memories/bulk", { op, ids });
+}
+
+export interface ClientInfo {
+  id: string;
+  name: string;
+  firstSeen: number;
+  lastSeen: number;
+  enabled: boolean;
+}
+
+export interface ClientsResult {
+  clients: ClientInfo[];
+  stats: Array<{ sourceClient: string; reads: number; writes: number }>;
+}
+
+// Powers the source-client filter's <select> (BUILD_BRIEF §9): the
+// dashboard needs the full list of clients that have ever touched the
+// store, not just the ones with memories on the current page.
+export function getClients(): Promise<ClientsResult> {
+  return request<ClientsResult>("GET", "/api/clients");
 }
 
 // The event bus payload (src/mcp/events.ts): only ever "updated" or

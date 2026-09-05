@@ -6,6 +6,7 @@ import { el, clear, text } from "../dom.js";
 import {
   listMemories,
   getStats,
+  getClients,
   patchMemory,
   deleteMemory,
   restoreMemory,
@@ -13,7 +14,7 @@ import {
   subscribeToEvents,
   ApiError,
 } from "../api-client.js";
-import type { Memory, SearchHit, StatsResult } from "../api-client.js";
+import type { Memory, SearchHit, StatsResult, ClientInfo } from "../api-client.js";
 
 const PAGE_SIZES = [25, 50, 100] as const;
 const SEARCH_DEBOUNCE_MS = 300;
@@ -22,6 +23,7 @@ const TOAST_DURATION_MS = 8000;
 // hard-capped there regardless of the requested page size, so a result set
 // at this size must say so rather than silently look complete.
 const SEARCH_RESULT_CAP = 50;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
 // A normalized shape both list-mode Memory rows and search-mode SearchHit
 // rows render through, so the table body has one code path instead of two.
@@ -78,10 +80,40 @@ function formatDate(ms: number | null): string {
   return new Date(ms).toLocaleString();
 }
 
+// Date inputs hand back a bare "YYYY-MM-DD" with no timezone attached --
+// interpreted here as a calendar day in the browser's own local timezone
+// (matching the day the user actually clicked), not UTC.
+function startOfLocalDay(dateStr: string): number {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y ?? 1970, (m ?? 1) - 1, d ?? 1).getTime();
+}
+
 interface Toast {
   message: string;
   actionLabel?: string;
   onAction?: () => void;
+}
+
+// Reconciles `parent`'s children to exactly `desired`, in order, without
+// ever removing-then-reinserting a node that is already positioned
+// correctly. That last part is load-bearing: a node that stays attached to
+// this same, already-connected parent throughout never gets disconnected
+// from the document, so a focused/edited element inside it (e.g. the inline
+// edit row's textarea) keeps both focus and caret position across a
+// refresh instead of only "looking" preserved.
+function reconcileChildren(parent: HTMLElement, desired: HTMLElement[]): void {
+  const desiredSet = new Set<Node>(desired);
+  for (const child of Array.from(parent.children)) {
+    if (!desiredSet.has(child)) parent.removeChild(child);
+  }
+  let ref: ChildNode | null = parent.firstChild;
+  for (const node of desired) {
+    if (ref === node) {
+      ref = ref.nextSibling;
+    } else {
+      parent.insertBefore(node, ref);
+    }
+  }
 }
 
 export function mountMemoriesView(container: HTMLElement): () => void {
@@ -89,6 +121,9 @@ export function mountMemoriesView(container: HTMLElement): () => void {
   let q = "";
   let scope = "";
   let selectedTags = new Set<string>();
+  let sourceClient = "";
+  let sinceDate = "";
+  let untilDate = "";
   let includeDeleted = false;
   let includeSuperseded = false;
   let pageSize: number = PAGE_SIZES[0];
@@ -106,12 +141,17 @@ export function mountMemoriesView(container: HTMLElement): () => void {
   let error: string | null = null;
 
   let statsForFilters: StatsResult | null = null;
+  let clientsForFilters: ClientInfo[] | null = null;
 
   const selected = new Set<string>();
   const expanded = new Set<string>();
   let editingId: string | null = null;
   let editDraft: { text: string; tags: string; importance: string } | null = null;
   let editError: string | null = null;
+  // The inline edit row's own DOM node and error slot, built once per edit
+  // session and reused on every subsequent render -- see renderEditRow.
+  let editRowNode: HTMLElement | null = null;
+  let editRowErrorSlot: HTMLElement | null = null;
 
   let toast: Toast | null = null;
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -129,11 +169,31 @@ export function mountMemoriesView(container: HTMLElement): () => void {
       // still works without this.
       statsForFilters = null;
     }
-    render();
+    updateScopeOptions();
+    updateTagOptions();
+  }
+
+  async function loadClientOptions(): Promise<void> {
+    try {
+      const result = await getClients();
+      clientsForFilters = result.clients;
+    } catch {
+      clientsForFilters = null;
+    }
+    updateSourceClientOptions();
   }
 
   function filtersActive(): boolean {
-    return q.trim() !== "" || scope !== "" || selectedTags.size > 0 || includeDeleted || includeSuperseded;
+    return (
+      q.trim() !== "" ||
+      scope !== "" ||
+      selectedTags.size > 0 ||
+      sourceClient !== "" ||
+      sinceDate !== "" ||
+      untilDate !== "" ||
+      includeDeleted ||
+      includeSuperseded
+    );
   }
 
   async function load(): Promise<void> {
@@ -145,6 +205,12 @@ export function mountMemoriesView(container: HTMLElement): () => void {
         q: q.trim() || undefined,
         scope: scope || undefined,
         tags: selectedTags.size > 0 ? [...selectedTags] : undefined,
+        sourceClient: sourceClient || undefined,
+        since: sinceDate ? startOfLocalDay(sinceDate) : undefined,
+        // `until` is exclusive (see ListMemoriesParams), so a "to" date
+        // picked by the user must reach one day past midnight to include
+        // that whole day's memories.
+        until: untilDate ? startOfLocalDay(untilDate) + MS_PER_DAY : undefined,
         limit: pageSize,
         cursor,
         includeDeleted,
@@ -277,6 +343,8 @@ export function mountMemoriesView(container: HTMLElement): () => void {
       tags: row.tags.join(", "),
       importance: String(row.importance),
     };
+    editRowNode = null;
+    editRowErrorSlot = null;
     render();
   }
 
@@ -284,6 +352,8 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     editingId = null;
     editDraft = null;
     editError = null;
+    editRowNode = null;
+    editRowErrorSlot = null;
     render();
   }
 
@@ -304,6 +374,8 @@ export function mountMemoriesView(container: HTMLElement): () => void {
       editingId = null;
       editDraft = null;
       editError = null;
+      editRowNode = null;
+      editRowErrorSlot = null;
       await load();
     } catch (err) {
       editError =
@@ -327,103 +399,215 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     void load();
   });
 
-  // --- rendering ---------------------------------------------------------
+  // --- toolbar (built once; see render()'s comment for why) ------------------
 
-  function renderToolbar(): HTMLElement {
-    const searchInput = el("input", {
-      type: "search",
-      class: "search-input",
-      placeholder: "Search memories…",
-      "aria-label": "Search memories",
-      value: q,
-    }) as HTMLInputElement;
-    searchInput.addEventListener("input", () => {
-      q = searchInput.value;
-      if (searchDebounce) clearTimeout(searchDebounce);
-      searchDebounce = setTimeout(() => resetPagingAndLoad(), SEARCH_DEBOUNCE_MS);
-    });
+  const searchInput = el("input", {
+    type: "search",
+    class: "search-input",
+    placeholder: "Search memories…",
+    "aria-label": "Search memories",
+    value: q,
+  }) as HTMLInputElement;
 
-    const scopeOptions = [
-      el("option", { value: "" }, ["All scopes"]),
-      ...(statsForFilters?.scopes ?? []).map((s) =>
-        el("option", { value: s.scope, selected: s.scope === scope || undefined }, [`${s.scope} (${s.count})`]),
-      ),
-    ];
-    const scopeSelect = el("select", { class: "scope-select", "aria-label": "Filter by scope" }, scopeOptions) as HTMLSelectElement;
-    scopeSelect.value = scope;
-    scopeSelect.addEventListener("change", () => {
-      scope = scopeSelect.value;
-      resetPagingAndLoad();
-    });
+  const scopeSelect = el("select", { class: "scope-select", "aria-label": "Filter by scope" }, [
+    el("option", { value: "" }, ["All scopes"]),
+  ]) as HTMLSelectElement;
+  scopeSelect.addEventListener("change", () => {
+    scope = scopeSelect.value;
+    resetPagingAndLoad();
+  });
 
-    const tagFieldset = el(
-      "fieldset",
-      { class: "tag-fieldset" },
-      [
-        el("legend", {}, ["Tags"]),
-        ...(statsForFilters?.topTags ?? []).map((t) => {
-          const checkbox = el("input", {
-            type: "checkbox",
-            id: `tag-${t.tag}`,
-            checked: selectedTags.has(t.tag) || undefined,
-          }) as HTMLInputElement;
-          checkbox.addEventListener("change", () => {
-            if (checkbox.checked) selectedTags.add(t.tag);
-            else selectedTags.delete(t.tag);
-            resetPagingAndLoad();
-          });
-          return el("label", { class: "tag-option", for: `tag-${t.tag}` }, [checkbox, ` ${t.tag} (${t.count})`]);
-        }),
-      ],
-    );
-    const tagsDetails = el("details", { class: "tags-picker" }, [
-      el("summary", {}, [selectedTags.size > 0 ? `Tags (${selectedTags.size})` : "Tags"]),
-      tagFieldset,
-    ]);
+  const tagFieldset = el("fieldset", { class: "tag-fieldset" }, [el("legend", {}, ["Tags"])]);
+  const tagsSummary = el("summary", {}, ["Tags"]);
+  const tagsDetails = el("details", { class: "tags-picker" }, [tagsSummary, tagFieldset]);
 
-    const includeDeletedCheckbox = el("input", {
-      type: "checkbox",
-      id: "include-deleted",
-      checked: includeDeleted || undefined,
-    }) as HTMLInputElement;
-    includeDeletedCheckbox.addEventListener("change", () => {
-      includeDeleted = includeDeletedCheckbox.checked;
-      resetPagingAndLoad();
-    });
+  const includeDeletedCheckbox = el("input", { type: "checkbox", id: "include-deleted" }) as HTMLInputElement;
+  includeDeletedCheckbox.addEventListener("change", () => {
+    includeDeleted = includeDeletedCheckbox.checked;
+    resetPagingAndLoad();
+  });
+  const includeDeletedLabel = el("label", { class: "checkbox-label", for: "include-deleted" }, [
+    includeDeletedCheckbox,
+    " Include deleted",
+  ]);
 
-    const includeSupersededCheckbox = el("input", {
-      type: "checkbox",
-      id: "include-superseded",
-      checked: includeSuperseded || undefined,
-    }) as HTMLInputElement;
-    includeSupersededCheckbox.addEventListener("change", () => {
-      includeSuperseded = includeSupersededCheckbox.checked;
-      resetPagingAndLoad();
-    });
+  const includeSupersededCheckbox = el("input", { type: "checkbox", id: "include-superseded" }) as HTMLInputElement;
+  includeSupersededCheckbox.addEventListener("change", () => {
+    includeSuperseded = includeSupersededCheckbox.checked;
+    resetPagingAndLoad();
+  });
+  const includeSupersededLabel = el("label", { class: "checkbox-label", for: "include-superseded" }, [
+    includeSupersededCheckbox,
+    " Include superseded",
+  ]);
 
-    const pageSizeSelect = el(
-      "select",
-      { class: "page-size-select", "aria-label": "Rows per page" },
-      PAGE_SIZES.map((size) => el("option", { value: String(size), selected: size === pageSize || undefined }, [`${size} / page`])),
-    ) as HTMLSelectElement;
-    pageSizeSelect.value = String(pageSize);
-    pageSizeSelect.addEventListener("change", () => {
-      pageSize = Number(pageSizeSelect.value);
-      resetPagingAndLoad();
-    });
-
-    return el("div", { class: "toolbar" }, [
-      searchInput,
-      scopeSelect,
-      tagsDetails,
-      el("label", { class: "checkbox-label", for: "include-deleted" }, [includeDeletedCheckbox, " Include deleted"]),
-      el("label", { class: "checkbox-label", for: "include-superseded" }, [
-        includeSupersededCheckbox,
-        " Include superseded",
-      ]),
-      pageSizeSelect,
-    ]);
+  const SEARCH_MODE_TITLE = "Search covers live memories only -- clear the search box to use this filter.";
+  function updateSearchModeUI(): void {
+    const inSearchMode = searchInput.value.trim() !== "";
+    for (const [checkbox, label] of [
+      [includeDeletedCheckbox, includeDeletedLabel],
+      [includeSupersededCheckbox, includeSupersededLabel],
+    ] as const) {
+      checkbox.disabled = inSearchMode;
+      if (inSearchMode) {
+        checkbox.title = SEARCH_MODE_TITLE;
+        label.setAttribute("aria-disabled", "true");
+        label.title = SEARCH_MODE_TITLE;
+      } else {
+        checkbox.removeAttribute("title");
+        label.removeAttribute("aria-disabled");
+        label.removeAttribute("title");
+      }
+    }
   }
+
+  searchInput.addEventListener("input", () => {
+    q = searchInput.value;
+    updateSearchModeUI();
+    if (searchDebounce) clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => resetPagingAndLoad(), SEARCH_DEBOUNCE_MS);
+  });
+
+  const sourceClientSelect = el("select", { class: "source-client-select", "aria-label": "Filter by source client" }, [
+    el("option", { value: "" }, ["All clients"]),
+  ]) as HTMLSelectElement;
+  sourceClientSelect.addEventListener("change", () => {
+    sourceClient = sourceClientSelect.value;
+    resetPagingAndLoad();
+  });
+
+  const sinceInput = el("input", {
+    type: "date",
+    class: "since-input",
+    "aria-label": "Created on or after this date",
+  }) as HTMLInputElement;
+  sinceInput.addEventListener("change", () => {
+    sinceDate = sinceInput.value;
+    resetPagingAndLoad();
+  });
+
+  const untilInput = el("input", {
+    type: "date",
+    class: "until-input",
+    "aria-label": "Created on or before this date",
+  }) as HTMLInputElement;
+  untilInput.addEventListener("change", () => {
+    untilDate = untilInput.value;
+    resetPagingAndLoad();
+  });
+
+  const dateRange = el("span", { class: "date-range" }, [
+    el("label", { class: "field-inline-label" }, ["From", sinceInput]),
+    el("label", { class: "field-inline-label" }, ["To", untilInput]),
+  ]);
+
+  const pageSizeSelect = el(
+    "select",
+    { class: "page-size-select", "aria-label": "Rows per page" },
+    PAGE_SIZES.map((size) => el("option", { value: String(size), selected: size === pageSize || undefined }, [`${size} / page`])),
+  ) as HTMLSelectElement;
+  pageSizeSelect.value = String(pageSize);
+  pageSizeSelect.addEventListener("change", () => {
+    pageSize = Number(pageSizeSelect.value);
+    resetPagingAndLoad();
+  });
+
+  const toolbarEl = el("div", { class: "toolbar" }, [
+    searchInput,
+    scopeSelect,
+    tagsDetails,
+    sourceClientSelect,
+    dateRange,
+    includeDeletedLabel,
+    includeSupersededLabel,
+    pageSizeSelect,
+  ]);
+
+  function updateScopeOptions(): void {
+    clear(scopeSelect);
+    scopeSelect.appendChild(el("option", { value: "" }, ["All scopes"]));
+    for (const s of statsForFilters?.scopes ?? []) {
+      scopeSelect.appendChild(el("option", { value: s.scope }, [`${s.scope} (${s.count})`]));
+    }
+    scopeSelect.value = scope;
+  }
+
+  function updateTagOptions(): void {
+    clear(tagFieldset);
+    tagFieldset.appendChild(el("legend", {}, ["Tags"]));
+    for (const t of statsForFilters?.topTags ?? []) {
+      const checkbox = el("input", {
+        type: "checkbox",
+        id: `tag-${t.tag}`,
+        checked: selectedTags.has(t.tag) || undefined,
+      }) as HTMLInputElement;
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) selectedTags.add(t.tag);
+        else selectedTags.delete(t.tag);
+        clear(tagsSummary);
+        tagsSummary.appendChild(text(selectedTags.size > 0 ? `Tags (${selectedTags.size})` : "Tags"));
+        resetPagingAndLoad();
+      });
+      tagFieldset.appendChild(el("label", { class: "tag-option", for: `tag-${t.tag}` }, [checkbox, ` ${t.tag} (${t.count})`]));
+    }
+    clear(tagsSummary);
+    tagsSummary.appendChild(text(selectedTags.size > 0 ? `Tags (${selectedTags.size})` : "Tags"));
+  }
+
+  function updateSourceClientOptions(): void {
+    clear(sourceClientSelect);
+    sourceClientSelect.appendChild(el("option", { value: "" }, ["All clients"]));
+    for (const c of clientsForFilters ?? []) {
+      sourceClientSelect.appendChild(el("option", { value: c.id }, [c.name || c.id]));
+    }
+    sourceClientSelect.value = sourceClient;
+  }
+
+  // --- persistent table structure (see render()'s comment for why) -----------
+
+  const selectAllCheckbox = el("input", {
+    type: "checkbox",
+    "aria-label": "Select all rows on this page",
+  }) as HTMLInputElement;
+  selectAllCheckbox.addEventListener("change", () => {
+    if (selectAllCheckbox.checked) {
+      for (const r of rows) selected.add(r.id);
+    } else {
+      for (const r of rows) selected.delete(r.id);
+    }
+    render();
+  });
+
+  const theadEl = el("thead", {}, [
+    el("tr", {}, [
+      el("th", { scope: "col" }, [selectAllCheckbox]),
+      el("th", { scope: "col" }, ["Text"]),
+      el("th", { scope: "col" }, ["Scope"]),
+      el("th", { scope: "col" }, ["Tags"]),
+      el("th", { scope: "col" }, ["Importance"]),
+      el("th", { scope: "col" }, ["Source"]),
+      el("th", { scope: "col" }, ["Created"]),
+      el("th", { scope: "col" }, ["Updated"]),
+      el("th", { scope: "col" }, ["Status"]),
+      el("th", { scope: "col" }, ["Actions"]),
+    ]),
+  ]);
+  const tbodyEl = el("tbody", {}, []);
+  const tableEl = el("table", { class: "memories-table" }, [theadEl, tbodyEl]);
+  const tableWrapperEl = el("div", { class: "table-scroll" }, [tableEl]);
+  const pagerSlot = el("div", {});
+  const tableSectionEl = el("div", {}, [tableWrapperEl, pagerSlot]);
+  const stateSlot = el("div", {});
+  const tableContainerEl = el("div", { class: "table-container" });
+
+  const bulkBarSlot = el("div", {});
+  const toastSlot = el("div", {});
+
+  container.appendChild(
+    el("div", { class: "memories-view" }, [toolbarEl, bulkBarSlot, tableContainerEl, toastSlot]),
+  );
+
+  // --- rendering ---------------------------------------------------------
 
   function renderBulkBar(): HTMLElement | null {
     if (selected.size === 0) return null;
@@ -450,54 +634,70 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     return null;
   }
 
+  function updateEditRowError(): void {
+    if (!editRowErrorSlot) return;
+    clear(editRowErrorSlot);
+    if (editError) editRowErrorSlot.appendChild(el("p", { class: "field-error" }, [editError]));
+  }
+
+  // Built once per edit session and cached in `editRowNode`: every
+  // subsequent call (from a render triggered by, say, the toast timer or an
+  // unrelated row's checkbox) returns the exact same DOM node instead of a
+  // fresh one, so the textarea inside it is never removed from the
+  // document and its focus/caret survive untouched.
   function renderEditRow(row: Row): HTMLElement {
     const draft = editDraft;
     if (!draft) return el("tr");
-    const textArea = el("textarea", { class: "edit-text", "aria-label": "Memory text" }, [draft.text]) as HTMLTextAreaElement;
-    textArea.value = draft.text;
-    textArea.addEventListener("input", () => {
-      draft.text = textArea.value;
-    });
-    const tagsInput = el("input", {
-      type: "text",
-      class: "edit-tags",
-      "aria-label": "Comma-separated tags",
-      value: draft.tags,
-    }) as HTMLInputElement;
-    tagsInput.addEventListener("input", () => {
-      draft.tags = tagsInput.value;
-    });
-    const importanceInput = el("input", {
-      type: "number",
-      class: "edit-importance",
-      min: "0",
-      max: "1",
-      step: "0.01",
-      "aria-label": "Importance, 0 to 1",
-      value: draft.importance,
-    }) as HTMLInputElement;
-    importanceInput.addEventListener("input", () => {
-      draft.importance = importanceInput.value;
-    });
-    const saveBtn = el("button", { type: "button", class: "btn" }, ["Save"]);
-    saveBtn.addEventListener("click", () => void saveEdit(row.id));
-    const cancelBtn = el("button", { type: "button", class: "btn btn-quiet" }, ["Cancel"]);
-    cancelBtn.addEventListener("click", cancelEdit);
+    if (!editRowNode) {
+      const textArea = el("textarea", { class: "edit-text", "aria-label": "Memory text" }, [draft.text]) as HTMLTextAreaElement;
+      textArea.value = draft.text;
+      textArea.addEventListener("input", () => {
+        draft.text = textArea.value;
+      });
+      const tagsInput = el("input", {
+        type: "text",
+        class: "edit-tags",
+        "aria-label": "Comma-separated tags",
+        value: draft.tags,
+      }) as HTMLInputElement;
+      tagsInput.addEventListener("input", () => {
+        draft.tags = tagsInput.value;
+      });
+      const importanceInput = el("input", {
+        type: "number",
+        class: "edit-importance",
+        min: "0",
+        max: "1",
+        step: "0.01",
+        "aria-label": "Importance, 0 to 1",
+        value: draft.importance,
+      }) as HTMLInputElement;
+      importanceInput.addEventListener("input", () => {
+        draft.importance = importanceInput.value;
+      });
+      const saveBtn = el("button", { type: "button", class: "btn" }, ["Save"]);
+      saveBtn.addEventListener("click", () => void saveEdit(row.id));
+      const cancelBtn = el("button", { type: "button", class: "btn btn-quiet" }, ["Cancel"]);
+      cancelBtn.addEventListener("click", cancelEdit);
 
-    return el("tr", { class: "editing-row" }, [
-      el("td", {}, []),
-      el("td", { colspan: "9" }, [
-        el("div", { class: "edit-form" }, [
-          el("label", { class: "field-label" }, ["Text", textArea]),
-          el("div", { class: "edit-form-row" }, [
-            el("label", { class: "field-label" }, ["Tags (comma-separated)", tagsInput]),
-            el("label", { class: "field-label" }, ["Importance", importanceInput]),
+      editRowErrorSlot = el("div", { class: "field-error-slot" }, []);
+      editRowNode = el("tr", { class: "editing-row" }, [
+        el("td", {}, []),
+        el("td", { colspan: "9" }, [
+          el("div", { class: "edit-form" }, [
+            el("label", { class: "field-label" }, ["Text", textArea]),
+            el("div", { class: "edit-form-row" }, [
+              el("label", { class: "field-label" }, ["Tags (comma-separated)", tagsInput]),
+              el("label", { class: "field-label" }, ["Importance", importanceInput]),
+            ]),
+            editRowErrorSlot,
+            el("div", { class: "edit-form-actions" }, [saveBtn, cancelBtn]),
           ]),
-          editError ? el("p", { class: "field-error" }, [editError]) : null,
-          el("div", { class: "edit-form-actions" }, [saveBtn, cancelBtn]),
         ]),
-      ]),
-    ]);
+      ]);
+    }
+    updateEditRowError();
+    return editRowNode;
   }
 
   function renderRow(row: Row): HTMLElement[] {
@@ -563,39 +763,13 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     return [tr];
   }
 
-  function renderTable(): HTMLElement {
-    const allChecked = rows.length > 0 && rows.every((r) => selected.has(r.id));
-    const selectAll = el("input", {
-      type: "checkbox",
-      "aria-label": "Select all rows on this page",
-      checked: allChecked || undefined,
-    }) as HTMLInputElement;
-    selectAll.addEventListener("change", () => {
-      if (selectAll.checked) {
-        for (const r of rows) selected.add(r.id);
-      } else {
-        for (const r of rows) selected.delete(r.id);
-      }
-      render();
-    });
+  function updateSelectAllCheckbox(): void {
+    selectAllCheckbox.checked = rows.length > 0 && rows.every((r) => selected.has(r.id));
+  }
 
-    const thead = el("thead", {}, [
-      el("tr", {}, [
-        el("th", { scope: "col" }, [selectAll]),
-        el("th", { scope: "col" }, ["Text"]),
-        el("th", { scope: "col" }, ["Scope"]),
-        el("th", { scope: "col" }, ["Tags"]),
-        el("th", { scope: "col" }, ["Importance"]),
-        el("th", { scope: "col" }, ["Source"]),
-        el("th", { scope: "col" }, ["Created"]),
-        el("th", { scope: "col" }, ["Updated"]),
-        el("th", { scope: "col" }, ["Status"]),
-        el("th", { scope: "col" }, ["Actions"]),
-      ]),
-    ]);
-
-    const tbody = el("tbody", {}, rows.flatMap(renderRow));
-    return el("div", { class: "table-scroll" }, [el("table", { class: "memories-table" }, [thead, tbody])]);
+  function updateTbody(): void {
+    updateSelectAllCheckbox();
+    reconcileChildren(tbodyEl, rows.flatMap(renderRow));
   }
 
   function renderPager(): HTMLElement {
@@ -677,40 +851,69 @@ export function mountMemoriesView(container: HTMLElement): () => void {
     ]);
   }
 
-  function render(): void {
-    if (destroyed) return;
-    clear(container);
-
-    const toolbar = renderToolbar();
-    const bulkBar = renderBulkBar();
-
-    let body: HTMLElement;
-    if (loading && rows.length === 0) {
-      body = el("div", { class: "state-panel" }, [el("p", {}, ["Loading memories…"])]);
-    } else if (error) {
-      const retryBtn = el("button", { type: "button", class: "btn" }, ["Retry"]);
-      retryBtn.addEventListener("click", () => void load());
-      body = el("div", { class: "state-panel state-error" }, [el("p", {}, [error]), retryBtn]);
-    } else if (rows.length === 0) {
-      body = renderEmptyState();
+  // Shows either the state panel (loading/error/empty) or the table
+  // section, without ever tearing down and recreating whichever one stays
+  // visible -- see reconcileChildren's comment for why that matters.
+  function setBodyMode(mode: "state" | "table"): void {
+    if (mode === "state") {
+      if (tableSectionEl.parentNode) tableContainerEl.removeChild(tableSectionEl);
+      if (!stateSlot.parentNode) tableContainerEl.appendChild(stateSlot);
     } else {
-      body = el("div", {}, [renderTable(), renderPager()]);
+      if (stateSlot.parentNode) tableContainerEl.removeChild(stateSlot);
+      if (!tableSectionEl.parentNode) tableContainerEl.appendChild(tableSectionEl);
     }
-
-    const toastEl = renderToast();
-
-    container.appendChild(
-      el("div", { class: "memories-view" }, [
-        toolbar,
-        bulkBar,
-        el("div", { class: "table-container" }, [body]),
-        toastEl,
-      ]),
-    );
   }
 
+  function updateBody(): void {
+    if (loading && rows.length === 0) {
+      clear(stateSlot);
+      stateSlot.appendChild(el("div", { class: "state-panel" }, [el("p", {}, ["Loading memories…"])]));
+      setBodyMode("state");
+    } else if (error) {
+      clear(stateSlot);
+      const retryBtn = el("button", { type: "button", class: "btn" }, ["Retry"]);
+      retryBtn.addEventListener("click", () => void load());
+      stateSlot.appendChild(el("div", { class: "state-panel state-error" }, [el("p", {}, [error]), retryBtn]));
+      setBodyMode("state");
+    } else if (rows.length === 0) {
+      clear(stateSlot);
+      stateSlot.appendChild(renderEmptyState());
+      setBodyMode("state");
+    } else {
+      setBodyMode("table");
+      updateTbody();
+      clear(pagerSlot);
+      pagerSlot.appendChild(renderPager());
+    }
+  }
+
+  // Only the parts of the view that can actually change get rebuilt here:
+  // the bulk bar, the table body, the pager and the toast. The toolbar is
+  // built exactly once above and never touched again, and the row
+  // currently under edit is never recreated (see renderEditRow) -- so
+  // neither a debounced search reload, an SSE-triggered refresh, nor an
+  // unrelated row's checkbox toggling can steal focus or reset a caret
+  // position the way rebuilding the whole view from scratch used to.
+  function render(): void {
+    if (destroyed) return;
+    clear(bulkBarSlot);
+    const bulkBar = renderBulkBar();
+    if (bulkBar) bulkBarSlot.appendChild(bulkBar);
+
+    updateBody();
+
+    clear(toastSlot);
+    const toastEl = renderToast();
+    if (toastEl) toastSlot.appendChild(toastEl);
+  }
+
+  updateScopeOptions();
+  updateTagOptions();
+  updateSourceClientOptions();
+  updateSearchModeUI();
   render();
   void loadFilterOptions();
+  void loadClientOptions();
   void load();
 
   return () => {

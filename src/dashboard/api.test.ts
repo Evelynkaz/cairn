@@ -14,6 +14,8 @@ import type { Store } from "../storage/index.js";
 import { MemoryEventBus } from "../mcp/events.js";
 import { createDashboardApi, DASHBOARD_CLIENT } from "./api.js";
 import type { DashboardApi } from "./api.js";
+import { createFakeProvider } from "../embeddings/fake.js";
+import { ensureVectorSpace } from "../storage/repositories/vectors.js";
 
 const TOKEN = "test-token-0123456789";
 
@@ -508,6 +510,80 @@ test("a request body over the 4 MB cap is rejected with 413", async () => {
   assert.equal(res.status, 413);
 });
 
+test("401 on /api/context specifically, not just /api/memories", async () => {
+  const res = await call(ctx, "GET", "/api/context", { token: null });
+  assert.equal(res.status, 401);
+});
+
+test("GET /api/context with no q falls back to a non-empty recency/importance block", async () => {
+  ctx.store.remember({ content: "context fallback fixture one", scope: "context-fixture" }, { sourceClient: "other" });
+  ctx.store.remember({ content: "context fallback fixture two", scope: "context-fixture" }, { sourceClient: "other" });
+
+  const res = await call(ctx, "GET", "/api/context?scope=context-fixture");
+  assert.equal(res.status, 200);
+  const body = res.body as {
+    text: string;
+    memories: Array<{ id: string; text: string }>;
+    tokensEstimated: number;
+    truncated: boolean;
+    degraded: boolean;
+    degradedReason: string | null;
+  };
+  assert.ok(body.text.length > 0);
+  assert.ok(body.memories.some((m) => m.text === "context fallback fixture one"));
+  assert.ok(body.memories.some((m) => m.text === "context fallback fixture two"));
+});
+
+test("GET /api/context?q=... ranks the matching memory in and the unrelated one out", async () => {
+  ctx.store.remember({ content: "kubernetes deployment rollback procedure", scope: "context-q-fixture" }, { sourceClient: "other" });
+  ctx.store.remember({ content: "a completely unrelated pet grooming note", scope: "context-q-fixture" }, { sourceClient: "other" });
+
+  const res = await call(ctx, "GET", "/api/context?scope=context-q-fixture&q=kubernetes+deployment+rollback");
+  assert.equal(res.status, 200);
+  const body = res.body as { memories: Array<{ text: string }> };
+  assert.ok(body.memories.some((m) => m.text.includes("kubernetes deployment rollback")));
+  assert.ok(!body.memories.some((m) => m.text.includes("pet grooming")));
+});
+
+test("GET /api/context?scope=... narrows the result to that scope", async () => {
+  ctx.store.remember({ content: "scope narrow fixture in scope", scope: "context-scope-a" }, { sourceClient: "other" });
+  ctx.store.remember({ content: "scope narrow fixture out of scope", scope: "context-scope-b" }, { sourceClient: "other" });
+
+  const res = await call(ctx, "GET", "/api/context?scope=context-scope-a");
+  assert.equal(res.status, 200);
+  const body = res.body as { memories: Array<{ text: string }> };
+  assert.ok(body.memories.some((m) => m.text === "scope narrow fixture in scope"));
+  assert.ok(!body.memories.some((m) => m.text === "scope narrow fixture out of scope"));
+});
+
+test("GET /api/context?budget=... is honoured: tokensEstimated never exceeds it, and truncated is set", async () => {
+  for (let i = 0; i < 20; i++) {
+    ctx.store.remember(
+      { content: `budget fixture memory number ${i} with enough padding text to cost real tokens`, scope: "context-budget-fixture" },
+      { sourceClient: "other" },
+    );
+  }
+
+  const unbudgeted = await call(ctx, "GET", "/api/context?scope=context-budget-fixture");
+  assert.equal(unbudgeted.status, 200);
+  const unbudgetedBody = unbudgeted.body as { tokensEstimated: number; memories: unknown[] };
+  // Sanity check the fixture itself: an unbudgeted response must already
+  // exceed the tiny budget below, or a broken budget could not be caught.
+  assert.ok(unbudgetedBody.tokensEstimated > 50);
+
+  const tiny = await call(ctx, "GET", "/api/context?scope=context-budget-fixture&budget=50");
+  assert.equal(tiny.status, 200);
+  const tinyBody = tiny.body as { tokensEstimated: number; memories: unknown[]; truncated: boolean };
+  assert.ok(tinyBody.tokensEstimated <= 50);
+  assert.ok(tinyBody.memories.length < unbudgetedBody.memories.length);
+  assert.equal(tinyBody.truncated, true);
+});
+
+test("a non-numeric budget on GET /api/context is 400", async () => {
+  const res = await call(ctx, "GET", "/api/context?budget=not-a-number");
+  assert.equal(res.status, 400);
+});
+
 test("the 51st concurrent SSE stream is refused with 503", async () => {
   const openReqs: ReturnType<typeof request>[] = [];
   try {
@@ -533,5 +609,80 @@ test("the 51st concurrent SSE stream is refused with 503", async () => {
     // Give the server a moment to notice each destroyed socket and clean
     // up its SSE stream before any later test relies on the stream count.
     await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+});
+
+// A sentinel embedding provider failure message, chosen to look exactly
+// like what an HTTP-backed provider (Ollama/OpenAI/Voyage, BUILD_BRIEF §3)
+// would actually throw -- a URL naming its own upstream host.
+const LEAKY_SENTINEL = "https://secret.internal/v1/embeddings";
+
+async function setupWithFailingProvider(): Promise<Ctx> {
+  const dir = makeTempDir();
+  const modelId = "leaky-provider-model";
+  const dim = 8;
+  // Build the vector space against the same db/model/dim the store below is
+  // opened with -- ensureVectorSpace needs the db to already exist, so a
+  // throwaway store is opened first just to create it, then closed.
+  const bootstrap = openStore({ path: tempDbPath(dir) });
+  const space = ensureVectorSpace(bootstrap.db, modelId, dim);
+  assert.equal(bootstrap.capabilities.vectors, true, "sqlite-vec must load for this test to be meaningful");
+  bootstrap.close();
+  // The fake provider always throws with a message carrying the sentinel --
+  // same shape as a real HTTP provider's error (a URL naming its own
+  // upstream host), per src/retrieval/search.test.ts's "rejecting provider"
+  // pattern.
+  const provider = createFakeProvider({ modelId, dim, failOn: () => true });
+  provider.embed = async () => {
+    throw new Error(`request to ${LEAKY_SENTINEL} failed`);
+  };
+  const store = openStore({ path: tempDbPath(dir), provider, space });
+  const bus = new MemoryEventBus();
+  const api = createDashboardApi({ store, token: TOKEN, bus });
+  const server = createServer((req, res) => {
+    void (async () => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      const handled = await api.handle(req, res, url);
+      if (!handled) {
+        res.writeHead(404).end();
+      }
+    })();
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  return { dir, store, bus, api, server, baseUrl: `http://127.0.0.1:${port}` };
+}
+
+test("GET /api/context never echoes a failing embedding provider's raw message", async () => {
+  const failCtx = await setupWithFailingProvider();
+  try {
+    failCtx.store.remember({ content: "context leak-check fixture", scope: "leak-check" }, { sourceClient: "other" });
+    const res = await call(failCtx, "GET", "/api/context?scope=leak-check&q=leak-check");
+    assert.equal(res.status, 200);
+    const raw = JSON.stringify(res.body);
+    assert.ok(!raw.includes(LEAKY_SENTINEL), "response must not contain the provider's raw message");
+    const body = res.body as { degraded: boolean; degradedReason: string | null };
+    assert.equal(body.degraded, true);
+    assert.equal(body.degradedReason, "embedding_failed");
+  } finally {
+    await teardown(failCtx);
+  }
+});
+
+test("GET /api/memories?q=... (search mode) never echoes a failing embedding provider's raw message", async () => {
+  const failCtx = await setupWithFailingProvider();
+  try {
+    failCtx.store.remember({ content: "search leak-check fixture" }, { sourceClient: "other" });
+    const res = await call(failCtx, "GET", "/api/memories?q=leak-check");
+    assert.equal(res.status, 200);
+    const raw = JSON.stringify(res.body);
+    assert.ok(!raw.includes(LEAKY_SENTINEL), "response must not contain the provider's raw message");
+    const body = res.body as { mode: string; degraded: boolean; degradedReason: string | null };
+    assert.equal(body.mode, "search");
+    assert.equal(body.degraded, true);
+    assert.equal(body.degradedReason, "embedding_failed");
+  } finally {
+    await teardown(failCtx);
   }
 });

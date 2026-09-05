@@ -21,6 +21,7 @@ export type ParsedCommand =
   | { command: "embeddings-status"; json: boolean }
   | { command: "embeddings-enable"; provider?: string; modelId?: string }
   | { command: "embeddings-disable" }
+  | { command: "hook-session-start" }
   | { command: "error"; message: string };
 
 export const TOP_LEVEL_COMMANDS = [
@@ -32,10 +33,12 @@ export const TOP_LEVEL_COMMANDS = [
   "ui",
   "setup",
   "embeddings",
+  "hook",
   "help",
 ] as const;
 
 const EMBEDDINGS_SUBCOMMANDS = ["status", "enable", "disable"] as const;
+const HOOK_SUBCOMMANDS = ["session-start"] as const;
 
 type FlagKind = "boolean" | "value" | "repeatable";
 type FlagSpec = Record<string, FlagKind>;
@@ -165,6 +168,21 @@ function parseEmbeddings(tokens: string[]): ParsedCommand {
     return { command: "error", message: error };
   }
   return { command: "embeddings-disable" };
+}
+
+function parseHook(tokens: string[]): ParsedCommand {
+  const [sub, ...rest] = tokens;
+  if (sub === undefined || !(HOOK_SUBCOMMANDS as readonly string[]).includes(sub)) {
+    return {
+      command: "error",
+      message: `unknown "cairn hook" subcommand "${sub ?? ""}"; valid subcommands are: ${HOOK_SUBCOMMANDS.join(", ")}`,
+    };
+  }
+  const { error } = parseFlags(rest, {}, "hook session-start");
+  if (error) {
+    return { command: "error", message: error };
+  }
+  return { command: "hook-session-start" };
 }
 
 function parseNoFlags(tokens: string[], command: "mcp" | "daemon" | "start" | "stop"): ParsedCommand {

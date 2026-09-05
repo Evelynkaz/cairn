@@ -246,6 +246,7 @@ button {
 input[type="search"],
 input[type="text"],
 input[type="number"],
+input[type="date"],
 select,
 textarea {
   background: var(--bg);
@@ -254,11 +255,31 @@ textarea {
   padding: 0.4rem 0.6rem;
 }
 
+.date-range {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.field-inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .checkbox-label {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
   white-space: nowrap;
+}
+
+.checkbox-label[aria-disabled="true"] {
+  color: var(--muted);
+  cursor: not-allowed;
 }
 
 .tags-picker {

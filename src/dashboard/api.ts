@@ -117,6 +117,23 @@ function validateImportance(value: unknown): number | undefined {
   return value;
 }
 
+// Shared by GET /api/context and GET /api/memories?q=... (search mode): both
+// surface the retrieval layer's `degraded`/`degradedReason` (BUILD_BRIEF §7),
+// but the raw `degradedReason` string set at src/retrieval/search.ts's catch
+// block is `error instanceof Error ? error.message : String(error)` -- the
+// unmodified text thrown by whatever embedding provider is configured
+// (Ollama, OpenAI, Voyage, ..., all HTTP-backed per BUILD_BRIEF §3). That
+// text originates outside our code and can carry a provider URL, a host
+// name, a file path, or an upstream API's raw error body. The no-echo rule
+// in ../daemon/server.ts -- an error's own text never reaches an HTTP caller
+// -- applies to it exactly like any other error text, so it is dropped here
+// and replaced with a fixed, safe value. `degraded` (the boolean) is left
+// untouched; it is already safe and is what the UI needs.
+type SafeDegradedReason = "embedding_failed" | null;
+function toSafeDegradedReason(degraded: boolean): SafeDegradedReason {
+  return degraded ? "embedding_failed" : null;
+}
+
 function asRecord(body: unknown): Record<string, unknown> {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
     throw new HttpError(400, "expected a JSON object body");
@@ -195,7 +212,12 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
 
     if (q !== undefined && q.trim() !== "") {
       const result = await store.recall(q, { scope, tags, limit }, CTX);
-      sendJson(res, 200, { mode: "search", hits: result.hits, degraded: result.degraded, degradedReason: result.degradedReason });
+      sendJson(res, 200, {
+        mode: "search",
+        hits: result.hits,
+        degraded: result.degraded,
+        degradedReason: toSafeDegradedReason(result.degraded),
+      });
       return;
     }
 
@@ -328,6 +350,29 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       }
     });
     sendJson(res, 200, { op, results, count: results.length });
+  }
+
+  // BUILD_BRIEF §8: instruction-only orchestration ("remember to call
+  // recall") is only 60-70% reliable, so a session-start context injection
+  // has to be deterministic -- driven by a client hook, not the model's
+  // goodwill -- and this route is what that hook fetches over HTTP.
+  // Store.context() already enforces the token budget itself; §8/§14 name
+  // "context pollution" (a project that dumped its whole memory store into
+  // context and had to retreat) as exactly the failure that budget exists
+  // to prevent, so this handler must never offer a path around it.
+  async function handleContext(res: ServerResponse, url: URL): Promise<void> {
+    const q = parseStringParam(url, "q") ?? "";
+    const scope = parseStringParam(url, "scope");
+    const tokenBudget = parseRequiredIntParam(url, "budget");
+    const block = await store.context(q, { scope, tokenBudget }, CTX);
+    sendJson(res, 200, {
+      text: block.text,
+      memories: block.memories,
+      tokensEstimated: block.tokensEstimated,
+      truncated: block.truncated,
+      degraded: block.degraded,
+      degradedReason: toSafeDegradedReason(block.degraded),
+    });
   }
 
   async function handleEpisodes(res: ServerResponse, url: URL): Promise<void> {
@@ -525,6 +570,13 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     if (segments.length === 1 && segments[0] === "events") {
       if (method !== "GET") throw new HttpError(405, "method not allowed");
       handleEvents(req, res);
+      return;
+    }
+
+    // /api/context
+    if (segments.length === 1 && segments[0] === "context") {
+      if (method !== "GET") throw new HttpError(405, "method not allowed");
+      await handleContext(res, url);
       return;
     }
 
