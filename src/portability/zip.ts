@@ -83,6 +83,18 @@ const FLAG_UTF8 = 0x0800;
 const HOST_UNIX = 3;
 const VERSION_MADE_BY = (HOST_UNIX << 8) | 20;
 
+// External file attributes, high 16 bits: once VERSION_MADE_BY claims a Unix
+// host, `unzip` (and other Unix-aware tools) interpret these bits as the
+// Unix mode to apply to the extracted file -- it does NOT fall back to a
+// sane default when they're zero, it applies literal mode 000, making every
+// extracted file unreadable until the user chmods it. The two fields are
+// coupled: if VERSION_MADE_BY is ever changed back to a DOS/FAT host byte,
+// this field becomes meaningless to Unix tools and can be dropped, but as
+// long as it says Unix this must carry a real mode. 0o644 (rw-r--r--) is
+// the sane default for a regular file written by an export.
+const UNIX_FILE_MODE = 0o644;
+const EXTERNAL_ATTRS_REGULAR_FILE = UNIX_FILE_MODE << 16;
+
 // --- Safety caps for reading untrusted archives -----------------------
 
 // A user can hand us an arbitrary file claiming to be a Cairn export.
@@ -192,7 +204,7 @@ export function writeZip(entries: readonly ZipEntry[]): Buffer {
     centralHeader.writeUInt16LE(0, 32); // comment length
     centralHeader.writeUInt16LE(0, 34); // disk number start
     centralHeader.writeUInt16LE(0, 36); // internal file attributes
-    centralHeader.writeUInt32LE(0, 38); // external file attributes
+    centralHeader.writeUInt32LE(EXTERNAL_ATTRS_REGULAR_FILE, 38); // external file attributes
     centralHeader.writeUInt32LE(localOffsets[localOffsets.length - 1]!, 42);
 
     centralParts.push(centralHeader, e.nameBytes);
@@ -258,6 +270,12 @@ function findEndOfCentralDirectory(buf: Buffer): number {
   }
   throw new ZipFormatError("not a valid zip archive: end-of-central-directory record not found");
 }
+
+// Note: readZip deliberately does not read external file attributes (the
+// Unix mode set by writeZip, see EXTERNAL_ATTRS_REGULAR_FILE above). We
+// always write buffers straight back to the caller in memory -- we never
+// extract to disk ourselves -- so there is nothing here for a mode to
+// apply to. Don't add speculative handling for it.
 
 /** Reads an archive written by writeZip, or by any ordinary ZIP tool within the subset below. */
 export function readZip(archive: Buffer): ZipEntry[] {

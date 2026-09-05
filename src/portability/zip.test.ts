@@ -2,8 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { platform } from "node:os";
 import { withTempDir } from "../testing/tmp.js";
 import { readZip, writeZip, ZipFormatError, type ZipEntry } from "./zip.js";
 
@@ -154,6 +155,18 @@ test("writeZip output passes `unzip -t` and extracts byte-identical content", (t
       assert.ok(existsSync(extractedPath), `expected ${extractedPath} to exist`);
       const extracted = readFileSync(extractedPath);
       assert.ok(extracted.equals(entry.data), `content mismatch for ${entry.name}`);
+
+      // Mode bits, not read success: root bypasses permission checks
+      // entirely, so a plain read would pass either way and hide the bug
+      // this guards against (external file attributes of 0 -> mode 000 on
+      // extraction, see EXTERNAL_ATTRS_REGULAR_FILE in zip.ts). Inspecting
+      // the mode itself is meaningful for every user, privileged or not.
+      if (platform() === "win32") {
+        t.skip("POSIX file mode bits are not meaningfully observable on Windows");
+      } else {
+        const mode = statSync(extractedPath).mode;
+        assert.ok(mode & 0o400, `expected owner-read bit set, got mode ${(mode & 0o777).toString(8)}`);
+      }
     }
   });
 });
