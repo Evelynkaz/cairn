@@ -12,7 +12,12 @@ const GOOD_FILES = [
   "dist/dashboard/ui/index.html",
   "dist/dashboard/ui/app.js",
   "dist/dashboard/ui/styles.css",
+  "dist/dashboard/ui/dom.js",
+  "dist/dashboard/ui/state.js",
+  "dist/dashboard/ui/api-client.js",
+  "dist/dashboard/ui/views/memories.js",
 ];
+const DASHBOARD_ASSETS = GOOD_FILES.filter((f) => f.startsWith("dist/dashboard/ui/"));
 
 test("checkPackageFiles accepts a well-formed file list", () => {
   assert.deepEqual(checkPackageFiles(GOOD_FILES, BIN), []);
@@ -25,9 +30,11 @@ test("checkPackageFiles flags a missing bin entry point", () => {
 });
 
 test("checkPackageFiles flags a missing dashboard asset", () => {
-  const files = GOOD_FILES.filter((f) => f !== "dist/dashboard/ui/app.js");
-  const problems = checkPackageFiles(files, BIN);
-  assert.ok(problems.some((p) => p.includes("dist/dashboard/ui/app.js")));
+  for (const asset of DASHBOARD_ASSETS) {
+    const files = GOOD_FILES.filter((f) => f !== asset);
+    const problems = checkPackageFiles(files, BIN);
+    assert.ok(problems.some((p) => p.includes(asset)), `expected a problem for missing ${asset}`);
+  }
 });
 
 test("checkPackageFiles flags a leaked test file", () => {
