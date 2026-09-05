@@ -15,6 +15,7 @@ import {
   runEmbeddingsDisable,
   runEmbeddingsStatus,
   runEmbeddingsEnable,
+  runCommand,
   runSetup,
   runStatus,
   runStop,
@@ -25,7 +26,7 @@ import type { CommandContext } from "./commands.js";
 import { TOP_LEVEL_COMMANDS } from "./args.js";
 import { ensureDaemon } from "../shim/ensure-daemon.js";
 import { daemonStatus } from "./lifecycle.js";
-import { writeRuntimeFile } from "../daemon/runtime-file.js";
+import { readRuntimeFile, writeRuntimeFile } from "../daemon/runtime-file.js";
 import { dbPath, ensureHome } from "../config/paths.js";
 import { suppressExperimentalSqliteWarning } from "./index.js";
 import { clientTargets } from "../setup/index.js";
@@ -386,6 +387,40 @@ test("journalMode surfaces through /health into daemonStatus (normally 'wal')", 
     }
   });
 });
+
+// runHookSessionStart's whole reason to exist is guaranteeing the
+// always-exit-0 property the SessionStart hook design rests on (see
+// hook.ts's header) -- these two tests exercise the wrapper itself, not
+// just runSessionStartHook underneath it, since that is the layer
+// commands.ts actually promises callers. A fresh temp home has no runtime
+// file, so this drives the "no daemon" branch, which fires off a real,
+// unawaited background spawn (see hook.ts) for the NEXT session -- that
+// spawned daemon is polled for and killed below so it never outlives this
+// test.
+test("runCommand('hook-session-start') over a fresh temp home returns 0 with ctx.out never called", async () => {
+  await withTempDirAsync(async (home) => {
+    const ctx = captureContext({ home });
+    const code = await runCommand({ command: "hook-session-start" }, ctx);
+    assert.equal(code, 0);
+    assert.equal(ctx.lines.out.length, 0);
+
+    const deadline = Date.now() + 5000;
+    let info = readRuntimeFile(home);
+    while (!info && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      info = readRuntimeFile(home);
+    }
+    await killPid(info?.pid);
+  });
+});
+
+// commands.ts's own comment on runHookSessionStart documents a catch block
+// specifically for a runSessionStartHook that violates its "never throws"
+// contract -- but per that same contract, runSessionStartHook itself never
+// throws, and CommandContext exposes no seam to inject a throwing
+// replacement. Exercising that catch branch would require changing
+// commands.ts (widening a hook-injection seam into CommandContext), which
+// is outside this task's file list, so it is not covered here.
 
 test("helpText lists every top-level command", () => {
   const text = helpText();

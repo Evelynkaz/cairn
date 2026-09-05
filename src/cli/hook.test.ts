@@ -10,9 +10,10 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import { Readable } from "node:stream";
+import { spawn } from "node:child_process";
 import { withTempDirAsync } from "../testing/tmp.js";
 import { ensureDaemon } from "../shim/ensure-daemon.js";
-import { generateToken, writeRuntimeFile } from "../daemon/runtime-file.js";
+import { generateToken, readRuntimeFile, writeRuntimeFile } from "../daemon/runtime-file.js";
 import { dbPath } from "../config/paths.js";
 import { openStore } from "../storage/store.js";
 import { runSessionStartHook } from "./hook.js";
@@ -91,7 +92,7 @@ test("with a running daemon and seeded memories, stdout is exactly the envelope 
   });
 });
 
-test("with no daemon running, stdout is completely empty and the command reports exit 0", async () => {
+test("with no daemon running, stdout is completely empty", async () => {
   await withTempDirAsync(async (dir) => {
     // startDaemon is stubbed so this genuinely exercises "no runtime file
     // found" rather than racing a real background daemon spawn -- the
@@ -100,6 +101,29 @@ test("with no daemon running, stdout is completely empty and the command reports
     const options: SessionStartHookOptions = { home: dir, startDaemon: neverStartDaemon };
     const result = await runSessionStartHook(options);
     assert.equal(result.stdout, "");
+  });
+});
+
+test("a stale runtime file naming a live but foreign pid is removed, not left to repeat forever", async () => {
+  await withTempDirAsync(async (dir) => {
+    // A long-lived, ordinary child process stands in for the reviewer's pid
+    // reuse case: pidIsAlive(info.pid) is true, but it is not a cairn
+    // daemon, so isDaemonAlive is false via the /health identity check
+    // (nothing is listening on the recorded port at all here). Without
+    // Fix 1, this runtime file would never be removed and the daemon would
+    // never be (re)started on any subsequent session, forever.
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e9);"], { stdio: "ignore" });
+    await new Promise<void>((resolve) => child.once("spawn", () => resolve()));
+    const childPid = child.pid;
+    assert.ok(childPid !== undefined);
+    try {
+      writeRuntimeFile({ pid: childPid, port: 1, token: generateToken(), startedAt: Date.now(), version: "0.1.0" }, dir);
+      const result = await runSessionStartHook({ home: dir, startDaemon: neverStartDaemon });
+      assert.equal(result.stdout, "");
+      assert.equal(readRuntimeFile(dir), null, "the stale runtime file should have been removed");
+    } finally {
+      await killPid(childPid);
+    }
   });
 });
 
@@ -157,7 +181,16 @@ test("with a daemon that answers 500, stdout is empty", async () => {
   });
 });
 
-test("with a daemon that hangs on /api/context, the hook still returns within its own deadline with empty stdout", async () => {
+test(
+  "with a daemon that hangs on /api/context, the hook still returns within its own deadline with empty stdout",
+  // An explicit timeout so a regression in the fetch's AbortController (the
+  // `signal: controller.signal` in fetchContextText) fails this test loudly
+  // instead of hanging it -- and with it, the whole suite -- forever: an
+  // un-aborted fetch here holds the socket open, so server.close()'s
+  // callback never fires, and node:test's default per-test timeout is
+  // Infinity.
+  { timeout: 5000 },
+  async () => {
   await withTempDirAsync(async (dir) => {
     // /health answers immediately (so isDaemonAlive reports the daemon as
     // alive and this genuinely drives the /api/context timeout path, not
@@ -189,7 +222,8 @@ test("with a daemon that hangs on /api/context, the hook still returns within it
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
-});
+  },
+);
 
 test("with a malformed JSON response, stdout is empty", async () => {
   await withTempDirAsync(async (dir) => {

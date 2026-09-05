@@ -24,7 +24,7 @@
 // better than one that hangs, or one that gets a stray line read as an
 // instruction.
 
-import { readRuntimeFile, isDaemonAlive } from "../daemon/runtime-file.js";
+import { readRuntimeFile, isDaemonAlive, removeRuntimeFile } from "../daemon/runtime-file.js";
 import type { RuntimeInfo } from "../daemon/runtime-file.js";
 import { startDaemonDetached } from "./lifecycle.js";
 
@@ -174,6 +174,15 @@ async function computeContext(
     return null;
   }
   if (!(await isDaemonAlive(info))) {
+    // Load-bearing: ensureDaemon (called by startDaemon below) re-reads this
+    // same runtime file itself, and a still-present stale file makes it
+    // await a real /health check before it ever reaches spawn() -- with the
+    // fire-and-forget call below and index.ts's immediate process.exit(0),
+    // that async gap means spawn() is never reached at all. Removing the
+    // file here (stopDaemon does the same for a stale file, see
+    // lifecycle.ts) makes ensureDaemon's own readRuntimeFile return null, so
+    // it reaches spawn() synchronously instead.
+    removeRuntimeFile(home);
     startDaemon({ home }).catch(() => {});
     return null;
   }
@@ -188,8 +197,9 @@ export async function runSessionStartHook(
   const deadlineAt = Date.now() + deadlineMs;
   const startDaemon = options.startDaemon ?? startDaemonDetached;
 
+  let deadlineTimer: NodeJS.Timeout;
   const timeout = new Promise<null>((resolve) => {
-    setTimeout(() => resolve(null), deadlineMs);
+    deadlineTimer = setTimeout(() => resolve(null), deadlineMs);
   });
 
   let text: string | null;
@@ -197,6 +207,12 @@ export async function runSessionStartHook(
     text = await Promise.race([computeContext(options.home, deadlineAt, startDaemon), timeout]);
   } catch {
     text = null;
+  } finally {
+    // Without this, a race decided by computeContext (the common case) still
+    // leaves this timer alive for the rest of deadlineMs, holding the event
+    // loop open -- production is only saved by index.ts's process.exit, but
+    // any other caller of this exported function inherits the stall.
+    clearTimeout(deadlineTimer!);
   }
 
   if (!text) {
