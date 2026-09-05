@@ -1,7 +1,6 @@
 {
   "name": "cairn",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "type": "module",
   "description": "Persistent memory for your AI that you actually own — local-first, shared across every MCP client, one command to install, a dashboard to see and edit everything. No cloud, no account, no API key.",
   "license": "MIT",
@@ -10,6 +9,7 @@
     "cairn": "dist/cli/index.js"
   },
   "files": [
+    "CHANGELOG.md",
     "dist/**/*.js",
     "dist/**/*.d.ts",
     "dist/dashboard/ui/**/*.html",
@@ -25,7 +25,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.ui.json --noEmit && tsc -p tsconfig.uitest.json --noEmit",
     "test": "npm run clean && npm run build && node --test \"dist/**/*.test.js\"",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "verify-package": "node dist/scripts/verify-package.js"
+    "verify-package": "node dist/scripts/verify-package.js",
+    "prepublishOnly": "npm run clean && npm run build && npm run verify-package"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
@@ -54,6 +55,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "github:Evelynkaz/cairn"
+    "url": "git+https://github.com/Evelynkaz/cairn.git"
+  },
+  "homepage": "https://github.com/Evelynkaz/cairn#readme",
+  "bugs": {
+    "url": "https://github.com/Evelynkaz/cairn/issues"
   }
 }
