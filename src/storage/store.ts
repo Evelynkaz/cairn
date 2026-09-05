@@ -38,7 +38,7 @@ import { recordRedactions } from "./repositories/redactions.js";
 import { search, getContext } from "../retrieval/index.js";
 import type { SearchDeps, SearchOptions, SearchResult, ContextOptions, ContextBlock } from "../retrieval/index.js";
 import type { EmbeddingProvider } from "../embeddings/types.js";
-import { clampLimit } from "./repositories/paging.js";
+import { clampLimit, encodeCursor } from "./repositories/paging.js";
 import { memoryStats } from "./repositories/stats.js";
 import type { StoreStats, StoreStatsOptions } from "./repositories/stats.js";
 import { redactText } from "../privacy/index.js";
@@ -317,6 +317,21 @@ function isEpisodeForgotten(episode: Episode): boolean {
   return episode.metadata[FORGOTTEN_KEY] === true;
 }
 
+// listEpisodes() applies its LIMIT before episodes() below filters out
+// forgotten rows, so a one-shot call can hand back a short (even empty)
+// page with a non-null cursor if the newest rows happen to be forgotten --
+// measured: 30 episodes with the newest 10 forgotten made
+// episodes({limit:10}) return items:0 with a cursor, and the dashboard's
+// Timeline renders its "nothing here" empty state on items.length === 0,
+// hiding the other 20 behind that cursor. episodes() below re-pages until
+// the requested page is full or the underlying cursor is exhausted. Bounded
+// at this many underlying fetches so a store that is mostly forgotten
+// episodes cannot turn one page request into an unbounded scan -- worst
+// case (MAX_PAGE_LIMIT-sized pages, all forgotten) is a bounded number of
+// rows examined, not the whole table; the page returned may then still be
+// short, but the cursor handed back always lets the caller keep going.
+const MAX_FORGOTTEN_SCAN_PAGES = 20;
+
 // A security audit found a single caller-supplied `tags` array re-applied to
 // every entry parsed out of a paste import, with nothing anywhere capping
 // tag count, tag length, scope length or memory length: a 23,798-byte
@@ -370,6 +385,86 @@ function assertContentWithinCap(content: string, field: string): void {
   if (content.length > MAX_CONTENT_LENGTH) {
     throw new Error(`${field} exceeds the cap of ${MAX_CONTENT_LENGTH} characters`);
   }
+}
+
+// episodes.metadata is a FIFTH ingest path (§10): a caller-supplied object
+// with no cap and no redaction let a 5,041-character value carrying an
+// intact GitHub token straight into episodes.metadata, served verbatim by
+// GET /api/episodes/:id and written into exportArchive -- reachable directly
+// from `remember`'s `source` parameter (its schema in tools.ts maps into
+// here, and is itself unbounded -- see this review's out-of-scope note for
+// that file). 4096 (JSON.stringify length, not raw string length) is chosen
+// because this column exists for small structured provenance -- client
+// name, ids, a handful of flags -- not a second content field:
+// MAX_CONTENT_LENGTH (65536) already governs the actual memory text, so
+// 4096 is generous for metadata's real purpose while closing off the
+// amplification actually measured. Refused, not truncated, for the same
+// reason as every other cap in this file: silent truncation is silent data
+// loss a caller never asked for.
+const MAX_METADATA_LENGTH = 4096;
+
+// Metadata arrives as a plain JSON object from a client or an archive, never
+// hand-built application state, so any real use case is shallow. Walked to
+// a bounded depth (4) -- rather than fully unbounded recursion -- so a
+// maliciously deep/wide structure cannot turn this walk itself into
+// unbounded work; the length cap above already bounds the total bytes
+// examined, this bounds the STACK DEPTH of examining them. Past the depth
+// cap, a nested value is left as-is (already covered by the byte cap, and
+// not worth refusing the whole write over).
+const MAX_METADATA_DEPTH = 4;
+
+function assertMetadataWithinCap(metadata: Record<string, unknown> | undefined): void {
+  if (metadata === undefined) return;
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(metadata);
+  } catch {
+    throw new Error(`metadata must be JSON-serializable`);
+  }
+  if (serialized.length > MAX_METADATA_LENGTH) {
+    throw new Error(`metadata exceeds the cap of ${MAX_METADATA_LENGTH} characters`);
+  }
+}
+
+function redactMetadataValue(value: unknown, mode: PrivacyMode, depth: number, findings: Finding[]): unknown {
+  if (typeof value === "string") {
+    const redaction = redactText(value, mode);
+    findings.push(...redaction.findings);
+    return redaction.text;
+  }
+  if (depth >= MAX_METADATA_DEPTH) return value;
+  if (Array.isArray(value)) {
+    return value.map((entry) => redactMetadataValue(entry, mode, depth + 1, findings));
+  }
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = redactMetadataValue(entry, mode, depth + 1, findings);
+    }
+    return out;
+  }
+  return value;
+}
+
+// Same shape and same reasoning as redactText itself: `off` skips the
+// detectors entirely (genuinely free), `on` returns rewritten metadata with
+// markers spliced in, `strict` returns the ORIGINAL metadata untouched with
+// `blocked: true` so the caller refuses the whole write -- never a
+// redact-and-store fallback for the mode that exists specifically so the
+// user finds out and decides.
+function redactMetadata(
+  metadata: Record<string, unknown> | undefined,
+  mode: PrivacyMode,
+): { metadata: Record<string, unknown> | undefined; findings: Finding[]; blocked: boolean } {
+  if (metadata === undefined || mode === "off") {
+    return { metadata, findings: [], blocked: false };
+  }
+  const findings: Finding[] = [];
+  const redacted = redactMetadataValue(metadata, mode, 0, findings) as Record<string, unknown>;
+  if (mode === "strict") {
+    return { metadata, findings, blocked: findings.length > 0 };
+  }
+  return { metadata: redacted, findings, blocked: false };
 }
 
 export function openStore(options: StoreOptions = {}): Store {
@@ -444,17 +539,21 @@ export function openStore(options: StoreOptions = {}): Store {
       assertContentWithinCap(input.content, "content");
       assertTagsWithinCap(input.tags);
       assertScopeWithinCap(input.scope);
+      assertMetadataWithinCap(input.metadata);
       const { sourceClient, scope } = gate(ctx, "remember");
       const resolvedScope = input.scope ?? scope;
 
       // §10 redaction runs BEFORE anything is written, and is pure local
       // regex (../privacy/detectors.ts) -- it never calls an LLM or the
       // network, so this stays inside `remember`'s "never calls an LLM"
-      // contract (BUILD_BRIEF §2).
+      // contract (BUILD_BRIEF §2). `metadata` is redacted the same way as
+      // `content` -- it is a fifth ingest path, not exempt from any of this
+      // (see assertMetadataWithinCap's comment above).
       const { mode: privacyMode } = resolvePrivacyMode(db);
       const redaction = redactText(input.content, privacyMode);
+      const metadataRedaction = redactMetadata(input.metadata, privacyMode);
 
-      if (privacyMode === "strict" && redaction.blocked) {
+      if (privacyMode === "strict" && (redaction.blocked || metadataRedaction.blocked)) {
         // §10 strict mode: write NOTHING -- no episode, no memory, no
         // vector. The refusal must still show up in the §9 "what was
         // blocked" view, so it is recorded here, OUTSIDE the write
@@ -463,9 +562,10 @@ export function openStore(options: StoreOptions = {}): Store {
         // before throwing rather than inside a transaction that would roll
         // it back. The error names the KINDS found and how many, never a
         // value or a preview that could reconstruct one.
+        const findings = [...redaction.findings, ...metadataRedaction.findings];
         recordRedactions(
           db,
-          redaction.findings.map((finding) => ({
+          findings.map((finding) => ({
             memoryId: null,
             episodeId: null,
             scope: resolvedScope,
@@ -476,12 +576,12 @@ export function openStore(options: StoreOptions = {}): Store {
           })),
         );
         throw new Error(
-          `remember refused: found ${summarizeFindings(redaction.findings)}; privacy mode is "strict"`,
+          `remember refused: found ${summarizeFindings(findings)}; privacy mode is "strict"`,
         );
       }
 
       const contentToStore = redaction.text;
-      const redacted = redaction.findings.length > 0;
+      const redacted = redaction.findings.length > 0 || metadataRedaction.findings.length > 0;
 
       return db.tx(() => {
         // Local-embedding hook lands in milestone 2 here: `remember` must
@@ -493,12 +593,14 @@ export function openStore(options: StoreOptions = {}): Store {
         // user's API key in the database, which is the exact outcome this
         // feature exists to prevent. The episode therefore gets the
         // REDACTED text too, not the raw content -- this looks like a §5
-        // violation to anyone who has not read §10, but it is not one.
+        // violation to anyone who has not read §10, but it is not one. Same
+        // reasoning for metadata: it gets the redacted object, not the raw
+        // one.
         const episode = appendEpisode(db, {
           content: contentToStore,
           scope: resolvedScope,
           sourceClient,
-          metadata: input.metadata,
+          metadata: metadataRedaction.metadata,
         });
         const { memory, deduped } = createMemory(db, {
           text: contentToStore,
@@ -512,7 +614,7 @@ export function openStore(options: StoreOptions = {}): Store {
         if (redacted) {
           recordRedactions(
             db,
-            redaction.findings.map((finding) => ({
+            [...redaction.findings, ...metadataRedaction.findings].map((finding) => ({
               memoryId: memory.id,
               episodeId: episode.id,
               scope: resolvedScope,
@@ -536,7 +638,7 @@ export function openStore(options: StoreOptions = {}): Store {
           memory,
           deduped,
           episodeId: memory.episodeId ?? episode.id,
-          redactions: summarizeKindCounts(redaction.findings),
+          redactions: summarizeKindCounts([...redaction.findings, ...metadataRedaction.findings]),
         };
       });
     },
@@ -999,8 +1101,23 @@ export function openStore(options: StoreOptions = {}): Store {
       // artifact, and SQLite still leaves the freed pages themselves in the
       // file until VACUUM reclaims them; a failure here must not undo (it
       // cannot -- the purge already committed) or hide the purge result.
+      //
+      // The daemon runs in WAL mode and never closes its connection between
+      // calls, so VACUUM's rewritten pages land in the -wal file, not the
+      // main db file, and the PRE-vacuum pages (still carrying the deleted
+      // plaintext) remain wherever they were checkpointed to -- measured:
+      // the purged marker phrase was still present in BOTH cairn.db and
+      // cairn.db-wal after VACUUM alone. `wal_checkpoint(TRUNCATE)`
+      // immediately after folds the WAL back into the main file and then
+      // truncates the WAL to zero bytes, which is what actually removes the
+      // stale pages from both files in the state the daemon runs in. Kept
+      // in this same best-effort try: the purge itself already committed by
+      // this point, so a failure here can only mean the cleanup pass
+      // (VACUUM and/or the checkpoint) did not fully run, never that the
+      // purge is undone.
       try {
         db.exec("VACUUM");
+        db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       } catch {
         // Best-effort: see the comment above.
       }
@@ -1102,19 +1219,23 @@ export function openStore(options: StoreOptions = {}): Store {
       requireWritable("importEpisode");
       assertContentWithinCap(input.content, "content");
       assertScopeWithinCap(input.scope);
+      assertMetadataWithinCap(input.metadata);
       const { sourceClient, scope } = gate(ctx, "import");
       const resolvedScope = input.scope ?? scope;
 
       // §10 redaction runs BEFORE anything is written, same reasoning as
       // importMemory above -- an episode's content is just as much an
-      // ingest path as a memory's text is.
+      // ingest path as a memory's text is, and so is its metadata (see
+      // assertMetadataWithinCap's comment above: this is the fifth path).
       const { mode: privacyMode } = resolvePrivacyMode(db);
       const redaction = redactText(input.content, privacyMode);
+      const metadataRedaction = redactMetadata(input.metadata, privacyMode);
 
-      if (privacyMode === "strict" && redaction.blocked) {
+      if (privacyMode === "strict" && (redaction.blocked || metadataRedaction.blocked)) {
+        const findings = [...redaction.findings, ...metadataRedaction.findings];
         recordRedactions(
           db,
-          redaction.findings.map((finding) => ({
+          findings.map((finding) => ({
             memoryId: null,
             episodeId: input.id,
             scope: resolvedScope ?? null,
@@ -1127,21 +1248,26 @@ export function openStore(options: StoreOptions = {}): Store {
         // Same all-or-nothing reasoning as importMemory's own strict refusal
         // above -- this throw unwinds archive.ts's outer db.tx() too.
         throw new Error(
-          `import refused: found ${summarizeFindings(redaction.findings)}; privacy mode is "strict"`,
+          `import refused: found ${summarizeFindings(findings)}; privacy mode is "strict"`,
         );
       }
 
-      const redacted = redaction.findings.length > 0;
+      const redacted = redaction.findings.length > 0 || metadataRedaction.findings.length > 0;
 
       // Invariant: the mutation, any redaction rows, and the audit row
       // commit together or not at all -- see importMemory's own comment
       // above.
       return db.tx(() => {
-        const result = importEpisodeRepo(db, { ...input, content: redaction.text, scope: resolvedScope });
+        const result = importEpisodeRepo(db, {
+          ...input,
+          content: redaction.text,
+          scope: resolvedScope,
+          metadata: metadataRedaction.metadata,
+        });
         if (!result.skipped && redacted && result.episode) {
           recordRedactions(
             db,
-            redaction.findings.map((finding) => ({
+            [...redaction.findings, ...metadataRedaction.findings].map((finding) => ({
               memoryId: null,
               episodeId: result.episode?.id ?? input.id,
               scope: result.episode?.scope ?? resolvedScope ?? null,
@@ -1168,12 +1294,46 @@ export function openStore(options: StoreOptions = {}): Store {
       // the §6-capped audit vocabulary.
       const { sourceClient, scope } = gate(ctx, "list_memories");
       const effectiveScope = options.scope ?? scope;
-      const { includeDeleted, ...listOptions } = options;
-      const result = listEpisodes(db, { ...listOptions, scope: effectiveScope });
-      // §10: a forgotten memory's provenance episode must not be readable
-      // by default, same as the forgotten memory itself -- see
-      // markEpisodeForgotten's doc comment above.
-      const items = includeDeleted ? result.items : result.items.filter((e) => !isEpisodeForgotten(e));
+      const limit = clampLimit(options.limit);
+      const { includeDeleted } = options;
+
+      // See MAX_FORGOTTEN_SCAN_PAGES's comment above: page underneath until
+      // this page is full or the underlying cursor runs out, bounded so a
+      // store full of forgotten episodes cannot turn this into a full scan.
+      const collected: Episode[] = [];
+      let cursor = options.cursor ?? null;
+      let underlyingExhausted = false;
+      for (let page = 0; page < MAX_FORGOTTEN_SCAN_PAGES; page++) {
+        const result = listEpisodes(db, { scope: effectiveScope, cursor, limit });
+        // §10: a forgotten memory's provenance episode must not be readable
+        // by default, same as the forgotten memory itself -- see
+        // markEpisodeForgotten's doc comment above.
+        const visible = includeDeleted ? result.items : result.items.filter((e) => !isEpisodeForgotten(e));
+        collected.push(...visible);
+        cursor = result.nextCursor;
+        if (cursor === null) {
+          underlyingExhausted = true;
+          break;
+        }
+        if (collected.length >= limit) break;
+      }
+
+      const items = collected.slice(0, limit);
+      let nextCursor: string | null;
+      if (items.length < collected.length) {
+        // The last underlying page contributed more visible rows than this
+        // page needed: resume right after the last row actually returned,
+        // not the underlying cursor (which points past the extra rows we
+        // dropped here) -- otherwise those extra rows would be skipped
+        // forever on the next call.
+        const last = items[items.length - 1];
+        nextCursor = last ? encodeCursor(last.createdAt, last.id) : cursor;
+      } else if (!underlyingExhausted) {
+        nextCursor = cursor;
+      } else {
+        nextCursor = null;
+      }
+
       if (!readOnly) {
         recordAudit(db, {
           action: "list_memories",
@@ -1182,7 +1342,7 @@ export function openStore(options: StoreOptions = {}): Store {
           resultCount: items.length,
         });
       }
-      return { items, nextCursor: result.nextCursor };
+      return { items, nextCursor };
     },
 
     episode(id, ctx, options = {}) {

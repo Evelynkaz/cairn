@@ -217,6 +217,10 @@ function clampErrorMessage(message: string): string {
 // verbatim and unbounded. Rather than add six near-identical try/catch
 // blocks that will inevitably drift apart, every tool handler is wrapped
 // here, in one place, so no future tool can be added without this net.
+// Exported so server.ts can wrap its own handlers (resources, resource
+// templates, prompts, subscribe/unsubscribe) with the identical net -- a
+// prior review found that half unwrapped, letting an unbounded caller-chosen
+// resource URI reach a client verbatim through a thrown error message.
 // Mutating `err.message` in place (instead of constructing a new Error)
 // preserves the thrown value's real type and identity -- callers/tests that
 // `instanceof`-match a specific error class, and the per-tool catch blocks
@@ -224,9 +228,9 @@ function clampErrorMessage(message: string): string {
 // degradedReason scrub, export_memories's fixed messages) still run first
 // and produce whatever message they choose; this only clamps it further if
 // it is somehow still too long, it never replaces it.
-function withBoundedErrors<Args extends unknown[]>(
-  handler: (...args: Args) => CallToolResult | Promise<CallToolResult>,
-): (...args: Args) => Promise<CallToolResult> {
+export function withBoundedErrors<Args extends unknown[], Result>(
+  handler: (...args: Args) => Result | Promise<Result>,
+): (...args: Args) => Promise<Result> {
   return async (...args: Args) => {
     try {
       return await handler(...args);
@@ -301,6 +305,13 @@ function verifyExportDirNotSymlinkedOutOfHome(candidate: string): void {
 // "cairn.db:evil") whose non-existence would otherwise let `wx` succeed.
 // So this compares the final path segment, with trailing dots/spaces
 // stripped, against the protected names, and refuses any `:` outright.
+//
+// Compared case-insensitively: on Linux "CAIRN.DB" is a different, harmless
+// file, but on macOS and Windows -- both case-insensitive filesystems by
+// default -- it names the same live database. A case-sensitive check would
+// let e.g. "CAIRN.DB-WAL" (no existing "-wal" file to trip `wx`) through on
+// those platforms, where it would be created and then adopted by SQLite as
+// the live WAL file.
 const PROTECTED_HOME_FILENAMES = new Set(["cairn.db", "cairn.db-wal", "cairn.db-shm", "daemon.json"]);
 
 function refuseCairnOwnedPath(candidate: string): void {
@@ -314,7 +325,7 @@ function refuseCairnOwnedPath(candidate: string): void {
   if (base.includes(":")) {
     throw new Error("export_memories: path must be inside the Cairn home directory");
   }
-  const normalizedBase = base.replace(/[. ]+$/, "");
+  const normalizedBase = base.replace(/[. ]+$/, "").toLowerCase();
   if (PROTECTED_HOME_FILENAMES.has(normalizedBase)) {
     throw new Error("export_memories: path must be inside the Cairn home directory");
   }
@@ -368,10 +379,12 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         scope: z.string().optional().describe('Namespace to store under, e.g. a project name. Defaults to "default".'),
         source: z
           .string()
+          .max(512)
           .optional()
           .describe(
             'Optional free-text note on where this came from (e.g. "user said", "inferred"). Stored as ' +
-              "provenance alongside the episode, not used for retrieval.",
+              "provenance alongside the episode, not used for retrieval. Capped at 512 characters -- this is " +
+              "provenance metadata, not a place to smuggle an unbounded payload into episodes.metadata.",
           ),
         importance: numberOrNumericString
           .optional()

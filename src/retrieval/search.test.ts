@@ -312,16 +312,7 @@ test("search: minCoverage filters a weak FTS-branch match while a fully-covering
     const strong = createMemory(db, { text: "kubernetes deployment rollback procedure documented here" }).memory;
     const weak = createMemory(db, { text: "the garden deployment of new roses went well" }).memory;
 
-    // minRelevance: 0 -- with only these two candidates fused, min-max
-    // normalisation (search.ts) gives the weaker-ranked one exactly 0
-    // relevance, which the default relevance floor would filter regardless
-    // of minCoverage; this test isolates minCoverage specifically.
-    const permissive = await search(
-      db,
-      "kubernetes deployment rollback procedure",
-      { minCoverage: 0, minRelevance: 0 },
-      {},
-    );
+    const permissive = await search(db, "kubernetes deployment rollback procedure", { minCoverage: 0 }, {});
     assert.ok(permissive.hits.some((h) => h.id === strong.id));
     assert.ok(permissive.hits.some((h) => h.id === weak.id), "a loose, one-term-of-four match survives a floor of 0");
 
@@ -371,19 +362,10 @@ test("search: limit clamps to 50 and defaults to 10; candidateLimit clamps to 20
       }
     });
 
-    // minRelevance: 0 isolates the clamps under test from the (now
-    // correctly rank-spanning, see the min-max normalisation comment in
-    // search.ts) relevance floor, which would otherwise legitimately trim
-    // the tail of this single-branch, 60-candidate fused list on its own.
-    const defaulted = await search(db, "bulk clamp searchable memory", { minRelevance: 0 }, {});
+    const defaulted = await search(db, "bulk clamp searchable memory", {}, {});
     assert.equal(defaulted.hits.length, 10);
 
-    const clamped = await search(
-      db,
-      "bulk clamp searchable memory",
-      { limit: 99999, candidateLimit: 99999, minRelevance: 0 },
-      {},
-    );
+    const clamped = await search(db, "bulk clamp searchable memory", { limit: 99999, candidateLimit: 99999 }, {});
     assert.equal(clamped.hits.length, 50);
   });
 });
@@ -411,23 +393,13 @@ test("search: `now` is honoured -- the same pair ranks differently at two differ
 
     // weights.relevance: 0 isolates recency+importance from any BM25 rank
     // tie-break noise between the two near-identical documents above.
-    // minRelevance: 0 keeps the WORSE-fused-rank one of these two from
-    // being dropped by the relevance floor before re-ranking ever runs --
-    // with only two fused candidates, min-max normalisation (see search.ts)
-    // gives the worse one exactly 0 relevance, which the default floor
-    // would otherwise filter regardless of weights.relevance.
-    const soon = await search(
-      db,
-      "chronotest",
-      { weights: { relevance: 0 }, minRelevance: 0, now: setupNow },
-      {},
-    );
+    const soon = await search(db, "chronotest", { weights: { relevance: 0 }, now: setupNow }, {});
     assert.equal(soon.hits[0]?.id, recentLowImportance.id);
 
     const muchLater = await search(
       db,
       "chronotest",
-      { weights: { relevance: 0 }, minRelevance: 0, now: setupNow + 400 * DAY_MS },
+      { weights: { relevance: 0 }, now: setupNow + 400 * DAY_MS },
       {},
     );
     assert.equal(muchLater.hits[0]?.id, oldHighImportance.id);
@@ -504,13 +476,7 @@ test("search: a tag-filtered vector-only match is never starved by the branch's 
       );
     }
 
-    // minRelevance: 0 -- the three tagged memories are given an identical
-    // vector on purpose (see above), which makes them a purely tied,
-    // exactly-3-item fused list; min-max normalisation (search.ts) always
-    // gives the last tie-broken one of an otherwise-flat list exactly 0
-    // relevance, which the default floor would filter regardless of the
-    // fan-out starvation fix this test actually pins.
-    const result = await search(db, query, { tags: ["ops"], limit: 10, candidateLimit, minRelevance: 0 }, { provider, space });
+    const result = await search(db, query, { tags: ["ops"], limit: 10, candidateLimit }, { provider, space });
     assert.equal(result.degraded, false);
     assert.deepEqual(
       result.hits.map((h) => h.id).sort(),
@@ -617,21 +583,15 @@ test("search: candidateLimit actually controls per-branch fan-out, not just the 
     const targetRank = knn(db, space, queryVector!, { k: 50 }).findIndex((h) => h.memorySeq === target.seq) + 1;
     assert.ok(targetRank > 10 && targetRank <= 50, `expected target rank in (10, 50], got ${targetRank}`);
 
-    // minRelevance: 0 throughout -- `target` is deliberately the WORST-
-    // ranked vector candidate in this single-branch fused list (that is
-    // what makes it a fan-out probe), so min-max normalisation (search.ts)
-    // gives it exactly 0 relevance whenever it IS included; the default
-    // floor would filter it regardless of candidateLimit, which is not what
-    // this test is pinning.
     // Explicit candidateLimit smaller than target's true rank: excluded.
-    const tooNarrow = await search(db, query, { candidateLimit: 5, limit: 50, minRelevance: 0 }, { provider, space });
+    const tooNarrow = await search(db, query, { candidateLimit: 5, limit: 50 }, { provider, space });
     assert.equal(tooNarrow.hits.some((h) => h.id === target.id), false);
 
     // No candidateLimit given: search()'s OWN default (50) must be
     // substituted -- not left undefined for knn's much smaller default (10)
     // to kick in, which is exactly what breaks if clampCandidateLimit's
     // default-substitution branch is removed.
-    const defaulted = await search(db, query, { limit: 50, minRelevance: 0 }, { provider, space });
+    const defaulted = await search(db, query, { limit: 50 }, { provider, space });
     assert.ok(defaulted.hits.some((h) => h.id === target.id));
   });
 });
@@ -785,5 +745,47 @@ test("search: a provider/space model-id mismatch skips the vector branch and rep
     assert.equal(result.degraded, true);
     assert.ok(typeof result.degradedReason === "string" && result.degradedReason.includes("model-a"));
     assert.ok(result.hits.length > 0, "FTS branch must still return results");
+  });
+});
+
+// Regression: min-max normalising relevance against BOTH ends of the fused
+// set (for the rerank BLEND) also pins the single worst-fused-rank
+// candidate to exactly 0 for every N -- if `minRelevance`'s default floor
+// were applied against THAT scale (instead of the max-only scale in
+// `preNormRelevanceById`), it would cut the worst survivor of every
+// non-empty result set regardless of how good it actually is. Five
+// memories that all equally match the query (same BM25 rank basis) must
+// all five come back at the default floor.
+test("search: five equally-matching memories all survive the default relevance floor", async () => {
+  await withDbAsync(async (db) => {
+    const memories = Array.from({ length: 5 }, (_, i) =>
+      createMemory(db, { text: `kubernetes deployment rollback procedure number ${i}` }).memory,
+    );
+
+    const result = await search(db, "kubernetes deployment rollback procedure", {}, {});
+    assert.deepEqual(
+      result.hits.map((h) => h.id).sort(),
+      memories.map((m) => m.id).sort(),
+      "all five equally-matching memories must survive the default minRelevance floor",
+    );
+  });
+});
+
+// Same regression, at the sharper edge the audit measured: with only TWO
+// fused candidates, min-max normalisation gives the worse-ranked one
+// EXACTLY 0 relevance -- if that were the scale minRelevance's default
+// floor read, it alone would cut it, no matter how good a match it
+// genuinely is.
+test("search: two matching memories both survive the default relevance floor", async () => {
+  await withDbAsync(async (db) => {
+    const a = createMemory(db, { text: "kubernetes deployment rollback procedure alpha" }).memory;
+    const b = createMemory(db, { text: "kubernetes deployment rollback procedure beta" }).memory;
+
+    const result = await search(db, "kubernetes deployment rollback procedure", {}, {});
+    assert.deepEqual(
+      result.hits.map((h) => h.id).sort(),
+      [a.id, b.id].sort(),
+      "both matching memories must survive the default minRelevance floor",
+    );
   });
 });

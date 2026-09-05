@@ -8,7 +8,7 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { SubscribeRequestSchema, UnsubscribeRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { McpDeps } from "./deps.js";
-import { registerTools, callContext, memoryToJson, MEMORY_URI_TEMPLATE, MEMORIES_LIST_URI } from "./tools.js";
+import { registerTools, callContext, memoryToJson, withBoundedErrors, MEMORY_URI_TEMPLATE, MEMORIES_LIST_URI } from "./tools.js";
 import { MemoryEventBus } from "./events.js";
 
 const SERVER_NAME = "cairn";
@@ -87,22 +87,28 @@ export function createMcpServer(deps: McpDeps): McpServer {
     },
   });
 
-  server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
-    const uri = request.params.uri;
-    if (!uri.startsWith(SUBSCRIBE_URI_SCHEME)) {
-      throw new Error("subscribe: unsupported resource URI scheme");
-    }
-    if (!subscribedUris.has(uri) && subscribedUris.size >= MAX_SUBSCRIBED_URIS) {
-      throw new Error("subscribe: too many subscriptions for this session");
-    }
-    subscribedUris.add(uri);
-    return {};
-  });
+  server.server.setRequestHandler(
+    SubscribeRequestSchema,
+    withBoundedErrors(async (request) => {
+      const uri = request.params.uri;
+      if (!uri.startsWith(SUBSCRIBE_URI_SCHEME)) {
+        throw new Error("subscribe: unsupported resource URI scheme");
+      }
+      if (!subscribedUris.has(uri) && subscribedUris.size >= MAX_SUBSCRIBED_URIS) {
+        throw new Error("subscribe: too many subscriptions for this session");
+      }
+      subscribedUris.add(uri);
+      return {};
+    }),
+  );
 
-  server.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
-    subscribedUris.delete(request.params.uri);
-    return {};
-  });
+  server.server.setRequestHandler(
+    UnsubscribeRequestSchema,
+    withBoundedErrors(async (request) => {
+      subscribedUris.delete(request.params.uri);
+      return {};
+    }),
+  );
 
   server.registerResource(
     "recent-memories",
@@ -114,12 +120,12 @@ export function createMcpServer(deps: McpDeps): McpServer {
         "a tool call; call `recall` instead when you need memories relevant to a specific question.",
       mimeType: "application/json",
     },
-    (uri) => {
+    withBoundedErrors((uri) => {
       const { items } = deps.store.list({ limit: RESOURCE_LIST_LIMIT }, callContext(server));
       return {
         contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(items.map(memoryToJson), null, 2) }],
       };
-    },
+    }),
   );
 
   const memoryTemplate = new ResourceTemplate(MEMORY_URI_TEMPLATE, { list: undefined });
@@ -131,7 +137,7 @@ export function createMcpServer(deps: McpDeps): McpServer {
       description: "A single memory by id, e.g. cairn://memory/<id>.",
       mimeType: "application/json",
     },
-    (uri, variables) => {
+    withBoundedErrors((uri, variables) => {
       const rawId = variables["id"];
       const id = Array.isArray(rawId) ? rawId[0] : rawId;
       if (!id) {
@@ -139,12 +145,12 @@ export function createMcpServer(deps: McpDeps): McpServer {
       }
       const memory = deps.store.get(id, {}, callContext(server));
       if (!memory) {
-        throw new Error(`memory not found: ${id}`);
+        throw new Error("memory not found");
       }
       return {
         contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(memoryToJson(memory), null, 2) }],
       };
-    },
+    }),
   );
 
   server.registerPrompt(
@@ -154,7 +160,7 @@ export function createMcpServer(deps: McpDeps): McpServer {
       description: "Ask Cairn to summarize everything it remembers about the user, grounded in stored memories rather than guesswork.",
       argsSchema: { scope: z.string().optional() },
     },
-    (args) => ({
+    withBoundedErrors((args) => ({
       messages: [
         {
           role: "user",
@@ -167,7 +173,7 @@ export function createMcpServer(deps: McpDeps): McpServer {
           },
         },
       ],
-    }),
+    })),
   );
 
   server.registerPrompt(
@@ -177,7 +183,7 @@ export function createMcpServer(deps: McpDeps): McpServer {
       description: "Save the decision just made in this conversation as a durable memory, so it survives into future sessions and other clients.",
       argsSchema: { decision: z.string() },
     },
-    (args) => ({
+    withBoundedErrors((args) => ({
       messages: [
         {
           role: "user",
@@ -189,7 +195,7 @@ export function createMcpServer(deps: McpDeps): McpServer {
           },
         },
       ],
-    }),
+    })),
   );
 
   return server;

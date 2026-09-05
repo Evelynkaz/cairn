@@ -51,17 +51,18 @@ const MAX_BULK_IDS = 200;
 // laptop, `curl | head`) -- see the backpressure handling in handleEvents.
 const SSE_BACKPRESSURE_CAP_BYTES = 1024 * 1024;
 
-// The only discriminator a 409's body ever carries (see handlePatchMemory,
+// The only discriminator an error body ever carries (see handlePatchMemory,
 // handleRestoreMemory and handleSupersedeMemory below): drawn from which
 // code path threw, never from an error's own message, so a client can tell
 // "this memory is history" apart from "that text already exists elsewhere"
-// without anything user-supplied ever leaking into the enum.
-type ConflictReason = "superseded" | "duplicate_text";
+// apart from "the store refused this write in strict mode" without anything
+// user-supplied ever leaking into the enum.
+type ErrorReason = "superseded" | "duplicate_text" | "strict_redaction_refused";
 
 class HttpError extends Error {
   readonly status: number;
-  readonly reason?: ConflictReason;
-  constructor(status: number, message: string, reason?: ConflictReason) {
+  readonly reason?: ErrorReason;
+  constructor(status: number, message: string, reason?: ErrorReason) {
     super(message);
     this.status = status;
     this.reason = reason;
@@ -125,6 +126,13 @@ function isMalformedCursorError(err: unknown): boolean {
 function isStrictRedactionRefusal(err: unknown): boolean {
   return err instanceof Error && err.message.startsWith("remember refused: found ");
 }
+
+// The fixed 400 body for isStrictRedactionRefusal above, wired into every
+// write path below that can reach a strict-mode refusal: names the
+// situation and the mode, never the offending value or the detected secret
+// (§10) -- unlike err.message, which is never forwarded here.
+const STRICT_REDACTION_REFUSAL_MESSAGE =
+  "this write was refused: the text appears to contain a secret and privacy mode is set to strict";
 
 // Shared by the memory patch and supersede handlers: `importance` is a
 // 0..1 relevance weight (BUILD_BRIEF §7's re-rank), so anything else --
@@ -299,6 +307,9 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
       if (err instanceof LiveTextCollisionError) {
         throw new HttpError(409, "conflict", "duplicate_text");
       }
+      if (isStrictRedactionRefusal(err)) {
+        throw new HttpError(400, STRICT_REDACTION_REFUSAL_MESSAGE, "strict_redaction_refused");
+      }
       throw err;
     }
     sendJson(res, 200, memory);
@@ -347,6 +358,9 @@ export function createDashboardApi(deps: DashboardApiDeps): DashboardApi {
     } catch (err) {
       if (err instanceof LiveTextCollisionError) {
         throw new HttpError(409, "conflict", "duplicate_text");
+      }
+      if (isStrictRedactionRefusal(err)) {
+        throw new HttpError(400, STRICT_REDACTION_REFUSAL_MESSAGE, "strict_redaction_refused");
       }
       throw err;
     }

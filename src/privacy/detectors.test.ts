@@ -487,8 +487,16 @@ test("HIGH-8: DB_PASSWORD=value is detected, only the value is redacted", () => 
   assert.equal(text.slice(finding.start, finding.end), "hunter2hunter2");
 });
 
-test("HIGH-8: SECRET_KEY: value (colon form) is detected", () => {
-  const text = "SECRET_KEY: 8f14e45fceea167a5a36dedd4bea2543";
+// CRITICAL-1 (see below) intentionally dropped ':' support: a colon is
+// overwhelmingly prose punctuation, not assignment, and matching it is what
+// let the detector mangle notes like "Password: use the one stored in
+// 1Password". The equals-sign form is still detected (next test).
+test("HIGH-8/CRITICAL-1: SECRET_KEY: value (colon form) is no longer detected", () => {
+  assert.deepEqual(detectSecrets("SECRET_KEY: 8f14e45fceea167a5a36dedd4bea2543"), []);
+});
+
+test("HIGH-8: SECRET_KEY=value (equals form) is detected", () => {
+  const text = "SECRET_KEY=8f14e45fceea167a5a36dedd4bea2543";
   const [finding] = detectSecrets(text);
   assert.equal(finding?.kind, "env-secret");
   assert.equal(text.slice(finding.start, finding.end), "8f14e45fceea167a5a36dedd4bea2543");
@@ -499,6 +507,93 @@ test("HIGH-8: quoted API_TOKEN=\"value\" is detected", () => {
   const [finding] = detectSecrets(text);
   assert.equal(finding?.kind, "env-secret");
   assert.equal(text.slice(finding.start, finding.end), "abcdef0123456789");
+});
+
+// ---------------------------------------------------------------------------
+// CRITICAL-1: the env-secret detector must not mangle ordinary prose
+// ---------------------------------------------------------------------------
+
+test("CRITICAL-1: realistic prose containing a secret-signalling word passes through untouched", () => {
+  const prose = [
+    "Password: use the one stored in 1Password",
+    "The staging secret: rotate it every 90 days",
+    "API_KEY: ask Dana for it",
+    "my_secret: tell nobody",
+    "GitHub PAT credentials: stored in the team vault",
+    "auth_token: TODO",
+    "TOKEN=see the runbook",
+  ];
+  for (const text of prose) {
+    assert.deepEqual(detectSecrets(text), [], `must not fire on: ${text}`);
+  }
+});
+
+test("CRITICAL-1: genuine .env assignment shapes are still detected", () => {
+  const cases: Array<[string, string]> = [
+    ["DB_PASSWORD=hunter2hunter2", "hunter2hunter2"],
+    ["SECRET_KEY=8f14e45fceea167a5a36dedd4bea2543", "8f14e45fceea167a5a36dedd4bea2543"],
+    ['API_TOKEN="abcdef0123456789"', "abcdef0123456789"],
+  ];
+  for (const [text, value] of cases) {
+    const [finding] = detectSecrets(text);
+    assert.equal(finding?.kind, "env-secret", `must fire on: ${text}`);
+    assert.equal(text.slice(finding.start, finding.end), value);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// CRITICAL-2: block detectors must not be quadratic
+// ---------------------------------------------------------------------------
+
+test("CRITICAL-2: many repeated PEM headers complete quickly", () => {
+  // 600 KB of repeated bare headers (no END, no blank line) exercised the
+  // O(n) endOfBlock slice AND the O(n) fullSpans.some() scan per header.
+  // A generous bound (well under the multi-second/minute blowup measured
+  // pre-fix) so this stays non-flaky in CI while still catching a
+  // regression back to quadratic behavior.
+  const text = "-----BEGIN A PRIVATE KEY-----\n".repeat(20000); // ~600 KB
+  const start = Date.now();
+  const findings = detectSecrets(text);
+  const elapsed = Date.now() - start;
+  assert.ok(findings.length > 0);
+  assert.ok(elapsed < 2000, `detectSecrets took too long on repeated PEM headers: ${elapsed}ms`);
+});
+
+test("CRITICAL-2: many repeated PuTTY headers complete quickly", () => {
+  const text = "PuTTY-User-Key-File-2: ssh-rsa\n".repeat(20000); // ~600 KB
+  const start = Date.now();
+  const findings = detectSecrets(text);
+  const elapsed = Date.now() - start;
+  assert.ok(findings.length > 0);
+  assert.ok(
+    elapsed < 2000,
+    `detectSecrets took too long on repeated PuTTY headers: ${elapsed}ms`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// HIGH-3: previews for kinds whose prefix is entropy, not a type signal
+// ---------------------------------------------------------------------------
+
+test("HIGH-3: env-secret, aws-secret-access-key and aws-session-token previews reveal no leading characters", () => {
+  const awsSecret = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY01"; // 40 chars, synthetic
+  const sessionToken = "fakeSessionTokenfakeSessionTokenfakeSessionToken1234567890";
+  const envSecret = "hunter2hunter2";
+
+  const [awsFinding] = detectSecrets(`aws_secret_access_key = "${awsSecret}"`);
+  assert.equal(awsFinding?.kind, "aws-secret-access-key");
+  assert.equal(awsFinding.preview, "*".repeat(8));
+  assert.ok(!awsFinding.preview.includes(awsSecret.slice(0, 4)));
+
+  const [sessionFinding] = detectSecrets(`aws_session_token = "${sessionToken}"`);
+  assert.equal(sessionFinding?.kind, "aws-session-token");
+  assert.equal(sessionFinding.preview, "*".repeat(8));
+  assert.ok(!sessionFinding.preview.includes(sessionToken.slice(0, 4)));
+
+  const [envFinding] = detectSecrets(`DB_PASSWORD=${envSecret}`);
+  assert.equal(envFinding?.kind, "env-secret");
+  assert.equal(envFinding.preview, "*".repeat(8));
+  assert.ok(!envFinding.preview.includes(envSecret.slice(0, 4)));
 });
 
 // ---------------------------------------------------------------------------

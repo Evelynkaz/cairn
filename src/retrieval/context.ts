@@ -118,6 +118,16 @@ export const DEFAULT_CONTEXT_MIN_COVERAGE = 0.4;
 // happens in semantic mode instead of keyword mode. Stricter (a smaller
 // distance ceiling) than `recall`'s default for the same unrequested-
 // injection asymmetry as every other floor in this file.
+//
+// UNVALIDATED against real embeddings (see search.ts's
+// DEFAULT_MAX_VECTOR_DISTANCE for the full caveat): 0.15 distance requires
+// cosine similarity >= 0.85, which a genuinely good bge-small-en-v1.5
+// paraphrase will often miss, so `get_context` in semantic mode may return
+// nothing on real data even when something genuinely related exists in the
+// store. §14 forbids tuning this against an invented corpus, so this stays
+// a starting point needing real-world validation, same as search.ts's own
+// default (see there for why this is not, and cannot cleanly be, surfaced
+// through `degraded`).
 export const DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE = 0.15;
 
 /**
@@ -198,8 +208,16 @@ interface PoolMemory {
 // emptyQueryFallback below). Queries memories_live directly, the same
 // sanctioned view fts.ts and search.ts read through, rather than
 // listMemories — listMemories only orders by (created_at, id) for its
-// keyset pagination and has no importance-ordered mode. Bounded by `limit`
-// in SQL, same as the recency half; never an unbounded scan.
+// keyset pagination and has no importance-ordered mode. `LIMIT` bounds the
+// OUTPUT, not the work: there is no index sorted by importance, so this
+// forces a full scan of `memories_live` (confirmed via `EXPLAIN QUERY PLAN`:
+// unscoped is `SCAN memories USING INDEX idx_memories_live_hash` plus `USE
+// TEMP B-TREE FOR ORDER BY`; scoped is an index SEARCH on scope but still
+// the same temp B-tree sort) — on every empty-query `get_context` call,
+// i.e. every SessionStart hook on every client launch. This needs a
+// supporting index — `(scope, importance DESC, created_at DESC)` filtered
+// to live rows — added by whoever owns the storage/migrations layer; this
+// function cannot add one itself (out of scope for this file).
 function loadImportancePool(db: CairnDb, scope: string | undefined, limit: number): PoolMemory[] {
   const conditions: string[] = [];
   const params: SqlValue[] = [];

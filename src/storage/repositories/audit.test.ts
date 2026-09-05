@@ -278,6 +278,46 @@ test("listAudit throws a descriptive error on a malformed cursor", () => {
   });
 });
 
+// Regression for a hostile-input finding (BUILD_BRIEF §10/§12): a cursor is
+// opaque and never meant to be echoed back -- a well-formed-but-huge cursor
+// (a plausible `ts:id` pair whose id is not a valid audit row id) must not
+// smuggle unbounded caller-chosen text into the thrown message.
+test("listAudit: a 500,000-character cursor produces a bounded message, not an unbounded echo", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      const hugeCursor = Buffer.from(`1700000000000:${"Q".repeat(500_000)}`, "utf8").toString("base64url");
+      assert.throws(() => listAudit(db, { cursor: hugeCursor }), (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.ok(err.message.length < 200, `expected a bounded message, got length ${err.message.length}`);
+        return true;
+      });
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// Pins the dashboard's 400-vs-500 mapping (src/dashboard/api.ts's
+// isMalformedCursorError): if this decoder's wording ever drifts from
+// "malformed .*cursor", a bad cursor silently becomes a 500 instead of a
+// 400. Duplicated literally (not imported) because isMalformedCursorError is
+// not exported.
+test("listAudit's malformed-cursor message matches the dashboard's isMalformedCursorError pattern", () => {
+  withTempDir((dir) => {
+    const db = openDb({ path: tempDbPath(dir) });
+    try {
+      assert.throws(() => listAudit(db, { cursor: "not-a-real-cursor!!" }), (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.ok(/malformed .*cursor/i.test(err.message));
+        return true;
+      });
+    } finally {
+      db.close();
+    }
+  });
+});
+
 test("recordAudit never throws for a memory id that does not exist", () => {
   withTempDir((dir) => {
     const db = openDb({ path: tempDbPath(dir) });

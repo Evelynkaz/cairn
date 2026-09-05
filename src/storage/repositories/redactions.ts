@@ -108,7 +108,7 @@ export function listRedactions(db: CairnDb, options: ListRedactionsOptions = {})
     const { ts, id } = decodeCursor(options.cursor, "redactions");
     const cursorId = Number(id);
     if (!Number.isInteger(cursorId)) {
-      throw new Error(`malformed redactions cursor: ${options.cursor}`);
+      throw new Error(`malformed redactions cursor`);
     }
     conditions.push("(ts < ? OR (ts = ? AND id < ?))");
     params.push(ts, ts, cursorId);

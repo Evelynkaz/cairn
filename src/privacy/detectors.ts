@@ -62,7 +62,16 @@ interface Candidate {
 // "ghp_") — never to help identify the value. For kinds where even the
 // prefix is entropy rather than a type signal, the value is masked
 // entirely regardless of length.
-const FULLY_MASKED_KINDS: ReadonlySet<SecretKind> = new Set(["url-password", "generic-bearer"]);
+// A kind belongs here when its first characters are entropy; it does NOT
+// belong here when its first characters are a fixed, publicly known type
+// marker (e.g. "AKIA", "ghp_", "glpat-", "sk-ant-").
+export const FULLY_MASKED_KINDS: ReadonlySet<SecretKind> = new Set([
+  "url-password",
+  "generic-bearer",
+  "env-secret",
+  "aws-secret-access-key",
+  "aws-session-token",
+]);
 const MASK = "*".repeat(8);
 
 function maskPreview(value: string, kind: SecretKind): string {
@@ -98,12 +107,33 @@ function collectSimple(
   return out;
 }
 
-// Finds the next blank line (or end of input) after `from`, for detectors
-// that redact "from a header to the end of the block" when there is no
-// well-formed closing delimiter to anchor on.
-function endOfBlock(text: string, from: number): number {
-  const blank = /\r?\n[ \t]*\r?\n/.exec(text.slice(from));
-  return blank ? from + blank.index : text.length;
+// Blank-line boundaries, for detectors that redact "from a header to the
+// end of the block" when there is no well-formed closing delimiter to
+// anchor on. Setting `lastIndex` and re-`exec`-ing per header (rather than
+// `text.slice(from)`) avoids the copy, but a hostile input with NO blank
+// line at all (e.g. thousands of bare "-----BEGIN ... PRIVATE KEY-----"
+// headers back to back) still forces each such scan to run to the end of
+// the text, which is O(n) per header and therefore O(n^2) overall — this
+// is exactly the shape CRITICAL-2 measured. So instead every blank-line
+// boundary is found ONCE per `text` (a single O(n) pass, in order), and
+// each header does an O(log n) binary search into that sorted list.
+function findBlockBoundaries(text: string): number[] {
+  const boundaries: number[] = [];
+  for (const match of text.matchAll(/\r?\n[ \t]*\r?\n/g)) {
+    boundaries.push(match.index);
+  }
+  return boundaries;
+}
+
+function endOfBlock(boundaries: readonly number[], text: string, from: number): number {
+  let lo = 0;
+  let hi = boundaries.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if ((boundaries[mid] as number) < from) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < boundaries.length ? (boundaries[lo] as number) : text.length;
 }
 
 // AWS access key id: AKIA (long-term) or ASIA (temporary/STS) + 16 uppercase
@@ -216,37 +246,113 @@ function collectJwt(text: string): Candidate[] {
 }
 
 // Private key block: a full PEM-style -----BEGIN ... PRIVATE KEY----- through
-// the matching -----END ... PRIVATE KEY----- (same label on both ends via
-// the backreference, matched case-insensitively), including the body.
-const PRIVATE_KEY_BLOCK = /-----BEGIN ([A-Za-z0-9 ]*PRIVATE KEY)-----[\s\S]*?-----END \1-----/gid;
-
-// Header-only fallback: any BEGIN ... PRIVATE KEY header, regardless of
-// whether a matching END is ever found (a truncated paste, a mismatched
-// footer, or an inconsistent label must never produce zero findings and
-// store the entire key body — see collectPrivateKeyBlocks below).
+// the matching -----END ... PRIVATE KEY----- (same label on both ends,
+// matched case-insensitively), including the body.
+//
+// This used to be one lazy regex (`[\s\S]*?` between BEGIN and END). That is
+// fine when an END exists nearby, but when it does NOT — many repeated bare
+// BEGIN headers, which is exactly the hostile-archive shape CRITICAL-2
+// measured — the lazy quantifier scans to the end of the text and fails,
+// once per BEGIN, which is O(n) per header and O(n^2) overall (measured:
+// ~6.3s on its own for 20,000 repeated headers, independent of the two
+// scans named below). So BEGIN and END are now found in two separate
+// linear passes (neither has unbounded backtracking) and paired up by
+// label via a map + binary search, which is O(n log n) total.
 const PRIVATE_KEY_HEADER = /-----BEGIN ([A-Za-z0-9 ]*PRIVATE KEY)-----/gid;
+const PRIVATE_KEY_END = /-----END ([A-Za-z0-9 ]*PRIVATE KEY)-----/gid;
+
+// Binary search over `spans` (start-ordered, since matchAll yields matches
+// in text order): the first span whose start is >= `pos`, or null. O(log n)
+// per lookup instead of a linear scan — load-bearing once the finding cap
+// was removed (CRITICAL-2), since a pathological input can produce many
+// thousands of candidates.
+function firstAtOrAfter(
+  spans: ReadonlyArray<[number, number]>,
+  pos: number,
+): [number, number] | null {
+  let lo = 0;
+  let hi = spans.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if ((spans[mid] as [number, number])[0] < pos) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < spans.length ? (spans[lo] as [number, number]) : null;
+}
+
+// Binary search over `fullSpans` (already start-ordered): finds the span
+// with the greatest start <= pos, then checks whether pos falls inside it.
+// O(log n) per header instead of the O(n) `Array#some` scan this replaced
+// (load-bearing once the finding cap was removed — see CRITICAL-2).
+function coveredByFullSpan(fullSpans: ReadonlyArray<[number, number]>, pos: number): boolean {
+  let lo = 0;
+  let hi = fullSpans.length - 1;
+  let candidate = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    const span = fullSpans[mid] as [number, number];
+    if (span[0] <= pos) {
+      candidate = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (candidate === -1) return false;
+  const [, fEnd] = fullSpans[candidate] as [number, number];
+  return pos < fEnd;
+}
 
 function collectPrivateKeyBlocks(text: string): Candidate[] {
   const out: Candidate[] = [];
   const fullSpans: Array<[number, number]> = [];
-  for (const match of text.matchAll(PRIVATE_KEY_BLOCK)) {
-    const span = groupSpan(match, 0);
-    if (span === null) continue;
-    out.push({ kind: "private-key-block", start: span[0], end: span[1], priority: -1 });
-    fullSpans.push(span);
+  const headerMatches = [...text.matchAll(PRIVATE_KEY_HEADER)];
+
+  if (headerMatches.length > 0) {
+    // Group END occurrences by lowercased label; each per-label list stays
+    // in text order (start-ascending), which is what firstAtOrAfter needs.
+    const endsByLabel = new Map<string, Array<[number, number]>>();
+    for (const match of text.matchAll(PRIVATE_KEY_END)) {
+      const label = match[1];
+      const span = groupSpan(match, 0);
+      if (label === undefined || span === null) continue;
+      const key = label.toLowerCase();
+      const list = endsByLabel.get(key);
+      if (list) list.push(span);
+      else endsByLabel.set(key, [span]);
+    }
+
+    // Headers already inside a full span found for an earlier header are
+    // skipped here too, same as the original regex's global-match advance:
+    // a BEGIN nested inside an already-consumed block never starts a new
+    // full-block search of its own.
+    let cursor = 0;
+    for (const match of headerMatches) {
+      const label = match[1];
+      const span = groupSpan(match, 0);
+      if (label === undefined || span === null) continue;
+      const [headerStart, headerEnd] = span;
+      if (headerStart < cursor) continue;
+      const ends = endsByLabel.get(label.toLowerCase());
+      const endSpan = ends ? firstAtOrAfter(ends, headerEnd) : null;
+      if (endSpan === null) continue;
+      const fullSpan: [number, number] = [headerStart, endSpan[1]];
+      out.push({ kind: "private-key-block", start: fullSpan[0], end: fullSpan[1], priority: -1 });
+      fullSpans.push(fullSpan);
+      cursor = fullSpan[1];
+    }
   }
-  for (const match of text.matchAll(PRIVATE_KEY_HEADER)) {
+
+  const boundaries = headerMatches.length > 0 ? findBlockBoundaries(text) : [];
+  for (const match of headerMatches) {
     const span = groupSpan(match, 0);
     if (span === null) continue;
     const [headerStart, headerEnd] = span;
-    const coveredByFullMatch = fullSpans.some(
-      ([fStart, fEnd]) => headerStart >= fStart && headerStart < fEnd,
-    );
-    if (coveredByFullMatch) continue;
+    if (coveredByFullSpan(fullSpans, headerStart)) continue;
     out.push({
       kind: "private-key-block",
       start: headerStart,
-      end: endOfBlock(text, headerEnd),
+      end: endOfBlock(boundaries, text, headerEnd),
       priority: -1,
     });
   }
@@ -260,13 +366,15 @@ const PUTTY_HEADER = /PuTTY-User-Key-File-\d+:/gid;
 
 function collectPutty(text: string): Candidate[] {
   const out: Candidate[] = [];
-  for (const match of text.matchAll(PUTTY_HEADER)) {
+  const headerMatches = [...text.matchAll(PUTTY_HEADER)];
+  const boundaries = headerMatches.length > 0 ? findBlockBoundaries(text) : [];
+  for (const match of headerMatches) {
     const span = groupSpan(match, 0);
     if (span === null) continue;
     out.push({
       kind: "putty-private-key",
       start: span[0],
-      end: endOfBlock(text, span[1]),
+      end: endOfBlock(boundaries, text, span[1]),
       priority: 12,
     });
   }
@@ -293,15 +401,30 @@ const URL_PASSWORD =
 // caller believes the secret was fully handled while its tail survives).
 const GENERIC_BEARER = /bearer\s+([A-Za-z0-9\-_.+/=~]{10,})(?![A-Za-z0-9_\-.+/=~])/gid;
 
-// .env-style assignment: KEY=value or KEY: value where KEY's name contains
-// one of a fixed list of secret-signalling substrings. Only the VALUE is
-// redacted. The key-name requirement is what keeps this precise enough to
-// ship as a default-on detector — a pasted .env file is the single most
-// likely way a secret reaches this store (BUILD_BRIEF §10), and unlike the
-// rest of this module (precision over recall) an explicitly named secret is
-// worth the small false-positive cost (e.g. "TOKEN: see docs").
-const ENV_KEY = /(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]{0,63})\s*[:=]\s*["']?([^\s"'#]+)["']?/gd;
+// .env-style assignment: KEY=value, where KEY's name contains one of a
+// fixed list of secret-signalling substrings. Only the VALUE is redacted.
+// A pasted .env file is the single most likely way a secret reaches this
+// store (BUILD_BRIEF §10), but an earlier version of this detector also
+// mangled ordinary prose (a "Password:" or "secret:" mid-sentence is
+// overwhelmingly a person talking, not an assignment — see the module's own
+// precision-over-recall doctrine above). It now requires ALL of:
+//   (a) line-anchored: the key must start the line (only leading
+//       whitespace before it), so a key name mid-sentence never qualifies;
+//   (b) '=' only, never ':' — a colon is overwhelmingly prose punctuation
+//       ("Password: use the one stored in 1Password"), an equals sign is
+//       assignment;
+//   (c) a value of at least 12 characters containing a digit or a
+//       non-alphanumeric character, so a plain-English reply ("TOKEN=see
+//       the runbook") is not mistaken for a value.
+// Measured: this kills all of "Password: use the one stored in 1Password",
+// "The staging secret: rotate it every 90 days", "API_KEY: ask Dana for
+// it", "my_secret: tell nobody", "GitHub PAT credentials: stored in the
+// team vault", "auth_token: TODO" and "TOKEN=see the runbook" — see
+// detectors.test.ts — while still catching genuine .env shapes.
+const ENV_KEY = /^[ \t]*([A-Za-z][A-Za-z0-9_]{0,63})[ \t]*=[ \t]*["']?([^\s"'#]+)["']?/gmd;
 const ENV_SECRET_NAME = /PASSWORD|PASSWD|SECRET|TOKEN|APIKEY|API_KEY|PRIVATE_KEY|CREDENTIALS/i;
+const ENV_VALUE_MIN_LENGTH = 12;
+const ENV_VALUE_HAS_SIGNAL = /[0-9]|[^A-Za-z0-9]/;
 
 function collectEnvAssignments(text: string): Candidate[] {
   const out: Candidate[] = [];
@@ -311,7 +434,11 @@ function collectEnvAssignments(text: string): Candidate[] {
     const span = groupSpan(match, 2);
     if (span === null) continue;
     const [start, end] = span;
-    if (end > start) out.push({ kind: "env-secret", start, end, priority: 20 });
+    if (end <= start) continue;
+    const value = text.slice(start, end);
+    if (value.length < ENV_VALUE_MIN_LENGTH) continue;
+    if (!ENV_VALUE_HAS_SIGNAL.test(value)) continue;
+    out.push({ kind: "env-secret", start, end, priority: 20 });
   }
   return out;
 }

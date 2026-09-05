@@ -9,7 +9,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ResourceListChangedNotificationSchema, ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -289,6 +290,30 @@ test("remember then recall round-trips; re-remembering the same text dedupes", a
     const recalled = await callJson<RecallResult>(client, "recall", { query: "dark mode" });
     assert.ok(recalled.hits.some((h) => h.id === first.id));
     assert.equal(recalled.degraded, false);
+  });
+});
+
+// episodes.metadata is a fifth ingest path with no redaction of its own
+// (BUILD_BRIEF §10/§12): `remember`'s `source` is the only MCP-reachable
+// route into it, and it maps straight into that column with no cap before
+// this fix -- an unbounded `source` is stored verbatim, served verbatim by
+// the dashboard's episode route, and written into export archives.
+// MEASURED before the fix: a 5,000+ character `source` with a fake token
+// embedded in it stored and round-tripped with no complaint. This is the
+// outer half of a two-layer fix -- src/storage/store.ts enforces its own
+// cap independently since the dashboard's PATCH route does not go through
+// this schema.
+test("remember rejects a `source` longer than 512 characters, without echoing it back", async () => {
+  await withServer(async ({ client, store }) => {
+    const hugeSource = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + "Q".repeat(5000);
+    const { isError, text } = await callTool(client, "remember", {
+      content: "A memory with an oversized source.",
+      source: hugeSource,
+    });
+    assert.equal(isError, true, "remember must refuse a `source` over 512 characters");
+    assert.ok(!text.includes(hugeSource), "the refusal must not echo the oversized source back");
+    assert.ok(text.length < 1000, `the refusal must be a bounded message, got ${text.length} chars`);
+    assert.equal(store.list({ limit: 200 }).items.length, 0, "the oversized-source memory must not be stored");
   });
 });
 
@@ -738,6 +763,64 @@ test("subscribing past the cap is refused", async () => {
   });
 });
 
+// The defect this milestone's review found: `withBoundedErrors` wrapped
+// only the eight tools in tools.ts, so an unbounded caller-chosen resource
+// URI reached a client verbatim through a thrown error message -- the exact
+// failure mode the wrapper exists to prevent, on the other half of the
+// surface. MEASURED against a live server before the fix: a 200,000-char id
+// produced a 200,018-char error message (the fixed "memory not found: "
+// prefix plus the id, verbatim). After the fix, the id is no longer
+// interpolated at all and the message is a short fixed string.
+test("resources/read with a 200,000-character uri yields a bounded error message", async () => {
+  await withServer(async ({ client }) => {
+    const hugeId = "A".repeat(200_000);
+    await assert.rejects(
+      () => client.readResource({ uri: `cairn://memory/${hugeId}` }),
+      (err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err);
+        assert.ok(
+          message.length < 1000,
+          `readResource with a 200,000-char id must yield a bounded error message, got ${message.length} chars`,
+        );
+        assert.ok(!message.includes(hugeId), "the bounded error must not echo the huge id back");
+        return true;
+      },
+    );
+  });
+});
+
+// Enumerates every handler server.ts itself registers (the tools are
+// covered by tools.ts's own registerTools wrapping, asserted elsewhere) so
+// that a future handler added here without `withBoundedErrors` fails this
+// test loudly instead of silently reopening the same hole.
+// Reads server.ts's own SOURCE (not the compiled .js this test itself runs
+// as, which has already erased the wrapping into plain function calls) --
+// this test runs from dist/mcp/server.test.js too, so the path is derived
+// relative to this file rather than assumed to be "./server.ts" on disk.
+function serverSourcePath(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  return join(here, "..", "..", "src", "mcp", "server.ts");
+}
+
+test("every handler server.ts registers itself (resources, resource templates, prompts, subscribe/unsubscribe) is wrapped in withBoundedErrors", () => {
+  const src = readFileSync(serverSourcePath(), "utf8");
+  const registrations: Array<{ name: string; pattern: RegExp }> = [
+    { name: "resources/subscribe request handler", pattern: /SubscribeRequestSchema,\s*\n\s*withBoundedErrors\(/ },
+    { name: "resources/unsubscribe request handler", pattern: /UnsubscribeRequestSchema,\s*\n\s*withBoundedErrors\(/ },
+    { name: 'resource "recent-memories"', pattern: /withBoundedErrors\(\(uri\) => \{\s*\n\s*const \{ items \}/ },
+    { name: 'resource "memory"', pattern: /withBoundedErrors\(\(uri, variables\) => \{/ },
+    { name: 'prompt "recall_digest"', pattern: /"recall_digest"[\s\S]{0,400}withBoundedErrors\(\(args\) => \(\{/ },
+    { name: 'prompt "save_decision"', pattern: /"save_decision"[\s\S]{0,400}withBoundedErrors\(\(args\) => \(\{/ },
+  ];
+  for (const { name, pattern } of registrations) {
+    assert.ok(
+      pattern.test(src),
+      `${name} must wrap its handler in withBoundedErrors -- otherwise a thrown error from it reaches an MCP ` +
+        "client unbounded, the same defect a live measurement found in the memory resource",
+    );
+  }
+});
+
 test("works end to end with no embedding provider configured (FTS-only mode)", async () => {
   await withServer(async ({ client }) => {
     const remembered = await callJson<RememberResult>(client, "remember", { content: "FTS-only fact about apples." });
@@ -977,6 +1060,36 @@ for (const [label, makePath] of Object.entries({
         assert.equal(isError, true, "a path outside CAIRN_HOME must be refused");
         assert.ok(!text.includes(target), "the refusal must not echo the requested path");
         assert.ok(!text.includes("/etc/passwd"), "the refusal must not echo the requested path");
+      });
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.CAIRN_HOME;
+      } else {
+        process.env.CAIRN_HOME = originalHome;
+      }
+      rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+}
+
+// The comparison against PROTECTED_HOME_FILENAMES must be case-insensitive:
+// on Linux "CAIRN.DB" is a genuinely different, harmless file, but macOS and
+// Windows are case-insensitive filesystems by default, so there it names the
+// SAME live database. MEASURED on Linux before this fix: export_memories
+// wrote "CAIRN.DB", "Cairn.Db-Wal" and "DAEMON.JSON" successfully, each a
+// distinct byte string from the protected lowercase name.
+for (const target of ["CAIRN.DB", "Cairn.Db-Wal", "DAEMON.JSON"]) {
+  test(`export_memories refuses "${target}" as a case-insensitive alias of a protected file`, async () => {
+    const home = makeTempDir();
+    const originalHome = process.env.CAIRN_HOME;
+    process.env.CAIRN_HOME = home;
+    try {
+      await withServer(async ({ client }) => {
+        const path = join(home, target);
+        const { isError, text } = await callTool(client, "export_memories", { path });
+        assert.equal(isError, true, `export_memories(path: "${target}") must be refused`);
+        assert.ok(!text.includes(home), "the refusal must not echo the path");
+        assert.ok(!statSyncExists(path), `no file must be written at "${target}"`);
       });
     } finally {
       if (originalHome === undefined) {

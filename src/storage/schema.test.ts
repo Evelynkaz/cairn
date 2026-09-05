@@ -435,6 +435,7 @@ test("sqlite_master reflects the exact expected schema shape (drift guard for mi
         "index idx_memories_live",
         "index idx_memories_live_hash",
         "index idx_memories_scope_created",
+        "index idx_memories_scope_importance_created",
         "index idx_memories_superseded_by",
         "index idx_memory_tags_tag",
         "index idx_redactions_memory",

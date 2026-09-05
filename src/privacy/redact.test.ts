@@ -77,6 +77,27 @@ test("DEFAULT_PRIVACY_MODE is 'on'", () => {
 // CRITICAL-1: the finding cap must bound reporting, never redaction
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// CRITICAL-1: env-secret false positives must never rewrite the episode
+// ---------------------------------------------------------------------------
+
+test("CRITICAL-1: realistic prose is stored byte-identical under redaction (the episode is unrecoverable if this fails)", () => {
+  const prose = [
+    "Password: use the one stored in 1Password",
+    "The staging secret: rotate it every 90 days",
+    "API_KEY: ask Dana for it",
+    "my_secret: tell nobody",
+    "GitHub PAT credentials: stored in the team vault",
+    "auth_token: TODO",
+    "TOKEN=see the runbook",
+  ];
+  for (const text of prose) {
+    const result = redactText(text, "on");
+    assert.equal(result.text, text, `must not rewrite: ${text}`);
+    assert.deepEqual(result.findings, []);
+  }
+});
+
 test("CRITICAL-1: 150 secrets in one input are all redacted, none survive raw in the output", () => {
   const keys = Array.from({ length: 150 }, (_, i) => `AKIA${String(i).padStart(16, "0")}`);
   const text = keys.join(" ");

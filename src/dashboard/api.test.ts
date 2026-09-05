@@ -335,6 +335,65 @@ test("PATCH whose text collides with a different live memory is a 409 conflict w
   assert.equal(unchanged?.text, "bravo patch collision text");
 });
 
+test("PATCH with a secret in strict privacy mode is a 400 refusal, not a 500", async () => {
+  const memory = ctx.store.remember({ content: "strict patch target" }, { sourceClient: "other" }).memory;
+  const put = await call(ctx, "PUT", "/api/privacy", { body: { mode: "strict" } });
+  assert.equal(put.status, 200);
+  try {
+    const res = await call(ctx, "PATCH", `/api/memories/${memory.id}`, {
+      body: { text: "my new token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    });
+    assert.equal(res.status, 400);
+    assert.equal((res.body as { reason?: string }).reason, "strict_redaction_refused");
+
+    const unchanged = ctx.store.get(memory.id, {}, { sourceClient: "other" });
+    assert.equal(unchanged?.text, "strict patch target");
+  } finally {
+    // Reset to "off" so later tests in this file that write memories are not
+    // subject to strict-mode refusal.
+    const reset = await call(ctx, "PUT", "/api/privacy", { body: { mode: "off" } });
+    assert.equal(reset.status, 200);
+  }
+});
+
+test("supersede with a secret in strict privacy mode is a 400 refusal, not a 500", async () => {
+  const memory = ctx.store.remember({ content: "strict supersede target" }, { sourceClient: "other" }).memory;
+  const put = await call(ctx, "PUT", "/api/privacy", { body: { mode: "strict" } });
+  assert.equal(put.status, 200);
+  try {
+    const res = await call(ctx, "POST", `/api/memories/${memory.id}/supersede`, {
+      body: { text: "my new token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    });
+    assert.equal(res.status, 400);
+    assert.equal((res.body as { reason?: string }).reason, "strict_redaction_refused");
+
+    const unchanged = ctx.store.get(memory.id, {}, { sourceClient: "other" });
+    assert.equal(unchanged?.text, "strict supersede target");
+  } finally {
+    // Reset to "off" so later tests in this file that write memories are not
+    // subject to strict-mode refusal.
+    const reset = await call(ctx, "PUT", "/api/privacy", { body: { mode: "off" } });
+    assert.equal(reset.status, 200);
+  }
+});
+
+test("PATCH with a secret in non-strict mode redacts and stores normally", async () => {
+  const memory = ctx.store.remember({ content: "non-strict patch target" }, { sourceClient: "other" }).memory;
+  const put = await call(ctx, "PUT", "/api/privacy", { body: { mode: "on" } });
+  assert.equal(put.status, 200);
+  try {
+    const res = await call(ctx, "PATCH", `/api/memories/${memory.id}`, {
+      body: { text: "my new token ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    });
+    assert.equal(res.status, 200);
+    const updated = res.body as { text: string };
+    assert.ok(!updated.text.includes("ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+  } finally {
+    const reset = await call(ctx, "PUT", "/api/privacy", { body: { mode: "off" } });
+    assert.equal(reset.status, 200);
+  }
+});
+
 test("restoring a memory whose text was re-remembered while deleted is a 409 conflict with reason duplicate_text", async () => {
   const original = ctx.store.remember({ content: "restore collision text" }, { sourceClient: "other" }).memory;
   ctx.store.forget(original.id, { sourceClient: "other" });

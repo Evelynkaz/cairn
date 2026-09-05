@@ -9,6 +9,15 @@ import { timestampFromUuidv7, uuidv7 } from "../../util/id.js";
 import { json, num, str, strOrNull } from "./row.js";
 import { clampLimit, decodeCursor, encodeCursor } from "./paging.js";
 
+// Bounds how much of an attacker-controlled value (an archive's episode id,
+// or any other field) can ever land in an error message: these errors can
+// surface all the way into an MCP client's context (BUILD_BRIEF §12).
+// Mirrors src/storage/repositories/memories.ts's safeValue() -- same
+// approach, kept local here rather than shared, per that module's comment.
+function safeValue(value: unknown): string {
+  return JSON.stringify(String(value).slice(0, 80));
+}
+
 function rowToEpisode(row: Row): Episode {
   return {
     id: str(row, "id"),
@@ -116,7 +125,7 @@ export function importEpisode(
   const createdAt = timestampFromUuidv7(input.id);
   const now = Date.now();
   if (createdAt < EARLIEST_SANE_TIMESTAMP || createdAt > now + FUTURE_SKEW_MS) {
-    throw new Error(`episode ${input.id}: id does not embed a plausible timestamp (${createdAt})`);
+    throw new Error(`episode ${safeValue(input.id)}: id does not embed a plausible timestamp (${createdAt})`);
   }
 
   const scope = input.scope ?? DEFAULT_SCOPE;
@@ -134,7 +143,7 @@ export function importEpisode(
     insertEpisode(db, input.id, input.content, scope, sourceClient, metadata, createdAt);
     const episode = getEpisode(db, input.id);
     if (!episode) {
-      throw new Error(`episode ${input.id} not found immediately after import insert`);
+      throw new Error(`episode ${safeValue(input.id)} not found immediately after import insert`);
     }
     return { episode, skipped: false };
   });

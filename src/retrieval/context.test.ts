@@ -76,13 +76,7 @@ test("getContext: never exceeds the token budget across several budgets, on a co
     seedLongCorpus(db, 40);
 
     for (const tokenBudget of [200, 800, 4000]) {
-      // minRelevance: 0 -- this test is pinning the token-budget loop, not
-      // the relevance floor; with 40 near-identical candidates fused from a
-      // single branch, min-max normalisation (search.ts) legitimately gives
-      // the tail of that ranking a relevance near/at 0, which
-      // DEFAULT_CONTEXT_MIN_RELEVANCE would otherwise filter well before
-      // the budget loop ever gets a chance to truncate.
-      const block = await getContext(db, "project status update", { tokenBudget, minRelevance: 0 }, {});
+      const block = await getContext(db, "project status update", { tokenBudget }, {});
       assert.ok(estimateTokens(block.text) <= tokenBudget, `budget ${tokenBudget}: text exceeded budget`);
       assert.ok(block.tokensEstimated <= tokenBudget, `budget ${tokenBudget}: tokensEstimated exceeded budget`);
       assert.equal(block.truncated, true, `budget ${tokenBudget}: expected truncation on an oversized corpus`);
@@ -196,17 +190,10 @@ test("getContext: an oversized memory ranked first no longer empties the whole b
 
     // Weights pin ranking to importance alone, so the huge memory is
     // deterministically rank 1 regardless of BM25/relevance nuance.
-    // minRelevance: 0 -- weights.relevance: 0 only zeroes relevance's
-    // contribution to the BLENDED score, not the independent minRelevance
-    // FILTER; with 6 fused candidates, min-max normalisation (search.ts)
-    // spreads their raw relevance across the full 0..1 range regardless of
-    // weights, which DEFAULT_CONTEXT_MIN_RELEVANCE would otherwise use to
-    // cut some of the shorts before the budget loop this test is pinning
-    // ever sees them.
     const block = await getContext(
       db,
       "keyword",
-      { tokenBudget: 400, weights: { relevance: 0, recency: 0, importance: 1, access: 0 }, minRelevance: 0 },
+      { tokenBudget: 400, weights: { relevance: 0, recency: 0, importance: 1, access: 0 } },
       {},
     );
 
@@ -238,19 +225,13 @@ test("getContext: a widened candidate pool surfaces a low-FTS-rank, high-importa
       importance: 1,
     }).memory;
 
-    // minRelevance: 0 -- `target` is deliberately the WORST-fused-rank
-    // candidate in this pool (that is what makes it a candidateLimit-widening
-    // probe); min-max normalisation (search.ts) gives it a very low, possibly
-    // 0, relevance regardless of candidateLimit, which
-    // DEFAULT_CONTEXT_MIN_RELEVANCE would otherwise filter before the
-    // importance re-rank this test is pinning ever gets a chance to run.
-    const wide = await getContext(db, query, { tokenBudget: 20000, minRelevance: 0 }, {});
+    const wide = await getContext(db, query, { tokenBudget: 20000 }, {});
     assert.ok(
       wide.memories.some((m) => m.id === target.id),
       "expected the default (widened) candidate pool to surface the low-FTS-rank, high-importance memory",
     );
 
-    const narrow = await getContext(db, query, { tokenBudget: 20000, candidateLimit: 50, minRelevance: 0 }, {});
+    const narrow = await getContext(db, query, { tokenBudget: 20000, candidateLimit: 50 }, {});
     assert.equal(
       narrow.memories.some((m) => m.id === target.id),
       false,
@@ -488,4 +469,25 @@ test("getContext's default maxVectorDistance floor is strictly stricter (smaller
     DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE < DEFAULT_MAX_VECTOR_DISTANCE,
     "get_context is injected unrequested at session start (BUILD_BRIEF §8); its default vector-distance ceiling must stay below recall's",
   );
+});
+
+// Regression: min-max normalising relevance against BOTH ends of the fused
+// set (for the rerank BLEND) also pins the single worst-fused-rank
+// candidate to exactly 0 for every N -- if DEFAULT_CONTEXT_MIN_RELEVANCE
+// were applied against THAT scale instead of the max-only scale
+// (`preNormRelevanceById` in search.ts), it would cut the worse of two
+// genuinely matching memories on every call. Both must survive at the
+// default floor, on both `recall` and `get_context`.
+test("recall and get_context both keep two matching memories at their default relevance floors", async () => {
+  await withDbAsync(async (db) => {
+    const a = createMemory(db, { text: "kubernetes deployment rollback procedure alpha" }).memory;
+    const b = createMemory(db, { text: "kubernetes deployment rollback procedure beta" }).memory;
+    const query = "kubernetes deployment rollback procedure";
+
+    const recallResult = await search(db, query, {}, {});
+    assert.deepEqual(recallResult.hits.map((h) => h.id).sort(), [a.id, b.id].sort());
+
+    const block = await getContext(db, query, { tokenBudget: 20000 }, {});
+    assert.deepEqual(block.memories.map((m) => m.id).sort(), [a.id, b.id].sort());
+  });
 });

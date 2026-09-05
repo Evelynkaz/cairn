@@ -33,12 +33,18 @@ export interface SearchOptions {
   weights?: Partial<RerankWeights>;
   mmrLambda?: number;
   now?: number;
-  /** A RELATIVE floor on the normalised RRF relevance (0..1): each fused
-      candidate's score is min-max normalised against the TOP and BOTTOM
-      fused scores of THIS call's own result set (see `maxScore`/`minScore`
-      below), so the single best-ranked candidate in any non-empty result
-      always has relevance exactly 1.0 and always clears this floor, and the
-      single worst-ranked one always has relevance exactly 0. That means
+  /** A RELATIVE floor on RRF relevance (0..1), against the TOP fused score
+      of THIS call's own result set only (`item.score / maxScore` — see
+      `preNormRelevanceById` in `search()`): the single best-ranked candidate
+      in any non-empty result always has relevance exactly 1.0 and always
+      clears this floor. This is deliberately NOT the min-max-normalised
+      relevance rerank() blends (see the comment above `relevanceById` in
+      `search()`): min-max also pins the single WORST fused candidate to
+      exactly 0 for every N, which would make this floor cut the worst
+      survivor of every non-empty result set regardless of how good it
+      actually is — the exact silent-loss regression this comment used to
+      describe. On the max-only scale used here, a candidate only reads as
+      low when it is genuinely far behind the leader on raw RRF score, so
       minRelevance can only ever SHRINK a result set, never EMPTY one — it
       is not, on its own, an absolute quality gate, whatever its name
       suggests. Absolute
@@ -190,6 +196,21 @@ export const DEFAULT_MIN_COVERAGE = 0.2;
 // 0.25-0.4 cosine distance; this default sits just below that band).
 // `get_context` uses a stricter value — see
 // DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE in context.ts.
+//
+// UNVALIDATED against real embeddings, and there is reason to expect it
+// runs hot: 0.24 distance requires cosine similarity >= 0.76, but for
+// bge-small-en-v1.5 a genuinely good paraphrase routinely sits in the
+// 0.75-0.85 similarity range — i.e. sometimes just below this floor. §14
+// forbids tuning this against a self-run/invented corpus, so it is left as
+// a starting point needing validation against real transcripts and a real
+// embedding model before it can be trusted not to silently cut real
+// matches. It is deliberately NOT surfaced through `degraded` when it
+// empties a result set: an entirely unrelated corpus is expected, correct,
+// non-degraded behaviour for this filter (see the regression test pinning
+// exactly that in search.test.ts) and there is no way, from inside this
+// function, to distinguish "genuinely unrelated" from "related, but this
+// unvalidated threshold cut it anyway" — only a real embedding model
+// evaluated against real transcripts can tell those apart.
 export const DEFAULT_MAX_VECTOR_DISTANCE = 0.24;
 
 function clampSearchLimit(limit: number | undefined): number {
@@ -528,34 +549,49 @@ export async function search(
   // `relevance` fed to rerank() is expected in 0..1: raw RRF scores are tiny
   // (they scale with 1/k and the number of lists) and carry no natural
   // upper bound, so this needs SOME normalisation. Dividing by the top score
-  // alone (the previous approach) is the wrong normalisation: in a
-  // single-branch (FTS-only, the default zero-config mode) result set, the
-  // fused score at rank r is exactly `1/(RRF_K+r)`, so `score/maxScore` is
-  // `(RRF_K+1)/(RRF_K+r)` — a curve that only spans down to ~0.55 by rank
+  // alone (the previous approach) is the wrong normalisation FOR THE BLEND:
+  // in a single-branch (FTS-only, the default zero-config mode) result set,
+  // the fused score at rank r is exactly `1/(RRF_K+r)`, so `score/maxScore`
+  // is `(RRF_K+1)/(RRF_K+r)` — a curve that only spans down to ~0.55 by rank
   // 10, compressing the WHOLE top-10 relevance spread into less than the
   // recency term's own span (rerank.ts's `w.recency` term alone covers a
   // full week's exponential decay). That compression is what let a
   // several-ranks-worse, barely-relevant FTS hit outscore a clearly better,
   // slightly-older one on the blended score (a reproduced defect, see
   // search.test.ts). Min-max normalising against BOTH ends of this call's
-  // own fused set instead restores the full 0..1 range regardless of branch
-  // count or fused-list size: the best candidate is exactly 1, the worst is
-  // exactly 0, and everything else falls proportionally between them, so a
-  // rank-position difference is never silently worth less than it should be
-  // relative to the other blend terms. This is the more principled of the
-  // two fixes precisely because it does not depend on how many branches
-  // fired or how deep the pool is — a max-only normalisation stays skewed
-  // by RRF_K no matter how the OTHER weights are re-tuned. fused is sorted
-  // score-desc, so fused[0]/fused[fused.length-1] are the max/min directly;
-  // the degenerate case (every fused score identical, including the
-  // single-candidate case) has no meaningful range to spread across, so it
-  // maps every candidate to 1 rather than dividing by zero.
+  // own fused set restores the full 0..1 range regardless of branch count or
+  // fused-list size for THAT job — the best candidate is exactly 1, the
+  // worst is exactly 0, and everything else falls proportionally between
+  // them, so a rank-position difference is never silently worth less than it
+  // should be relative to the other blend terms.
+  //
+  // But min-max pins the single WORST fused candidate to exactly 0 for every
+  // N by construction — that is fine as a blend input (0 just means "least
+  // relevant of this particular set", still ranked correctly relative to its
+  // peers), but it is wrong as a THRESHOLD input: `minRelevance` is supposed
+  // to mean "this candidate's own match quality is too weak to bother with",
+  // not "this happened to be the worst of however many candidates fused this
+  // call" — the latter deletes the worst survivor of every non-empty result
+  // set regardless of how good it actually is (five equally strong matches
+  // -> four returned; two matches -> one). So thresholding and blending are
+  // two different jobs and must not share one normalisation: `minRelevance`
+  // is applied below against the max-only scale (`item.score / maxScore`,
+  // the same curve described above) via `preNormRelevanceById`, which still
+  // maps the single best candidate to 1 and never manufactures an artificial
+  // 0 — only a candidate that is genuinely far behind the leader on raw RRF
+  // score reads as low on this scale. `relevanceById` (min-max) remains what
+  // rerank() blends. fused is sorted score-desc, so fused[0]/fused[fused.
+  // length-1] are the max/min directly; the degenerate case (every fused
+  // score identical, including the single-candidate case) has no meaningful
+  // range to spread across, so it maps every candidate to 1 rather than
+  // dividing by zero.
   const maxScore = fused[0]!.score;
   const minScore = fused[fused.length - 1]!.score;
   const scoreRange = maxScore - minScore;
   const relevanceById = new Map(
     fused.map((item) => [item.id, scoreRange > 0 ? (item.score - minScore) / scoreRange : 1]),
   );
+  const preNormRelevanceById = new Map(fused.map((item) => [item.id, maxScore > 0 ? item.score / maxScore : 1]));
 
   // --- re-rank (recency/importance/relevance/access blend) ---
   const rerankInput: RerankItem[] = fused.map((item) => {
@@ -574,12 +610,14 @@ export async function search(
   });
   // Relative relevance floor (see SearchOptions.minRelevance — RELATIVE to
   // this call's own top fused score, so it shrinks this result set but can
-  // never empty it on its own). Applied to the SAME normalised relevance
-  // fed into rerank() above, after re-rank has had its say but before MMR
-  // spends any work diversifying a set that is mostly noise.
+  // never empty it on its own). Applied against `preNormRelevanceById`
+  // (max-only scale), NOT the min-max-normalised `relevance` rerank() just
+  // blended with — see the long comment above `relevanceById` for why those
+  // must be two different scales. Applied after re-rank has had its say but
+  // before MMR spends any work diversifying a set that is mostly noise.
   const minRelevance = clampMinRelevance(options.minRelevance);
   const reranked = rerank(rerankInput, now, options.weights)
-    .filter((r) => r.relevance >= minRelevance)
+    .filter((r) => (preNormRelevanceById.get(r.id) ?? 0) >= minRelevance)
     .sort((a, b) => tieBreak(a.id, a.score, b.id, b.score));
 
   if (reranked.length === 0) {

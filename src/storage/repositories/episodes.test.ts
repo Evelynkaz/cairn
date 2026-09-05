@@ -83,6 +83,21 @@ test("listEpisodes: a malformed cursor throws", () => {
   });
 });
 
+// Pins the dashboard's 400-vs-500 mapping (src/dashboard/api.ts's
+// isMalformedCursorError): if this decoder's wording ever drifts from
+// "malformed .*cursor", a bad cursor silently becomes a 500 instead of a
+// 400. Duplicated literally (not imported) because isMalformedCursorError is
+// not exported.
+test("listEpisodes's malformed-cursor message matches the dashboard's isMalformedCursorError pattern", () => {
+  withDb((db) => {
+    assert.throws(() => listEpisodes(db, { cursor: "not-a-real-cursor" }), (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.ok(/malformed .*cursor/i.test(err.message));
+      return true;
+    });
+  });
+});
+
 test("listEpisodes: an empty-string cursor returns the first page, not an error", () => {
   withDb((db) => {
     const first = appendEpisode(db, { content: "a" });
@@ -205,5 +220,31 @@ test("a memory linked via episode_id survives episode deletion, with episode_id 
     const reloaded = getMemory(db, memory.id);
     assert.ok(reloaded);
     assert.equal(reloaded?.episodeId, null);
+  });
+});
+
+// Regression for a hostile-input finding (BUILD_BRIEF §10/§12): an
+// attacker-controlled id (an archive's episode id) must never be echoed
+// unbounded into an error message that can surface all the way into an MCP
+// client's context. Mirrors memories.test.ts's equivalent importMemory test.
+test("importEpisode: a 500,000-character id produces a bounded message, not an unbounded echo", () => {
+  withDb((db) => {
+    const hugeId = "Q".repeat(500_000);
+    assert.throws(() => importEpisode(db, { id: hugeId, content: "x" }), (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.ok(err.message.length < 200, `expected a bounded message, got length ${err.message.length}`);
+      return true;
+    });
+  });
+});
+
+test("importEpisode: an id embedding an implausible future timestamp produces a bounded message", () => {
+  withDb((db) => {
+    const farFutureId = idAtTimestamp(Date.UTC(9999, 0, 1));
+    assert.throws(() => importEpisode(db, { id: farFutureId, content: "x" }), (err: unknown) => {
+      assert.ok(err instanceof Error);
+      assert.ok(err.message.length < 200, `expected a bounded message, got length ${err.message.length}`);
+      return true;
+    });
   });
 });

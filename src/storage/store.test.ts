@@ -8,6 +8,7 @@ import { setPrivacyMode } from "./privacy-settings.js";
 import { ensureVectorSpace, upsertVector } from "./repositories/vectors.js";
 import type { CairnDb } from "./db.js";
 import { uuidv7 } from "../util/id.js";
+import { FULLY_MASKED_KINDS } from "../privacy/detectors.js";
 
 function withStore<T>(fn: (store: Store, dir: string) => T): T {
   return withTempDir((dir) => {
@@ -748,6 +749,94 @@ test("remember in 'off' mode stores content verbatim and records nothing", () =>
   });
 });
 
+// episodes.metadata is a FIFTH ingest path (§10), reachable straight from
+// MCP via remember()'s `source` parameter: a secret inside it must be
+// redacted like content, and refused in strict mode like content.
+test("remember redacts a secret found inside metadata (not just content), and records it", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "on");
+
+    const { memory, episodeId, redactions } = store.remember({
+      content: "totally unrelated content",
+      metadata: { source: `token: ${GH_TOKEN}` },
+    });
+
+    assert.equal(memory.redacted, true);
+    const episode = store.episode(episodeId);
+    assert.ok(episode);
+    assert.match(String(episode.metadata["source"]), /\[redacted:github-token\]/);
+    assert.ok(!String(episode.metadata["source"]).includes(GH_TOKEN));
+    assert.equal(dbContainsRawBytes(store.db, GH_TOKEN), false);
+
+    assert.deepEqual(redactions.map((r) => r.kind), ["github-token"]);
+    const redactionRows = store.db.q(`SELECT * FROM redactions WHERE action = 'redacted'`).all();
+    assert.equal(redactionRows.length, 1);
+  });
+});
+
+test("remember in 'strict' mode refuses a write when the secret is only in metadata", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "strict");
+
+    assert.throws(
+      () => store.remember({ content: "nothing secret here", metadata: { source: GH_TOKEN } }),
+      /github-token/,
+    );
+
+    assert.equal(countRows(store, "memories"), 0);
+    assert.equal(countRows(store, "episodes"), 0);
+    assert.equal(dbContainsRawBytes(store.db, GH_TOKEN), false);
+
+    const redactionRows = store.db.q(`SELECT * FROM redactions WHERE action = 'blocked'`).all();
+    assert.equal(redactionRows.length, 1);
+  });
+});
+
+test("importEpisode redacts a secret found inside metadata, and refuses in strict mode", () => {
+  withStore((store) => {
+    setPrivacyMode(store.db, "strict");
+    const blockedId = uuidv7();
+    assert.throws(
+      () => store.importEpisode({ id: blockedId, content: "fine", metadata: { source: AWS_KEY } }),
+      /aws-access-key-id/,
+    );
+    assert.equal(store.episode(blockedId), undefined);
+    assert.equal(dbContainsRawBytes(store.db, AWS_KEY), false);
+
+    setPrivacyMode(store.db, "on");
+    const okId = uuidv7();
+    const result = store.importEpisode({ id: okId, content: "fine", metadata: { source: AWS_KEY } });
+    assert.ok(result.episode);
+    assert.match(String(result.episode.metadata["source"]), /\[redacted:aws-access-key-id\]/);
+    assert.equal(dbContainsRawBytes(store.db, AWS_KEY), false);
+  });
+});
+
+test("remember refuses metadata over the 4096-character cap", () => {
+  withStore((store) => {
+    const oversized = { source: "x".repeat(5000) };
+    assert.throws(
+      () => store.remember({ content: "fine", metadata: oversized }),
+      /metadata exceeds the cap of 4096 characters/,
+    );
+    assert.equal(countRows(store, "memories"), 0);
+    assert.equal(countRows(store, "episodes"), 0);
+
+    const { memory } = store.remember({ content: "fine", metadata: { source: "small" } });
+    assert.equal(memory.text, "fine");
+  });
+});
+
+test("importEpisode refuses metadata over the 4096-character cap", () => {
+  withStore((store) => {
+    const oversized = { source: "x".repeat(5000) };
+    assert.throws(
+      () => store.importEpisode({ id: uuidv7(), content: "fine", metadata: oversized }),
+      /metadata exceeds the cap of 4096 characters/,
+    );
+  });
+});
+
 test("a recall query containing a secret is stored redacted in the access log", async () => {
   await withStoreAsync(async (store) => {
     setPrivacyMode(store.db, "on");
@@ -1148,42 +1237,141 @@ test("forget() hides the memory's provenance episode from the default episode re
   });
 });
 
-test("deleteEverything leaves no raw bytes of deleted content in the database file", () => {
-  withTempDir((dir) => {
-    const path = tempDbPath(dir);
-    // Deliberately NOT shaped like a secret (see AWS_KEY/GH_TOKEN above):
-    // this test is about deleteEverything's VACUUM/secure_delete leaving no
-    // trace at all, not about §10 redaction -- a secret-shaped marker would
-    // get redacted at write time (the default privacy mode is "on"),
-    // masking the very thing this test needs to observe.
-    const marker = "MARKER-PHRASE-FOR-VACUUM-TEST-1234567890";
-    const store = openStore({ path });
-    for (let i = 0; i < 5; i++) {
-      store.remember({ content: `${marker} entry ${i}` });
+// HIGH 3: the forgotten-episode filter used to run AFTER listEpisodes'
+// LIMIT, so a page could come back with zero items and a non-null cursor
+// when the newest rows in created_at order happened to be forgotten -- the
+// dashboard's Timeline renders its empty state on items.length === 0,
+// hiding everything else behind that cursor.
+test("episodes({limit:10}) returns a full page of ten even when the newest ten are forgotten", () => {
+  withStore((store) => {
+    const memoryIds: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      const { memory } = store.remember({ content: `entry ${i}` });
+      memoryIds.push(memory.id);
+      waitForNextMs();
     }
-    store.deleteEverything({ confirm: true });
-    store.close();
+    // Forget the ten NEWEST memories (episodes() orders newest-first).
+    for (const id of memoryIds.slice(20)) {
+      store.forget(id);
+    }
 
-    const bytes = readFileSync(path);
-    const occurrences = bytes.toString("latin1").split(marker).length - 1;
-    assert.equal(occurrences, 0);
+    const { items, nextCursor } = store.episodes({ limit: 10 });
+    assert.equal(items.length, 10);
+    assert.ok(nextCursor, "expected a cursor: 10 more live episodes remain unfetched");
   });
 });
 
-test("redactions() never returns an unmasked secret", () => {
+test("deleteEverything leaves no raw bytes of deleted content in the database file or the WAL, without closing the store", () => {
+  withTempDir((dir) => {
+    const path = tempDbPath(dir);
+    // Deliberately NOT shaped like a secret (see AWS_KEY/GH_TOKEN above):
+    // this test is about deleteEverything's VACUUM/checkpoint/secure_delete
+    // leaving no trace at all, not about §10 redaction -- a secret-shaped
+    // marker would get redacted at write time (the default privacy mode is
+    // "on"), masking the very thing this test needs to observe.
+    const marker = "MARKER-PHRASE-FOR-VACUUM-TEST-1234567890";
+    const store = openStore({ path });
+    try {
+      for (let i = 0; i < 5; i++) {
+        store.remember({ content: `${marker} entry ${i}` });
+      }
+      store.deleteEverything({ confirm: true });
+
+      // Deliberately NOT calling store.close() before scanning: the daemon
+      // this store models never closes its connection between calls, and a
+      // WAL-mode VACUUM's rewritten pages land in the -wal file while the
+      // pre-vacuum pages (still carrying the deleted plaintext) can remain
+      // in both files until a checkpoint runs -- a scan that only ever
+      // observes the post-close state verifies a situation the live daemon
+      // never reaches.
+      const bytes = readFileSync(path);
+      const occurrences = bytes.toString("latin1").split(marker).length - 1;
+      assert.equal(occurrences, 0, "marker still present in the main database file");
+
+      let walOccurrences = 0;
+      try {
+        const walBytes = readFileSync(`${path}-wal`);
+        walOccurrences = walBytes.toString("latin1").split(marker).length - 1;
+      } catch {
+        // No -wal file at all (e.g. a fully truncated checkpoint removed it)
+        // is also an acceptable outcome here.
+      }
+      assert.equal(walOccurrences, 0, "marker still present in the WAL file");
+    } finally {
+      store.close();
+    }
+  });
+});
+
+// FULLY_MASKED_KINDS is imported from ../privacy/detectors.ts (not mirrored)
+// so that adding a kind there automatically extends this test's coverage.
+// These are the kinds where even a 4-char leading prefix is pure entropy,
+// not a type signal: a preview like "hunt********" for a DB_PASSWORD value,
+// or "FwoG********" for an AWS session token, still hands over four
+// characters an attacker can use to narrow a guess, unlike
+// "AKIA"/"ghp_"/"glpat-"/"sk-ant-" etc, which are fixed, publicly known
+// token-type signatures that reveal nothing about the value itself. Every
+// OTHER kind detectSecrets can produce is assumed to fall in that "prefix is
+// a type signal" bucket, and is checked below for the
+// [4-char prefix]+asterisks shape instead.
+const MASK = "*".repeat(8);
+
+test("redactions() never returns an unmasked secret, and fully-masked kinds leak zero characters of entropy", () => {
   withStore((store) => {
     setPrivacyMode(store.db, "on");
-    store.remember({ content: `AWS key: ${AWS_KEY} and GitHub token: ${GH_TOKEN}` });
+
+    // One secret per kind now in FULLY_MASKED_KINDS, plus two prefixed
+    // kinds (aws-access-key-id, github-token) for contrast -- shapes lifted
+    // straight from ../privacy/detectors.test.ts's own fixtures for each
+    // detector. env-secret's key must start its own line, so each secret
+    // gets its own line.
+    const URL_PASSWORD_VALUE = "S3cretPassValue123";
+    const BEARER_TOKEN = "abcdefghij1234567890";
+    const AWS_SECRET = "fakeSecretfakeSecretfakeSecretfakeSecret"; // 40 chars
+    const AWS_SESSION = "fakeSessionTokenfakeSessionTokenfakeSessionToken1234567890";
+    const ENV_SECRET_VALUE = "hunter2CorrectHorseBatteryStaple";
+    const fullyMaskedSecrets = [URL_PASSWORD_VALUE, BEARER_TOKEN, AWS_SECRET, AWS_SESSION, ENV_SECRET_VALUE];
+
+    const content = [
+      `AWS key: ${AWS_KEY}`,
+      `GitHub token: ${GH_TOKEN}`,
+      `postgres://admin:${URL_PASSWORD_VALUE}@localhost:5432/db`,
+      `Authorization: Bearer ${BEARER_TOKEN}`,
+      `aws_secret_access_key = "${AWS_SECRET}"`,
+      `aws_session_token = "${AWS_SESSION}"`,
+      `DB_PASSWORD=${ENV_SECRET_VALUE}`,
+    ].join("\n");
+    store.remember({ content });
 
     const { items } = store.redactions();
-    assert.ok(items.length > 0);
+    const kinds = new Set(items.map((item) => item.kind));
+    for (const kind of FULLY_MASKED_KINDS) {
+      assert.ok(kinds.has(kind), `expected a finding of kind ${kind} in this fixture`);
+    }
+
     for (const item of items) {
       for (const value of Object.values(item)) {
         if (typeof value === "string") {
-          assert.ok(!value.includes(AWS_KEY), `field leaked the raw AWS key: ${value}`);
-          assert.ok(!value.includes(GH_TOKEN), `field leaked the raw GitHub token: ${value}`);
+          for (const secret of [AWS_KEY, GH_TOKEN, ...fullyMaskedSecrets]) {
+            assert.ok(!value.includes(secret), `field leaked a raw secret: ${value}`);
+          }
         }
       }
+
+      if ((FULLY_MASKED_KINDS as ReadonlySet<string>).has(item.kind)) {
+        // Full masking means EXACTLY the fixed-length asterisk run -- not
+        // just "no full value" and not just "no long substring", because a
+        // regression that kept a 1-4 char prefix "for these kinds too"
+        // would still hand over real entropy (see this test's header
+        // comment) while passing a looser shape check.
+        assert.equal(
+          item.preview,
+          MASK,
+          `kind ${item.kind} is in FULLY_MASKED_KINDS but its preview was not fully masked: ${item.preview}`,
+        );
+        continue;
+      }
+
       // Not just "no full value" -- a trailing slice of a short value can be
       // most of it (the CVE-shaped bug ../privacy/detectors.ts's maskPreview
       // comment describes), so masking was tightened to NEVER reveal
@@ -1193,9 +1381,8 @@ test("redactions() never returns an unmasked secret", () => {
       // isn't itself most of the value. Assert both the fixed shape AND that
       // no substring of the original secret longer than that 4-char prefix
       // ever appears in the preview, so a regression that widens the
-      // revealed prefix (or un-masks a "fully masked" kind) still fails this
-      // guard even if it keeps some other shape that happens to match a
-      // looser regex.
+      // revealed prefix still fails this guard even if it keeps some other
+      // shape that happens to match a looser regex.
       assert.match(
         item.preview,
         /^(?:.{4})?\*{8}$/u,

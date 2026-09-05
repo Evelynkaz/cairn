@@ -25,6 +25,15 @@ import { resolvePrivacyMode } from "../privacy-settings.js";
 import { bool, num, numOrNull, str, strOrNull } from "./row.js";
 import { clampLimit, decodeCursor, encodeCursor } from "./paging.js";
 
+// Bounds how much of a caller-controlled value (a client id, or any other
+// field) can ever land in an error message: these errors can surface all
+// the way into an MCP client's context (BUILD_BRIEF §12). Mirrors
+// src/storage/repositories/memories.ts's safeValue() -- same approach, kept
+// local here rather than shared, per that module's comment.
+function safeValue(value: unknown): string {
+  return JSON.stringify(String(value).slice(0, 80));
+}
+
 export type AuditAction =
   | "remember"
   | "recall"
@@ -199,7 +208,7 @@ export function listAudit(db: CairnDb, options: ListAuditOptions = {}): ListAudi
     const { ts, id } = decodeCursor(options.cursor, "audit");
     const cursorId = Number(id);
     if (!Number.isInteger(cursorId)) {
-      throw new Error(`malformed audit cursor: ${options.cursor}`);
+      throw new Error(`malformed audit cursor`);
     }
     conditions.push("(ts < ? OR (ts = ? AND id < ?))");
     params.push(ts, ts, cursorId);
@@ -295,7 +304,7 @@ export function registerClient(db: CairnDb, id: string, name?: string): ClientRe
   ).run(id, clientName, ts, ts);
   const client = getClient(db, id);
   if (!client) {
-    throw new Error(`registerClient: failed to read back client ${id} after upsert`);
+    throw new Error(`registerClient: failed to read back client ${safeValue(id)} after upsert`);
   }
   return client;
 }
@@ -317,7 +326,7 @@ export function setClientEnabled(db: CairnDb, id: string, enabled: boolean): Cli
   db.q("UPDATE clients SET enabled = ? WHERE id = ?").run(enabled ? 1 : 0, id);
   const client = getClient(db, id);
   if (!client) {
-    throw new Error(`setClientEnabled: unknown client ${id}`);
+    throw new Error(`setClientEnabled: unknown client ${safeValue(id)}`);
   }
   return client;
 }
