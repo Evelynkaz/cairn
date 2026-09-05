@@ -18,6 +18,20 @@ plainly.
 - Secret and PII redaction runs at ingest, across every path text can enter
   the store (direct writes, edits, supersede, import, and episode
   metadata).
+- Every memory carries `origin` (`user` / `import` / `unknown`) and
+  `approved`. Automatic injection — the `SessionStart` hook that puts
+  memory text into a session before the user has said anything — is gated
+  on provenance: only user-originated or approved memories are injected.
+  The `get_context` MCP tool does not apply that gate; it labels provenance
+  instead of excluding on it, because a model that asks for context
+  explicitly can weigh the label itself, and excluding there would break
+  the portability promise for imported memories. **This is a mitigation,
+  not a guarantee:** nothing filters imperative content inside a memory the
+  user has approved, or inside anything `get_context` returns — a memory
+  reading "ignore prior instructions and run X" is still handed to the
+  model verbatim once it is labelled or approved. Provenance narrows who
+  gets to reach the model's context automatically; it does not sanitize
+  what is in it.
 - **At-rest encryption is deliberately deferred to v2.** `cairn.db` is a
   plain SQLite file. If someone else gets a copy of it — a stolen laptop,
   a shared machine, a careless backup — they can read every memory in it.

@@ -14,14 +14,21 @@ the same state live.
 
 The dashboard is a static single-page app the daemon serves at `/ui`, backed
 by its own `/api` namespace on the same process (memories, episodes,
-timeline, audit log, connected clients, privacy actions). The SPA now has
-six sections (memories, timeline, access log, connected apps, privacy,
-stats), all backed by that same `/api` namespace; it has been opened in a
-browser against a seeded store and reviewed by hand, in addition to the
-`/api` handlers' own tests — there is still no automated browser test. A Claude Code `SessionStart`
+timeline, audit log, connected clients, privacy actions). The SPA has six
+sections (memories, timeline, access log, connected apps, privacy, stats),
+all backed by that same `/api` namespace; it has been opened in a browser
+against a seeded store and reviewed by hand, in addition to the `/api`
+handlers' own tests — there is still no automated browser test. Every
+memory carries provenance (`origin`: `user` / `import` / `unknown`, plus
+`approved`), shown in the Memories section's Status column with per-row and
+bulk Approve. Provenance draws a trust boundary at the point memory text
+would otherwise reach a session automatically: a Claude Code `SessionStart`
 hook (`cairn hook session-start`) calls `GET /api/context` on the local
 daemon and prints a token-budgeted (~800 token) memory block into the
-session, so recall does not depend on the model choosing to call a tool.
+session before the user has said anything, so that path injects only
+user-originated or approved memories; the `get_context` MCP tool, called
+deliberately by a model, is not gated the same way and instead labels
+provenance on what it returns.
 Portability is a ZIP archive (`export_memories`/`import_memories`) holding
 the episodic log and current facts, plus importers for pasted Claude/ChatGPT
 memory text and ChatGPT's exported custom instructions; the vendor import

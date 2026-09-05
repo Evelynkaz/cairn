@@ -19,7 +19,7 @@ Status against BUILD_BRIEF §16's eleven milestones, read from `git log --onelin
 | 6 | Cross-client integration test | done — `feat(integration)` |
 | 7 | Dashboard | done — six sections rendered and screenshotted (`691c69a`, `329b842`, `9a49164`, `9ea55ee`, `063d621`, `1b7ae7d`); no automated browser test |
 | 8 | Privacy (redaction, delete-everything) | done — `feat(privacy)`, hardened by `f4dd3c9` and `6d08e56` (see §1a) |
-| 9 | Recall hook (Claude Code SessionStart) | done — `f58cb2a` |
+| 9 | Recall hook (Claude Code SessionStart) | done — `f58cb2a`, provenance-gated by `27d5b03` (see §1a) |
 | 10 | Portability (export/import, Claude/ChatGPT importers) | done — a dependency-free ZIP codec (`196840d`), a manifest'd archive format with id-preserving import of both memories and episodes (`eadc98c`, `30f674b`, `55e016e`), `export_memories`/`import_memories` (`c1eca59`), the vendor importers wired to dashboard routes (`93fa972`, `1b7ae7d`); never run against a real vendor export (§8) |
 | 11 | Polish (README hero GIF, demo GIF, MIT LICENSE, CI 3 OSes) | blocked — package renamed and published-ready (`114cd47`), screenshots exist, but **CI is not running at all right now** (§1b) and the GIFs still need a human at a screen |
 
@@ -31,12 +31,18 @@ time, and the fixes for those in turn needed a rework pass of their own. Read
 §1a before touching `src/privacy`, `src/retrieval`, `src/daemon`, or
 `src/portability`.
 
-Current test count: **936 tests, 931 pass, 0 fail, 5 skipped**, verified
-locally on Linux (`6d08e56`). This project has been burned twice on
+Current test count: **971 tests, 965 pass, 0 fail, 6 skipped**, verified
+locally on Linux (`27d5b03`). This project has been burned twice on
 trusting a raw pass/skip count without reading what changed it (§5) — the
-skip count and the 5 remaining skips are unchanged from the last handoff
-and are the platform-only assertions recorded in CONTRIBUTING.md, not new
-gaps.
+6th skip (up from 5) is a new `ensureHome` test added in `27d5b03` that
+skips under `process.getuid?.() === 0`, per CONTRIBUTING.md's root-skip
+rule; this session runs as root (`id -u` is `0`), so it is expected here,
+not a new gap.
+
+This paragraph is a snapshot, not a promise: it will drift again the next
+time a commit changes the count. §2 no longer pastes the `node --test`
+summary for the same reason — run `npm test` yourself rather than trusting
+a transcript that looks current and isn't.
 
 ### 1a. The security audits and the rework — read this before touching privacy, retrieval, the daemon, or portability
 
@@ -102,7 +108,7 @@ that risk as live, not historical, until CI billing is fixed and a run
 goes green on all three OSes again.
 
 **What WAS verified by hand on this Linux machine**, and is real evidence
-even though it is not the three-OS matrix: the full 936-test suite;
+even though it is not the three-OS matrix: the full 971-test suite;
 `npm run typecheck` across all three `tsconfig` projects; `verify-package`
 against 162 packaged files; `npm pack` followed by installing the tarball
 outside this repo, running the installed CLI, starting the packed
@@ -111,7 +117,27 @@ daemon, getting a 200 from `/health`, and stopping it; and
 for the Windows/macOS legs — it rules out a broken package, not a
 platform-specific bug.
 
-## 2. How to run it — every command below was executed in this session
+### 1c. `27d5b03` — provenance, and a hand audit standing in for the CI this project doesn't have
+
+Two bodies of work landed together. First, provenance: memories now carry
+`origin` (`user` / `import` / `unknown`) and `approved`; the SessionStart
+hook injects only user-originated or approved memories (§1a, §4); the
+`get_context` tool still returns imported memories but labels them instead
+of excluding them, because a model that asks for context deliberately can
+weigh that itself. Rows written before this migration are `unknown`, not
+back-filled as `user` — **an existing store's SessionStart block goes empty
+until its memories are approved in the dashboard**, which is a real
+upgrade surprise, recorded in CHANGELOG.md's Unreleased section on purpose.
+
+Second, since CI still cannot run (§1b), an audit was done by hand as its
+substitute and found that the day's own security work had broken macOS
+outright (`export_memories`'s symlink guard compared a realpath'd
+directory against a home that was never realpath'd, and macOS's `/var` is
+a symlink) plus Windows reserved-device-name bypasses, two unguarded
+`fchmodSync` calls, and a test that would have hung six hours rather than
+failed. All are fixed on this branch; **none of it is verified on real
+Windows or macOS hardware** — §1b still applies, this was found and fixed
+by reading and reproducing on Linux, not by running the actual platform.
 
 ```
 $ npm install
@@ -132,16 +158,14 @@ $ npm run typecheck
 (no output; three projects, all clean)
 
 $ npm test          # runs: clean -> build -> node --test dist/**/*.test.js
-...
-1..936
-# tests 936
-# suites 0
-# pass 931
-# fail 0
-# cancelled 0
-# skipped 5
-# todo 0
 ```
+
+The exact `node --test` summary (tests/pass/fail/skipped counts) is
+deliberately not pasted here anymore. It drifted five times in one day —
+every count in this document is a snapshot of one commit, not a live
+value, and a transcript that looks like a terminal invites trust a stale
+number hasn't earned. Run `npm test` yourself; at `27d5b03` it was 971
+tests, 965 pass, 0 fail, 6 skipped (see §1).
 
 The build is still three `tsc` invocations plus one asset-copy step, not
 one: `tsconfig.json` (Node-only root project), `tsconfig.ui.json` (the
@@ -270,7 +294,8 @@ and `src/cli`.
 - **The dashboard must never be able to pause itself, and its client id is reserved.** `DASHBOARD_CLIENT` (`src/config/identity.ts`) is the id the dashboard stamps on its own store calls; the store's `gate()` refuses every gated call from a disabled client with no bypass, so if the dashboard's own id could be disabled, the very next request — including the one that would re-enable it — would be refused, locking the user out with no recovery short of hand-editing SQLite. `sourceClientName()` in `src/mcp/tools.ts` refuses to let any MCP client claim that name, so nothing can be impersonated into (or out of) the un-pauseable guard (`329b842`).
 - **No CORS headers and no preflight handler, anywhere, ever.** `src/daemon/server.ts` requires an `Authorization` bearer token on `/api`, which is what forces a browser to send a CORS preflight it never answers — that absence is the actual boundary against a cross-origin page reading the store, not something to "fix" if a browser console complains (`329b842`).
 - **`degradedReason` never leaves the process.** `toSafeDegradedReason` now lives once, beside the `SearchResult.degradedReason` field it describes (`5963277`, undoing an earlier duplication) — a raw embedding-provider error can carry a URL, hostname, or upstream error body, and both `/api/stats`-shaped routes and `/api/context` report a fixed `"embedding_failed"` string through that one shared helper instead (`063d621`). The `degraded` boolean itself is unchanged and safe to expose.
-- **The SessionStart hook (`cairn hook session-start`, `src/cli/hook.ts`) always exits 0 and writes only the envelope to stdout.** For that hook, stdout *is* model context — a stray diagnostic line becomes something the model reads and may act on. No daemon, a refused connection, a 401, a 500, malformed JSON, or an unexpected throw all end the same way: exit 0, empty stdout, diagnostics (if any) to stderr. It also enforces its own ~2s deadline shared across draining stdin, the daemon check, and the fetch, rather than trusting whatever timeout the calling client happens to use (`f58cb2a`). **This hook injects memory text into a session's single highest-trust position with nothing yet constraining imperative content inside a stored memory** — see §8, this is the next mitigation worth building, not a solved problem.
+- **The SessionStart hook (`cairn hook session-start`, `src/cli/hook.ts`) always exits 0 and writes only the envelope to stdout.** For that hook, stdout *is* model context — a stray diagnostic line becomes something the model reads and may act on. No daemon, a refused connection, a 401, a 500, malformed JSON, or an unexpected throw all end the same way: exit 0, empty stdout, diagnostics (if any) to stderr. It also enforces its own ~2s deadline shared across draining stdin, the daemon check, and the fetch, rather than trusting whatever timeout the calling client happens to use (`f58cb2a`). **This hook injects memory text into a session's single highest-trust position, and provenance is the gate on that, not a content filter.** Every memory carries `origin`/`approved` (`27d5b03`); this hook injects only user-originated or approved memories, so an imported or unreviewed memory can carry imperative text without it reaching a session automatically. The `get_context` MCP tool is a different trust boundary and is not gated the same way — see the next bullet.
+- **`get_context` labels provenance instead of gating on it, and rows predating the migration are `unknown` until approved.** A model calling the tool deliberately can weigh a labelled imported memory itself, and excluding it there would silently break the portability promise for anyone who imported Claude/ChatGPT memories; only the automatic `SessionStart` path (above) excludes. `importMemory` re-derives `origin`/`approved` rather than trusting an archive's own claim — a crafted archive could otherwise self-certify as `user`-originated (`27d5b03`). A gate is only real if there is a verified way through it: the first version of this shipped with nothing calling `setMemoryApproved` (no route, no UI, no tool), so an upgraded store's SessionStart block went silent with no way to approve anything; there is now a per-row and bulk approve route and dashboard control, watched end to end on the live store (0 injected → 16).
 - **`export_memories` writes with `wx` and refuses the daemon's own files by name, and containment is checked by realpath, not string comparison.** A lexical containment check never sees a symlinked parent directory, and string-identity file-name checks miss a trailing space, a trailing dot, or an alternate-data-stream suffix — all of which can alias `cairn.db` on some filesystem (`e6fa952`, `3e272af`).
 - **Import runs in one transaction, episodes and memories together.** A checksum-valid archive containing one row the store rejects used to leave the store permanently half-imported with no record of where it stopped; one transaction now covers the whole loop (`0085bd2`).
 - **An archive entry is capped at an absolute 64 MiB, not a derived one**, checked before any decoding — a derived cap bounded nothing, and a 410 KB archive alone drove a V8 heap fatal before this was fixed (`e6fa952`, `1963819`).
@@ -299,12 +324,15 @@ it does not write code. Every file change goes through a builder agent
 skill runs that full loop; use it for anything that changes files rather
 than improvising the handoff.
 
-Three working rules this project now holds itself to, each learned from
-an incident recorded in §1a/§5 rather than adopted in the abstract:
+Six working rules this project now holds itself to, each learned from
+an incident recorded in §1a/§5/§1c rather than adopted in the abstract:
 
 1. **A regression test must be shown to fail against the unfixed code before it is trusted** — revert, run, watch it fail, restore. A test that has never failed has not proven anything yet, and this project has had a false-positive test slip through review on exactly this gap.
 2. **Many tests failing off one change is one signal, not many.** Nine tests each independently rationalized with `minRelevance: 0` was the same defect reported nine times; the question to ask first is what the failures say in common, not why each one is individually fine.
 3. **Isolation between parallel workers has to be real, not agreed.** A shared working tree partitioned by file-list convention is not isolation — git operates on the whole repository and does not know the convention exists. Use `git worktree add <tmp> HEAD`, copy in only the files you own, and verify there.
+4. **Only pixels can judge a visual defect.** A provenance column rendered correctly in the DOM, typechecked, and passed 971 tests while being painted underneath a `position: sticky` column and invisible to the user — it survived two rounds of code review before anyone actually looked at a screen. Corollary, now in the code as a comment: nothing that must stay readable belongs immediately left of a sticky column.
+5. **Every prohibition needs a verified way out.** Provenance gating was built correctly and shipped with nothing able to call `setMemoryApproved` — no route, no UI, no tool. On the live store the hook went silent with 18 memories and no way to approve any of them. Verify that a user can still act, not merely that the guard fires.
+6. **`git stash` is repository-wide.** A worktree (rule 3) isolates file edits but NOT the stash; a stash taken inside a throwaway worktree appears in the main repository's stash list and can be popped over live work there.
 
 Older verification discipline that still holds:
 - **A claim is not reported until it has been reproduced**, ideally on the actual failing platform — "Local measurement is not evidence here: this Windows machine reports 0/60 both before and after. CI on macOS and ubuntu is the decisive check" (`25bfb73`).
@@ -329,7 +357,7 @@ the next session can pick up and finish alone.
 
 **Open engineering work, pick-up-able by the next session:**
 - **No automated browser test exists.** The dashboard has been rendered and reviewed by a human once (§2); the mount closures beyond the pure helpers they call remain untested by anything automated.
-- **The SessionStart hook has no defence against a memory's own content.** It injects memory text into a session's highest-trust position, and nothing today constrains imperative content inside a stored memory (§4). The mitigation worth building is a provenance flag so imported memories are excluded from injection until a human has reviewed them in the dashboard — not a content filter, which is easy to evade; a trust-tier on the memory itself.
+- ~~The SessionStart hook has no defence against a memory's own content.~~ Closed by `27d5b03`: memories now carry `origin`/`approved`, and the hook injects only user-originated or approved rows (§4). What's left open is the limit already stated there and in SECURITY.md — nothing filters imperative content inside a memory the user *has* approved, or inside anything `get_context` returns labelled. That is a content-filtering problem, deliberately not attempted here because a filter is easy to evade; if it's ever tackled, it is additive to provenance, not a replacement for it.
 
 `package.json` has no `files`-shaped concern left open (`edb359c`,
 `c47f9ca`, `0085bd2`, `d4ccdec` closed that loop and `verify-package` now
