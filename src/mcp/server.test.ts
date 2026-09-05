@@ -8,6 +8,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { rmSync } from "node:fs";
+import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ResourceListChangedNotificationSchema, ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -87,6 +88,18 @@ interface ForgetConfirmedResult {
   deleted: boolean;
   count: number;
   ids: string[];
+}
+
+interface ExportResult {
+  path: string;
+  bytes: number;
+  memories: number;
+  episodes: number;
+}
+
+interface ImportResult {
+  imported: number;
+  skipped: number;
 }
 
 interface TestEnv {
@@ -181,12 +194,24 @@ function firstResourceText(contents: Array<{ uri: string; text: string } | { uri
   return first.text;
 }
 
-test("tools/list returns exactly the six §6 tools, by exact name", async () => {
+test("tools/list returns exactly the eight §6 tools, by exact name", async () => {
   await withServer(async ({ client }) => {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 6);
+    // 8 is a deliberate ceiling (§6/§2: export_memories/import_memories are
+    // one conceptual slot), not an incidental number -- read tools.ts's
+    // opening comment before changing this.
+    assert.equal(tools.length, 8);
     const names = tools.map((t) => t.name).sort();
-    assert.deepEqual(names, ["forget", "get_context", "list_memories", "recall", "remember", "update_memory"]);
+    assert.deepEqual(names, [
+      "export_memories",
+      "forget",
+      "get_context",
+      "import_memories",
+      "list_memories",
+      "recall",
+      "remember",
+      "update_memory",
+    ]);
   });
 });
 
@@ -203,12 +228,16 @@ const TOOL_PRIMARY_PARAM: Record<string, string> = {
   list_memories: "scope",
   update_memory: "id",
   forget: "query",
+  export_memories: "path",
+  import_memories: "path",
 };
 
 test("every tool description says WHEN to call it and gives an example invocation of its own primary parameter", async () => {
   await withServer(async ({ client }) => {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 6);
+    // 8 is a deliberate ceiling (§6/§2), not an incidental number -- read
+    // tools.ts's opening comment before changing this.
+    assert.equal(tools.length, 8);
     for (const tool of tools) {
       const description = tool.description ?? "";
       assert.ok(description.trim().length > 40, `${tool.name} has a real description`);
@@ -445,6 +474,8 @@ const TOOL_PROBE_ARGS: Record<string, Record<string, unknown>> = {
   list_memories: {},
   update_memory: { id: "does-not-exist", content: `update attempted while paused ${LEAK_MARKER}` },
   forget: { query: LEAK_MARKER },
+  export_memories: {},
+  import_memories: { path: "/does-not-exist-pause-probe.zip" },
 };
 
 test("the tool probe table covers exactly the registered tool set", async () => {
@@ -470,7 +501,7 @@ async function assertResourceReadRefused(client: Client, uri: string): Promise<v
   );
 }
 
-test("a paused client is refused on every one of the six tools, and none returns memory content", async () => {
+test("a paused client is refused on every one of the eight tools, and none returns memory content", async () => {
   const clientName = "paused-mcp-client";
   await withServer(async ({ client, store }) => {
     const seeded = await callJson<RememberResult>(client, "remember", { content: `seed memory containing ${LEAK_MARKER}` });
@@ -724,5 +755,69 @@ test("a peer whose transport has already failed does not make the mutating clien
       await b.client.close();
       await b.server.close();
     }
+  });
+});
+
+// The chronology property archive.test.ts defends at the storage layer,
+// re-checked here through the MCP layer: export_memories writes a real
+// file, and import_memories into a DIFFERENT store must bring the
+// memories back with their original ids (BUILD_BRIEF §10 -- created_at is
+// derived from the id, so a fresh id on import would collapse the
+// original chronology).
+test("export_memories then import_memories into a different store round-trips original ids", async () => {
+  const sourceDir = makeTempDir();
+  const destDir = makeTempDir();
+  const sourceStore = openStore({ path: tempDbPath(sourceDir) });
+  const destStore = openStore({ path: tempDbPath(destDir) });
+  const sourceServer = createMcpServer({ store: sourceStore });
+  const destServer = createMcpServer({ store: destStore });
+  const sourceClient = new Client({ name: "source-client", version: "1.0.0" });
+  const destClient = new Client({ name: "dest-client", version: "1.0.0" });
+  const [sourceServerTransport, sourceClientTransport] = InMemoryTransport.createLinkedPair();
+  const [destServerTransport, destClientTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await Promise.all([sourceServer.connect(sourceServerTransport), sourceClient.connect(sourceClientTransport)]);
+    await Promise.all([destServer.connect(destServerTransport), destClient.connect(destClientTransport)]);
+
+    const first = await callJson<RememberResult>(sourceClient, "remember", { content: "First exported memory." });
+    const second = await callJson<RememberResult>(sourceClient, "remember", { content: "Second exported memory." });
+
+    const archivePath = join(sourceDir, "export.zip");
+    const exported = await callJson<ExportResult>(sourceClient, "export_memories", { path: archivePath });
+    assert.equal(exported.path, archivePath);
+    assert.ok(exported.bytes > 0);
+    assert.equal(exported.memories, 2);
+
+    const imported = await callJson<ImportResult>(destClient, "import_memories", { path: archivePath });
+    assert.equal(imported.imported, 2);
+    assert.equal(imported.skipped, 0);
+
+    const destIds = destStore.list({ limit: 200 }).items.map((m) => m.id).sort();
+    assert.deepEqual(destIds, [first.id, second.id].sort());
+
+    const again = await callJson<ImportResult>(destClient, "import_memories", { path: archivePath });
+    assert.equal(again.imported, 0, "re-importing the same archive must import nothing the second time");
+    assert.equal(again.skipped, 2);
+  } finally {
+    await sourceClient.close();
+    await sourceServer.close();
+    await destClient.close();
+    await destServer.close();
+    sourceStore.close();
+    destStore.close();
+    try {
+      rmSync(sourceDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      rmSync(destDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch {
+      // Best-effort: never mask the real failure from fn() with a cleanup error.
+    }
+  }
+});
+
+test("import_memories on a nonexistent path returns a clear error, not an unhandled throw", async () => {
+  await withServer(async ({ client }) => {
+    const { isError, text } = await callTool(client, "import_memories", { path: "/no/such/archive-for-this-test.zip" });
+    assert.equal(isError, true, "importing a nonexistent path must return isError: true, not throw unhandled");
+    assert.ok(text.length > 0, "the error must say something clear");
   });
 });

@@ -163,13 +163,18 @@ test("the daemon starts, /health reports ok and a live memory count, and the run
   });
 });
 
-test("a real MCP client connects over Streamable HTTP, lists six tools, remembers and recalls", async () => {
+test("a real MCP client connects over Streamable HTTP, lists eight tools, remembers and recalls", async () => {
   await withDaemon(async (handle) => {
     const { client, transport } = connectClient(handle);
     await client.connect(transport);
     try {
       const { tools } = await client.listTools();
-      assert.equal(tools.length, 6);
+      // Eight is a deliberate ceiling (BUILD_BRIEF §6/§2), not incidental: the
+      // brief lists seven line items with export_memories/import_memories joined
+      // by a slash; registering both as separate tools makes eight. This is the
+      // recorded decision — src/mcp/server.test.ts asserts the same count, so
+      // change both together.
+      assert.equal(tools.length, 8);
 
       const remembered = await callJson<RememberResult>(client, "remember", { content: "Daemon transport check." });
       assert.ok(remembered.id);

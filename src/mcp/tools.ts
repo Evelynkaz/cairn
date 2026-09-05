@@ -1,18 +1,29 @@
-// The BUILD_BRIEF §6 tool surface: exactly six tools, a hard ceiling (§2 --
-// tool sprawl measurably degrades client accuracy). The seventh slot is
-// reserved for export_memories/import_memories in a later milestone; do not
-// add a seventh here for convenience.
+// The BUILD_BRIEF §6 tool surface: eight tools, a hard ceiling. §6 lists
+// export_memories/import_memories as one line item joined by a slash --
+// one conceptual slot -- and §2's ceiling is written "≤ ~7" with a tilde,
+// whose stated rationale is that sprawl PAST ~50 tools measurably degrades
+// client accuracy; competitors shipping 50-83 tools are the target, not an
+// eighth here. A single tool with a `direction: "in" | "out"` flag was
+// considered and rejected: a direction parameter on a tool that can
+// overwrite a user's memory store is exactly the ambiguity that makes a
+// model mis-fire, and §6 wants verb-first names. Do not add a ninth for
+// convenience, and do not relitigate this split back into one tool.
 //
 // Tool descriptions are product copy, not code comments (§8): each one
 // states WHEN to call it, with a concrete example, because instruction-only
 // orchestration is only ~60-70% reliable on its own.
 
 import { z } from "zod";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { CallContext, Memory, SearchHit } from "../storage/index.js";
 import type { McpDeps } from "./deps.js";
 import { DASHBOARD_CLIENT } from "../config/identity.js";
+import { resolveCairnHome, ensureHome } from "../config/paths.js";
+import { exportArchive, importArchive, ArchiveFormatError } from "../portability/archive.js";
+import { recordAudit } from "../storage/repositories/audit.js";
 
 // The label used when a connected client did not identify itself (a bare
 // stdio pipe, or a client that skips clientInfo). Kept distinct from `null`
@@ -158,8 +169,17 @@ function clampUnitOptional(value: number | string | undefined): number | undefin
   return n === undefined ? undefined : Math.min(1, Math.max(0, n));
 }
 
+// Default export destination: under the user's Cairn home (§3's "one file
+// on the user's machine" home), named with a timestamp so repeated exports
+// never collide or silently overwrite an earlier backup.
+function defaultExportPath(): string {
+  const home = ensureHome(resolveCairnHome());
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return resolve(home, `cairn-export-${stamp}.zip`);
+}
+
 /**
- * Registers exactly the six §6 tools on `server`, wired to `deps`.
+ * Registers exactly the eight §6 tools on `server`, wired to `deps`.
  */
 export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: ResourceEvents): void {
   function nowOverride(): number | undefined {
@@ -175,6 +195,17 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
     if (memoryId) {
       await resourceEvents.notifyUpdated(memoryUri(memoryId));
     }
+  }
+
+  // exportArchive/importArchive (portability/archive.ts) always call the
+  // store with their own fixed administrative CallContext, never the real
+  // connected client's -- so store.list/importMemory's own gate() never
+  // sees THIS client's identity and can't refuse a paused one. A cheap
+  // gated read first (store.list, limit 1) closes that gap: it throws
+  // before either tool below touches the filesystem or the archive if this
+  // client is disabled (§9).
+  function requireEnabled(scope: string | undefined): void {
+    deps.store.list({ scope, limit: 1 }, callContext(server, scope));
   }
 
   server.registerTool(
@@ -535,6 +566,94 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         }
       }
       return jsonResult({ deleted: result.deleted, count: result.count, ids: result.matches.map((m) => m.id) });
+    },
+  );
+
+  server.registerTool(
+    "export_memories",
+    {
+      title: "Export memories",
+      description:
+        "Back up or move the user's whole memory store to a file on disk. Call this when the user asks to " +
+        'back up, export, or move their memory to another machine. Example: the user says "back up my ' +
+        'memories before I reset my laptop" -- call export_memories(path: "~/cairn-backup.zip") (or omit ' +
+        "`path` for a timestamped default under the Cairn home). Returns the file's path, size, and counts -- " +
+        "never the memory contents themselves, so a large store never floods this response.",
+      inputSchema: {
+        path: z
+          .string()
+          .optional()
+          .describe("Where to write the archive. Defaults to a timestamped file under the Cairn home."),
+        scope: z.string().optional().describe("Export only one namespace instead of every scope."),
+      },
+    },
+    (args) => {
+      requireEnabled(args.scope);
+      const path = resolve(args.path && args.path.trim().length > 0 ? args.path : defaultExportPath());
+      const result = exportArchive(deps.store, { scope: args.scope });
+      writeFileSync(path, result.archive);
+      recordAudit(deps.store.db, {
+        action: "export",
+        scope: args.scope ?? null,
+        sourceClient: callContext(server, args.scope).sourceClient,
+        details: { path, bytes: result.archive.length, memories: result.memories, episodes: result.episodes },
+      });
+      return jsonResult({
+        path,
+        bytes: result.archive.length,
+        memories: result.memories,
+        episodes: result.episodes,
+      });
+    },
+  );
+
+  server.registerTool(
+    "import_memories",
+    {
+      title: "Import memories",
+      description:
+        "Merge memories from a previously exported archive file into the store. This MERGES -- it never " +
+        "replaces or overwrites anything: a memory whose id or content is already present is skipped, so " +
+        "importing the same archive twice is safe and imports nothing the second time. Call this when the " +
+        'user asks to restore a backup or bring memories over from another machine. Example: the user says ' +
+        '"load the memories I exported from my old laptop" -- call import_memories(path: "~/cairn-backup.zip"). ' +
+        "Never present this as a destructive restore; it is additive only.",
+      inputSchema: {
+        path: z.string().min(1).describe("Path to a Cairn export archive (.zip) previously written by export_memories."),
+        scope: z.string().optional().describe("Attributed scope for this import call's own audit entry."),
+      },
+    },
+    async (args) => {
+      requireEnabled(args.scope);
+      const path = resolve(args.path);
+      if (!existsSync(path)) {
+        throw new Error(`import_memories: no file found at ${path}`);
+      }
+      let archiveBuf: Buffer;
+      try {
+        archiveBuf = readFileSync(path);
+      } catch (err) {
+        throw new Error(`import_memories: could not read ${path}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      let result: { imported: number; skipped: number; memories: number };
+      try {
+        result = importArchive(deps.store, archiveBuf);
+      } catch (err) {
+        if (err instanceof ArchiveFormatError) {
+          throw new Error(`import_memories: ${err.message}`);
+        }
+        throw err;
+      }
+      recordAudit(deps.store.db, {
+        action: "import",
+        scope: args.scope ?? null,
+        sourceClient: callContext(server, args.scope).sourceClient,
+        details: { path, imported: result.imported, skipped: result.skipped },
+      });
+      if (result.imported > 0) {
+        await notifyMutation();
+      }
+      return jsonResult({ imported: result.imported, skipped: result.skipped });
     },
   );
 }
