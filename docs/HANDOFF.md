@@ -236,6 +236,40 @@ SSH tunnel (§8) — the five screenshots from that session live in
 closures are deliberately untested beyond the pure helpers they call;
 see §8. Do not run bare `cairn setup`; see §4/§7 and CONTRIBUTING.md.
 
+### 1d. Published, then broken twice, then fixed — read this before trusting "CI is green" as "the package works"
+
+`cairn-mem` is now on the npm registry: `0.1.0` was the first publish,
+`0.1.1` and `0.1.2` are patches, `0.1.2` is `latest`. npm does not allow
+republishing or safely unpublishing a version, so all three exist on the
+registry permanently; do not try to remove `0.1.0`/`0.1.1` (docs/RELEASING.md §5).
+
+Both patches exist because of bugs that a green CI run and a successful
+`npm publish` did not catch, and could not have caught the way they were
+checked:
+
+- **`0.1.0`'s bin entrypoint was broken.** The package's `bin` maps
+  `cairn` to `dist/cli/index.js`, which npm symlinks into
+  `node_modules/.bin`. Running it through that symlink — i.e. exactly how
+  `npx cairn-mem` and a globally-installed `cairn` actually invoke it —
+  failed silently. The release runbook's own post-publish check
+  (docs/RELEASING.md §4, before this session) ran the CLI by its
+  *resolved* `dist/cli/index.js` path, not through the symlink, so it
+  passed while the real front door was broken. Fixed in `0.1.1`.
+- **`0.1.1`'s `/health` reported a hardcoded, stale version.** The daemon
+  had its own version constant instead of reading `package.json`, so
+  `/health` kept reporting an old version after every bump. Fixed in
+  `0.1.2` (`16a65e0`, "read the version from package.json, not a
+  hardcoded constant").
+
+**The transferable lesson, not the two bugs:** a green CI run and a
+successful `npm publish` are not evidence that the installed package
+works. Both are evidence about the *build*, not the *artifact a user
+actually gets*. The only check that caught either bug was installing
+`cairn-mem` from the registry into a scratch directory and running it the
+way a real user does — through `npx`/the bin shim, not a resolved dist
+path. Publishing is not the finish line; docs/RELEASING.md §4 now makes
+this verification step explicit and prominent for exactly this reason.
+
 ## 3. The map
 
 | Directory | What lives there | Depends on |
@@ -345,7 +379,7 @@ Older verification discipline that still holds:
 ## 7. Open decisions that belong to the human
 
 - **The package name is settled, not open.** The npm package is `cairn-mem` (`114cd47`) — `cairn` is an unrelated React Native styling library, `cairn-memory` is an active direct competitor on Elastic-2.0, `cairn-mcp` is another project. The product name stays Cairn, the bin stays `cairn`, the MCP server id clients see stays `cairn`, and `~/.cairn`/`CAIRN_HOME`/`CAIRN_PORT`/the dashboard client id are all unchanged. `cairn setup` now writes `npx -y cairn-mem@latest` into every client config it generates.
-- **Publishing itself is the one thing left, and it is blocked on the owner's npm account, not a decision.** `npm publish --dry-run` succeeds end to end (§1b); the actual `npm publish` needs the owner's credentials, which this session does not have.
+- ~~**Publishing itself is the one thing left, and it is blocked on the owner's npm account, not a decision.**~~ Resolved: published as `cairn-mem`, current `latest` is `0.1.2`. Two bugs shipped in the first two versions and both were found only by installing the published package and running it as a user, not by CI or the test suite — see §1d.
 - **The demo/hero GIF.** BUILD_BRIEF §15 wants a hero GIF (Claude tells it something, Cursor recalls it) and a launch demo GIF — both need a human at a screen with a working dashboard. The dashboard exists and is screenshotted (`assets/`), so this is unblocked except for the human and the screen.
 
 ## 8. What comes next
@@ -353,10 +387,10 @@ Older verification discipline that still holds:
 Split by who can move it, because most of what remains is not something
 the next session can pick up and finish alone.
 
-**Blocked on the project owner:** everything that blocks the actual publish
-— npm credentials and disk space — plus the order to do it in and how to
-verify each step, is now [docs/RELEASING.md](RELEASING.md); read that
-instead of reconstructing the steps here.
+**Blocked on the project owner:** the first publish is done (§1d); what
+remains still needs the owner (credentials for future releases, disk
+space, a real vendor export) is in [docs/RELEASING.md](RELEASING.md); read
+that instead of reconstructing the steps here.
 - ~~**GitHub Actions billing.**~~ Resolved: the owner made the repository
   public, which restores free unlimited Actions minutes regardless of
   billing status. The first real run (`5ef327e`) immediately found two
@@ -365,7 +399,7 @@ instead of reconstructing the steps here.
   fixed in `0d4e329`, after which all six jobs (`build`/`smoke` ×
   ubuntu/macos/windows) went green (§1b). This is what restored CI
   immediately bought: real defects reading the code could not find.
-- **`npm publish`.** The dry run passes; the real publish needs the owner's npm credentials.
+- ~~**`npm publish`.**~~ Done: `cairn-mem` is on the registry, `0.1.2` is `latest` (§1d). Future releases still need the owner's npm credentials — see docs/RELEASING.md.
 - **A real Claude or ChatGPT export.** `c2687d1`'s importer fixtures are built from documented and community-reported shapes, never a real Claude memory paste or a real ChatGPT `conversations.json` — the parsers are tested against constructed input, not reality, and only the owner can produce a real export to test against.
 - **Disk space.** This machine is at 100% (97G/99G used, 715M free), 47 GB of it in directories unrelated to this project — worth knowing before a build or `npm pack` fails for a reason that looks like a code problem and isn't.
 

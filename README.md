@@ -2,26 +2,30 @@
 
 **Persistent memory for your AI that you actually own — local-first, shared across every MCP client, one command to install, a dashboard to see and edit everything. No cloud, no account, no API key.**
 
+[![npm version](https://img.shields.io/npm/v/cairn-mem.svg)](https://www.npmjs.com/package/cairn-mem)
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)
 ![CI](https://github.com/Evelynkaz/cairn/actions/workflows/ci.yml/badge.svg)
 ![Node >=22.13](https://img.shields.io/badge/node-%3E%3D22.13-brightgreen.svg)
 
 ![Cairn dashboard hero screenshot](assets/hero.png)
 
-> Status: pre-release. The daemon, dashboard API, all MCP tools, the
-> SessionStart recall hook, and export/import are implemented and covered
-> by tests (1009 tests, 1003 passing, 0 failing, 6 skipped). CI is green on
-> all three platforms as of commit `0d4e329` — the unit suite on
-> ubuntu-latest/macos-latest/windows-latest, and a smoke test on each that
-> packs the tarball, installs it outside the repo, and confirms the daemon
-> starts and answers `/health`. That's evidence about the tree it ran on,
-> not a permanent guarantee. It is not yet published to npm. The
-> Claude/ChatGPT importers have still never been run against a real export
-> from either product, though import now previews before writing so a bad
-> parse is visible and reversible. The dashboard UI has been reviewed by
-> hand in a browser against a seeded store and judged good; no automated
-> browser test exists yet.
+> Status: published. Cairn ships to npm as [`cairn-mem`](https://www.npmjs.com/package/cairn-mem)
+> (current: `0.1.2`) — `npx cairn-mem` runs the real bin shim, `cairn
+> --version` and `/health` both report the correct version. The daemon,
+> dashboard API, all MCP tools, the SessionStart recall hook, and
+> export/import are implemented and covered by tests (1009 tests, 1003
+> passing, 0 failing, 6 skipped). CI is green on all three platforms — the
+> unit suite on ubuntu-latest/macos-latest/windows-latest, and a smoke test
+> on each that installs the tarball and runs it through `npx`, confirming
+> the daemon starts and answers `/health`. That's evidence about the
+> commit it ran on, not a permanent guarantee. The Claude/ChatGPT importers
+> have still never been run against a real export from either product,
+> though import now previews before writing so a bad parse is visible and
+> reversible. The dashboard UI has been reviewed by hand in a browser
+> against a seeded store and judged good; no automated browser test exists
+> yet.
+
+Repo: [github.com/Evelynkaz/cairn](https://github.com/Evelynkaz/cairn) · Package: [npmjs.com/package/cairn-mem](https://www.npmjs.com/package/cairn-mem)
 
 ## Why
 
@@ -33,15 +37,34 @@ Cairn's wedge: **local-first**, **zero-config** (`npx cairn-mem` and you're runn
 
 ## Install
 
-Not yet published to npm — `npx cairn-mem` is planned but not yet available.
-Today, run it from a clone:
+Published to npm as [`cairn-mem`](https://www.npmjs.com/package/cairn-mem):
+
+```bash
+npx cairn-mem        # run it — no install step, no keys, no Docker
+cairn setup          # wire up Claude Desktop / Claude Code / Cursor
+cairn ui             # open the dashboard
+```
+
+Or install it globally so the `cairn` command is always on `PATH`:
+
+```bash
+npm install -g cairn-mem
+cairn setup
+cairn ui
+```
+
+Every MCP client config `cairn setup` writes points at `npx -y
+cairn-mem@latest`, so clients always run the latest published version
+without a manual upgrade step.
+
+**From source**, for contributors:
 
 ```bash
 git clone https://github.com/Evelynkaz/cairn.git
 cd cairn
 npm install
 npm run build
-node dist/cli/index.js        # equivalent to the future `npx cairn-mem`
+node dist/cli/index.js        # equivalent to `npx cairn-mem`
 node dist/cli/index.js setup  # wire up Claude Desktop / Claude Code / Cursor
 node dist/cli/index.js ui     # open the dashboard
 ```
@@ -93,12 +116,10 @@ at ingest, the dashboard API, `cairn setup` / `cairn ui`, the Claude Code
 SessionStart recall hook, and export/import with pasted Claude/ChatGPT text
 and ChatGPT custom-instructions importers — all under test.
 
-**Still open before v1 is "done":** publishing to npm so `npx cairn-mem` works,
-an automated browser test for the dashboard (it has been reviewed by hand,
-but nothing checks it in CI), and the release housekeeping in
-`docs/BUILD_BRIEF.md` §13/§15 (hero GIF, cross-OS smoke test of the
-published package). See [docs/RELEASING.md](docs/RELEASING.md) for the
-publish runbook.
+**Still open before v1 is "done":** an automated browser test for the
+dashboard (it has been reviewed by hand, but nothing checks it in CI), and
+the hero/demo GIFs from `docs/BUILD_BRIEF.md` §15. See
+[docs/RELEASING.md](docs/RELEASING.md) for the release runbook.
 
 **Deferred to v2+:** knowledge-graph / graph view, multi-user/teams/RBAC, cross-device sync, at-rest encryption (SQLCipher), opt-in LLM enrichment (fact extraction/summarization), feedback re-ranking, opt-in auto-capture hooks, a LanceDB large-scale backend, and auto-config for more clients.
 
@@ -133,9 +154,9 @@ Note the vendor-side importers (pasted Claude/ChatGPT memory text, ChatGPT
 custom instructions) have not yet been exercised against a real export from
 either product.
 
-**What's not built yet?** Publishing to npm, an automated browser test for
-the dashboard (it has been reviewed by hand and looks good, but nothing
-checks it in CI), and everything under "Deferred to v2+" below.
+**What's not built yet?** An automated browser test for the dashboard (it
+has been reviewed by hand and looks good, but nothing checks it in CI),
+and everything under "Deferred to v2+" below.
 
 ## Contributing
 

@@ -1,14 +1,15 @@
 # Releasing Cairn
 
-An ordered runbook for the first (and every subsequent) `npm publish` of
-`cairn-mem`. Follow it top to bottom; don't skip a step because a nearby one
-looks green. Every command below is either a `package.json` script or a
-real CLI invocation used elsewhere in this repo (CI, CONTRIBUTING.md,
+An ordered runbook for every `npm publish` of `cairn-mem`. The first
+publish happened (§3.4) — this is now a repeatable process, not a
+one-time plan. Follow it top to bottom; don't skip a step because a nearby
+one looks green. Every command below is either a `package.json` script or
+a real CLI invocation used elsewhere in this repo (CI, CONTRIBUTING.md,
 docs/HANDOFF.md) — none of it is invented.
 
-This document assumes you have what the next session did not: a payment
-method on the GitHub Actions account, npm publish credentials, and enough
-disk to build with. See §6 before you start if disk is tight.
+This document assumes you have a payment method on the GitHub Actions
+account, npm publish credentials, and enough disk to build with. See §6
+before you start if disk is tight.
 
 ## 1. Preconditions
 
@@ -129,16 +130,17 @@ If this errors instead of printing a username, log in first:
 npm login
 ```
 
-**3.2 — Re-check the name is still free.** It was available hours/days ago
-(`npm view cairn-mem` returned 404 on 2026-09-05); names are claimed
-continuously, so re-check immediately before publishing, not from memory:
+**3.2 — Re-check the current published version against what you expect.**
+Someone else releasing in parallel, or a stale local memory of the last
+version shipped, is what this catches — re-check immediately before
+publishing, not from memory:
 ```
-npm view cairn-mem
+npm view cairn-mem version
 ```
-Expect: `npm error 404 Not Found` (the name is still unclaimed). If this
-instead prints package info, someone else has published `cairn-mem` first
-— stop, this is a decision for the project owner (rename, or contact npm
-support), not something to work around.
+Confirm it matches the last release you expect and that `package.json`'s
+`version` is the next one, not a repeat of something already on the
+registry — npm refuses to republish an existing version, but catching this
+before `npm publish` saves the round trip.
 
 **3.3 — Publish.**
 ```
@@ -147,14 +149,28 @@ npm publish
 `prepublishOnly` (in `package.json`) runs `clean` → `build` →
 `verify-package` automatically before the tarball is uploaded, so this
 cannot ship a stale `dist/` — if `verify-package` fails, the publish aborts
-before anything is sent. This is the first publish of this package: it
-both ships v0.1.0 *and* claims the `cairn-mem` name on the registry. There
-is no dry-run equivalent of "undo" once this succeeds — see §5 if it goes
-out broken.
+before anything is sent. There is no dry-run equivalent of "undo" once
+this succeeds — see §5 if it goes out broken.
 
-## 4. After publishing
+**3.4 — Release history.** `0.1.0` was the first publish and claimed the
+`cairn-mem` name. `0.1.1` and `0.1.2` are patches — both existed because
+§4's post-publish verification (run *after* those two shipped, not before)
+caught real bugs: `0.1.0`'s bin entrypoint was broken through the actual
+`npx`/symlink path, and `0.1.1`'s `/health` reported a hardcoded, stale
+version. `0.1.2` is `latest`. npm does not allow republishing or safely
+unpublishing a version, so all three permanently exist on the registry —
+see §5, do not attempt to remove the broken ones.
 
-Don't assume the registry has what you think you uploaded — verify it.
+## 4. After publishing — this is the step that has caught real bugs, do not skip or shortcut it
+
+Don't assume the registry has what you think you uploaded — verify it by
+running the package the way a real user does. **This is not a formality:**
+`0.1.0` and `0.1.1` each shipped a bug that a green CI run and a
+successful `npm publish` did not catch, and both were found only here, by
+installing the published package into a scratch directory and running it
+as a user would — not by CI, not by the test suite, not by running the
+resolved `dist/` path inside the repo. Treat §4.2 in particular as
+load-bearing, not optional:
 
 **4.1 — Install the published artifact into a scratch directory outside the repo**, the same shape as CI's `smoke` job:
 ```
@@ -163,35 +179,42 @@ npm init -y
 npm install cairn-mem
 ```
 
-**4.2 — Run the CLI by its resolved path** (not via a `bin` shim on PATH — see the comment in `.github/workflows/ci.yml`'s `smoke` job for why):
+**4.2 — Run the CLI through the actual bin shim, via `npx` — NOT via its resolved `dist/` path.**
+This is the one gotcha this runbook exists to flag: running
+`node node_modules/cairn-mem/dist/cli/index.js` bypasses the exact
+`node_modules/.bin` symlink that `npx cairn-mem` and a global install both
+go through, and that symlink path is precisely what was broken in `0.1.0`
+— a resolved-path check there would have stayed green while the real
+front door was broken. Always go through the shim:
 ```
-node node_modules/cairn-mem/dist/cli/index.js --version
-node node_modules/cairn-mem/dist/cli/index.js status
+npx --no-install cairn-mem --version
+npx --no-install cairn-mem status
 ```
 Expect `--version` to print the version you just published.
 
-**4.3 — Start the daemon, hit `/health`, stop it:**
+**4.3 — Start the daemon (again through the shim), hit `/health`, stop it:**
 ```
-CAIRN_HOME=/tmp/cairn-release-check/home node node_modules/cairn-mem/dist/cli/index.js start
-node node_modules/cairn-mem/dist/cli/index.js status --json   # read the daemon.url from this
+CAIRN_HOME=/tmp/cairn-release-check/home npx --no-install cairn-mem start
+npx --no-install cairn-mem status --json   # read the daemon.url from this
 curl -s http://127.0.0.1:<port-from-status>/health
-node node_modules/cairn-mem/dist/cli/index.js stop
+npx --no-install cairn-mem stop
 ```
-Expect a 200 from `/health`, and `stop` to report the daemon stopped.
+Expect a 200 from `/health`, **and confirm the version in the JSON body
+matches the version you just published** — `0.1.1`'s `/health` reported a
+hardcoded, stale version instead of reading `package.json`, and this is
+the check that would have caught it. `stop` should report the daemon
+stopped.
 
-**4.4 — Confirm the zero-config front door works**, since that's §2's
+**4.4 — Confirm the zero-config front door works from a clean cache**, since that's §2's
 actual promise:
 ```
 cd /tmp && npx cairn-mem@latest --version
 ```
 
-**4.5 — Update the README and CHANGELOG.** Both currently say "not yet
-published" / carry an `[Unreleased]`/`[0.1.0] - unreleased` heading with no
-date (see `README.md`'s "Status: pre-release" banner and Install section,
-and `CHANGELOG.md`'s top). Once the above all pass:
-- Fill in the CHANGELOG's release date and remove the "unreleased" framing.
+**4.5 — Update the README and CHANGELOG.**
+- Fill in the CHANGELOG's release date and remove any "unreleased" framing.
 - Update the README's install instructions and status banner to reflect
-  that `npx cairn-mem` is live.
+  the version just published.
 
 **4.6 — Tag the release:**
 ```

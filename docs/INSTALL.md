@@ -1,26 +1,29 @@
 # Installing Cairn
 
-## Status: not yet published to npm
+## Status: published on npm as `cairn-mem`
 
-The package is prepared for publication (0.1.0, no `"private"` flag) but is
-not yet on the npm registry. `npx cairn-mem` is the eventual zero-config install
-path, but until it is actually published, the only way to run Cairn is from
-a clone. These are the exact
-commands from the README — do not drift from them:
+Cairn is on the npm registry as the package **`cairn-mem`** (the product is
+Cairn; the command is `cairn`; the package name differs only because
+`cairn` was taken). The zero-config way to run it:
+
+```bash
+npx cairn-mem            # run it (starts the daemon on first client use)
+npx cairn-mem setup      # wire up Claude Desktop / Claude Code / Cursor
+npx cairn-mem ui         # open the dashboard
+```
+
+Everywhere below, `cairn <command>` means `npx cairn-mem <command>` (or the
+`cairn` binary if you installed it globally with `npm install -g cairn-mem`).
+
+To run from a clone instead — for contributing, or to build from source:
 
 ```bash
 git clone https://github.com/Evelynkaz/cairn.git
 cd cairn
 npm install
 npm run build
-node dist/cli/index.js        # equivalent to the future `npx cairn-mem`
-node dist/cli/index.js setup  # wire up Claude Desktop / Claude Code / Cursor
-node dist/cli/index.js ui     # open the dashboard
+node dist/cli/index.js        # the same CLI, run directly
 ```
-
-Everywhere below, read `cairn <command>` as `node dist/cli/index.js <command>`
-run from inside the clone (or as `npx -y cairn-mem@latest <command>` once it is
-published).
 
 ## CRITICAL SAFETY RULE: never run `cairn setup` without `--dry-run` first
 
