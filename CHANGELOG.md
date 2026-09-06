@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-06
+
+### Fixed
+
+- The daemon's `GET /health` reported a hardcoded version string
+  (`0.1.0`) that had already drifted from `package.json` — a fresh
+  install of 0.1.1 answered `/health` with `0.1.0`. The version now
+  comes from `package.json` through one shared helper that both the CLI
+  and the daemon read, so there is a single source of truth rather than a
+  constant to keep in sync by hand. Cosmetic (the `/health` version is
+  informational; the CLI always reported the right version), but it was
+  the same two-sources-of-truth shape that caused other drifts this
+  release.
+
 ## [0.1.1] - 2026-09-06
 
 ### Fixed

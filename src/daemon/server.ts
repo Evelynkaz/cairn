@@ -34,9 +34,10 @@ import {
   writeRuntimeFile,
 } from "./runtime-file.js";
 import { MAX_REQUEST_BODY_BYTES, PayloadTooLargeError, readJsonBody, sendJson, tokenMatches } from "./http.js";
+import { packageVersion } from "../config/version.js";
 
 export const DEFAULT_PORT = 8787;
-const DAEMON_VERSION = "0.1.0";
+const DAEMON_VERSION = packageVersion();
 
 // A client that closes without sending DELETE (StreamableHTTPClientTransport
 // .close() does not) leaks its session forever without this: evict any

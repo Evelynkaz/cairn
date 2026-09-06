@@ -5,11 +5,8 @@
 // time. index.ts is the only place that turns a return code into a real
 // process.exit.
 
-import { readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { homedir as osHomedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ParsedCommand } from "./args.js";
 import { TOP_LEVEL_COMMANDS } from "./args.js";
 import { runSessionStartHook } from "./hook.js";
@@ -24,6 +21,7 @@ import {
 } from "./lifecycle.js";
 import type { DaemonStatus, EmbeddingStatus } from "./lifecycle.js";
 import { dbPath, resolveCairnHome } from "../config/paths.js";
+import { packageVersion } from "../config/version.js";
 import { applyToClients, cairnServerEntry, clientTargets } from "../setup/index.js";
 import type { ApplyOutcome, ApplyResult } from "../setup/index.js";
 
@@ -43,13 +41,6 @@ export interface CommandContext {
   // runSetup/resolveOsHome below). Never set in production.
   stopTimeoutMs?: number;
   homedir?: () => string;
-}
-
-function packageVersion(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const pkgPath = join(here, "..", "..", "package.json");
-  const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as { version?: string };
-  return pkg.version ?? "0.0.0";
 }
 
 const HELP_TEXT = `cairn -- local-first memory MCP server
