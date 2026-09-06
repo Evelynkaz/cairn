@@ -1,5 +1,7 @@
 # Cairn
 
+[Русская версия — README_RU.md](README_RU.md)
+
 **Persistent memory for your AI that you actually own — local-first, shared across every MCP client, one command to install, a dashboard to see and edit everything. No cloud, no account, no API key.**
 
 [![npm version](https://img.shields.io/npm/v/cairn-mem.svg)](https://www.npmjs.com/package/cairn-mem)
@@ -68,6 +70,42 @@ node dist/cli/index.js        # equivalent to `npx cairn-mem`
 node dist/cli/index.js setup  # wire up Claude Desktop / Claude Code / Cursor
 node dist/cli/index.js ui     # open the dashboard
 ```
+
+## Usage
+
+1. **Wire up your MCP clients.** `npx cairn-mem setup` edits real config files
+   on your machine (Claude Desktop's config, Claude Code's `~/.claude.json`,
+   Cursor's `~/.cursor/mcp.json`). Preview first — it's safer and shows you
+   exactly what would change:
+
+   ```bash
+   npx cairn-mem setup --dry-run --print   # shows what would be written, writes nothing
+   npx cairn-mem setup                     # writes it for real
+   ```
+
+   For Claude Code specifically, `claude mcp add cairn -- npx -y
+   cairn-mem@latest` is the safer alternative, since Claude Code writes to
+   `~/.claude.json` continuously while running. Full per-client steps:
+   [docs/INSTALL.md](docs/INSTALL.md).
+
+2. **Restart the client.** The daemon isn't running yet at this point — the
+   stdio shim auto-starts it the first time the client actually connects.
+
+3. **Just talk — the model calls memory tools itself.** Tell Claude "remember
+   that I prefer TypeScript over JavaScript for new projects," then, in a
+   fresh Cursor conversation, ask "what language do I prefer for new
+   projects?" Both clients share the same daemon and the same SQLite file, so
+   Cursor recalls what Claude stored. See [docs/TOOLS.md](docs/TOOLS.md) for
+   what each of the 8 tools does and when a model should call it.
+
+4. **Browse and curate in the dashboard:** `npx cairn-mem ui` starts the
+   daemon if needed and opens it. From there you can search, edit, and delete
+   memories, and approve imported memories before they're eligible for
+   automatic recall (see "Dashboard" below).
+
+5. **Claude Code users:** a `SessionStart` hook can make the first recall of
+   a session automatic instead of relying on the model to call it — see
+   [docs/RECALL_HOOK.md](docs/RECALL_HOOK.md).
 
 ## Architecture
 
