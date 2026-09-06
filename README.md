@@ -11,15 +11,17 @@
 
 > Status: pre-release. The daemon, dashboard API, all MCP tools, the
 > SessionStart recall hook, and export/import are implemented and covered
-> by tests (1006 tests, 1000 passing, 0 failing, 6 skipped). Verified locally
-> on Linux only: the full suite, `npm run typecheck`, `npm run
-> verify-package`, `npm pack` installed and run from a scratch directory,
-> and `npm publish --dry-run`. NOT verified on macOS or Windows: GitHub
-> Actions has been failing in seconds on every job since account payments
-> stopped going through, so nothing has been checked on those platforms for
-> the last several commits. It is not yet published to npm. The dashboard
-> UI has now been reviewed by hand in a browser against a seeded store and
-> judged good; no automated browser test exists yet.
+> by tests (1006 tests, 1000 passing, 0 failing, 6 skipped). CI is green on
+> all three platforms as of commit `0d4e329` — the unit suite on
+> ubuntu-latest/macos-latest/windows-latest, and a smoke test on each that
+> packs the tarball, installs it outside the repo, and confirms the daemon
+> starts and answers `/health`. That's evidence about the tree it ran on,
+> not a permanent guarantee. It is not yet published to npm. The
+> Claude/ChatGPT importers have still never been run against a real export
+> from either product, though import now previews before writing so a bad
+> parse is visible and reversible. The dashboard UI has been reviewed by
+> hand in a browser against a seeded store and judged good; no automated
+> browser test exists yet.
 
 ## Why
 

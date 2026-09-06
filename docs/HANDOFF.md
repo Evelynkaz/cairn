@@ -21,7 +21,7 @@ Status against BUILD_BRIEF §16's eleven milestones, read from `git log --onelin
 | 8 | Privacy (redaction, delete-everything) | done — `feat(privacy)`, hardened by `f4dd3c9` and `6d08e56` (see §1a) |
 | 9 | Recall hook (Claude Code SessionStart) | done — `f58cb2a`, provenance-gated by `27d5b03` (see §1a) |
 | 10 | Portability (export/import, Claude/ChatGPT importers) | done — a dependency-free ZIP codec (`196840d`), a manifest'd archive format with id-preserving import of both memories and episodes (`eadc98c`, `30f674b`, `55e016e`), `export_memories`/`import_memories` (`c1eca59`), the vendor importers wired to dashboard routes (`93fa972`, `1b7ae7d`); never run against a real vendor export (§8) |
-| 11 | Polish (README hero GIF, demo GIF, MIT LICENSE, CI 3 OSes) | blocked — package renamed and published-ready (`114cd47`), screenshots exist, but **CI is not running at all right now** (§1b) and the GIFs still need a human at a screen |
+| 11 | Polish (README hero GIF, demo GIF, MIT LICENSE, CI 3 OSes) | mostly done — package renamed and published-ready (`114cd47`); CI now runs and is green on all three OSes as of `0d4e329` (§1b); the GIFs still need a human at a screen |
 
 The package is published-ready and every subsystem in the brief is wired
 end to end, but call this "done" only with the CI and audit caveats below
@@ -31,8 +31,8 @@ time, and the fixes for those in turn needed a rework pass of their own. Read
 §1a before touching `src/privacy`, `src/retrieval`, `src/daemon`, or
 `src/portability`.
 
-Current test count: **1006 tests, 1000 pass, 0 fail, 6 skipped**, verified
-locally on Linux (`27d5b03`). This project has been burned twice on
+Current test count: **1006 tests, 1000 pass, 0 fail, 6 skipped**, green in
+CI on Linux, macOS and Windows as of `0d4e329` (§1b). This project has been burned twice on
 trusting a raw pass/skip count without reading what changed it (§5) — the
 6th skip (up from 5) is a new `ensureHome` test added in `27d5b03` that
 skips under `process.getuid?.() === 0`, per CONTRIBUTING.md's root-skip
@@ -89,33 +89,32 @@ separately — it is one signal, repeated nine times, and it should have
 been read as one question ("did the fix change what counts as a match?")
 before any test was touched.
 
-### 1b. CI is not running — nothing since `114cd47` is verified on Windows or macOS
+### 1b. CI was down, then came back and immediately earned its keep — resolved
 
-Since 19:05 today every GitHub Actions run on this repo fails in about
-ten seconds with: *"The job was not started because recent account
-payments have failed or your spending limit needs to be increased."*
-Three consecutive pushes (`3877a54`, `5963277`, `6d08e56`) have failed
-this way — `gh run list` shows it plainly, and it is a billing problem on
-the owner's account, not a code or workflow regression. It is blocked on
-the owner (§8); do not try to work around it, and do not assume the
-retrieval fix, the rework, or the refactor are cross-platform clean just
-because they pass here.
+From 19:05 on the day this was written until the owner made the repository
+public, every GitHub Actions run failed in about ten seconds with: *"The
+job was not started because recent account payments have failed or your
+spending limit needs to be increased."* Three consecutive pushes
+(`3877a54`, `5963277`, `6d08e56`) failed this way — a billing problem on
+the owner's account, not a code or workflow regression. Making the repo
+public restores free unlimited Actions minutes regardless of billing
+status, and that is what unblocked it (§8).
 
-**What this means concretely: nothing landed since `114cd47` has been
-verified on Windows or macOS.** This project has hit real
-Windows/macOS-only bugs before that no Linux run could see (§5) — treat
-that risk as live, not historical, until CI billing is fixed and a run
-goes green on all three OSes again.
+**The first real run (`5ef327e`) found one failure per platform, both in
+tests written that same day, neither in the product itself:** a new
+two-stdio-shim test scanned `/proc`, which does not exist on macOS; and a
+hook test on Windows parsed an empty stdout — the hook's own correct
+output when its ~2s deadline elapses, which a real cold-started daemon
+exceeded on a slower runner. Both were fixed in `0d4e329`, and the second
+run went **fully green: `build` and `smoke` on ubuntu-latest,
+macos-latest and windows-latest, all six jobs.** That's the point of this
+section now: a hand audit, however careful, cannot see what only a real
+machine shows — see §1c for how its predictions held up in the same
+window.
 
-**What WAS verified by hand on this Linux machine**, and is real evidence
-even though it is not the three-OS matrix: the full 971-test suite;
-`npm run typecheck` across all three `tsconfig` projects; `verify-package`
-against 162 packaged files; `npm pack` followed by installing the tarball
-outside this repo, running the installed CLI, starting the packed
-daemon, getting a 200 from `/health`, and stopping it; and
-`npm publish --dry-run` succeeding end to end. None of that substitutes
-for the Windows/macOS legs — it rules out a broken package, not a
-platform-specific bug.
+Treat a green run as evidence about the commit it ran on, not a permanent
+property — re-check `gh run list` against the exact commit before relying
+on it, especially before a publish (docs/RELEASING.md §2).
 
 ### 1c. `27d5b03` — provenance, and a hand audit standing in for the CI this project doesn't have
 
@@ -129,15 +128,18 @@ back-filled as `user` — **an existing store's SessionStart block goes empty
 until its memories are approved in the dashboard**, which is a real
 upgrade surprise, recorded in CHANGELOG.md's Unreleased section on purpose.
 
-Second, since CI still cannot run (§1b), an audit was done by hand as its
-substitute and found that the day's own security work had broken macOS
-outright (`export_memories`'s symlink guard compared a realpath'd
+Second, since CI could not run that day (§1b), an audit was done by hand
+as its substitute and found that the day's own security work had broken
+macOS outright (`export_memories`'s symlink guard compared a realpath'd
 directory against a home that was never realpath'd, and macOS's `/var` is
 a symlink) plus Windows reserved-device-name bypasses, two unguarded
 `fchmodSync` calls, and a test that would have hung six hours rather than
-failed. All are fixed on this branch; **none of it is verified on real
-Windows or macOS hardware** — §1b still applies, this was found and fixed
-by reading and reproducing on Linux, not by running the actual platform.
+failed. All are fixed on this branch. **Once CI came back, every one of
+these predictions held on real hardware**: file modes, the reserved
+device names, `O_NOFOLLOW`, and the macOS symlink break all passed in the
+green three-OS run (§1b) — the audit wasn't wasted, it just can't see what
+it didn't predict, which is exactly what the same run's `/proc`-on-macOS
+and Windows-timeout findings were.
 
 ```
 $ npm install
@@ -183,8 +185,9 @@ the tarball has the bin entrypoint, all twelve dashboard assets, and
 ships no test artifact or `src/`), `npm pack` + install the tarball
 outside the repo + run the installed CLI + start the packed daemon +
 confirm `/health` is 200 + stop it, and `npm publish --dry-run`. All
-three passed locally today; none of them is a substitute for the CI
-matrix that is currently down (§1b).
+three passed locally that day; CI's own `smoke` job now covers this same
+ground on all three OSes and is green (§1b) — re-run this list only when
+you need evidence outside CI, not as a substitute for checking it.
 
 ```
 $ node dist/cli/index.js --help
@@ -306,7 +309,7 @@ and `src/cli`.
 
 ## 5. What this project has learned the hard way
 
-- **Green locally is not green.** Portability-milestone commits were pushed red on CI while every local run passed: an `unzip -O` flag only this machine's Info-ZIP build accepts, a file-permission check invisible to a process running as root, and a genuine product defect (files extracting at mode 000). None of those three show up in a run on this machine — reading the actual CI run, not trusting a local pass, is what found them. This is doubly true right now: CI itself is down (§1b), which does not mean the risk went away, only that nothing is watching for it.
+- **Green locally is not green.** Portability-milestone commits were pushed red on CI while every local run passed: an `unzip -O` flag only this machine's Info-ZIP build accepts, a file-permission check invisible to a process running as root, and a genuine product defect (files extracting at mode 000). None of those three show up in a run on this machine — reading the actual CI run, not trusting a local pass, is what found them. CI's own reawakening proved the same lesson again (§1b): the first real three-OS run found a macOS test scanning a nonexistent `/proc` and a Windows timeout too tight for a slower runner, neither visible from Linux or from reading the code.
 - **A review finding is not a fact until it is reproduced.** Read the implementation before writing the finding down, not after; two early "findings" in this project turned out not to reproduce against the actual code.
 - **Do not commit while an agent is still writing.** It has pushed non-compiling code to `main` before. The mechanical fix — snapshot `git diff HEAD | md5sum` before and after a test run, refuse to commit if it moved — is what actually catches it; a reminder to "be careful" does not.
 - **Tests encoding the host OS.** A `C:\fake\home` literal is a relative path on POSIX; a `renameSync` onto a read-only file succeeds on POSIX but fails on Windows; a Windows-shaped config marker landed where the POSIX detector never looks. Ask the code under test for the real path/behaviour instead of hardcoding a platform's own; skip elsewhere with `t.skip("reason")` where a property is genuinely only measurable on one OS.
@@ -351,11 +354,17 @@ Split by who can move it, because most of what remains is not something
 the next session can pick up and finish alone.
 
 **Blocked on the project owner:** everything that blocks the actual publish
-— a payment method for CI, npm credentials, and disk space — plus the
-order to do it in and how to verify each step, is now
-[docs/RELEASING.md](RELEASING.md); read that instead of reconstructing the
-steps here.
-- **GitHub Actions billing.** Every CI run has failed in ~10s since 19:05 today with an account-payments message (§1b); nothing since `114cd47` is verified on Windows or macOS until this is fixed.
+— npm credentials and disk space — plus the order to do it in and how to
+verify each step, is now [docs/RELEASING.md](RELEASING.md); read that
+instead of reconstructing the steps here.
+- ~~**GitHub Actions billing.**~~ Resolved: the owner made the repository
+  public, which restores free unlimited Actions minutes regardless of
+  billing status. The first real run (`5ef327e`) immediately found two
+  defects a hand audit couldn't — a macOS test scanning a nonexistent
+  `/proc`, and a Windows timeout too tight for a slower runner — both
+  fixed in `0d4e329`, after which all six jobs (`build`/`smoke` ×
+  ubuntu/macos/windows) went green (§1b). This is what restored CI
+  immediately bought: real defects reading the code could not find.
 - **`npm publish`.** The dry run passes; the real publish needs the owner's npm credentials.
 - **A real Claude or ChatGPT export.** `c2687d1`'s importer fixtures are built from documented and community-reported shapes, never a real Claude memory paste or a real ChatGPT `conversations.json` — the parsers are tested against constructed input, not reality, and only the owner can produce a real export to test against.
 - **Disk space.** This machine is at 100% (97G/99G used, 715M free), 47 GB of it in directories unrelated to this project — worth knowing before a build or `npm pack` fails for a reason that looks like a code problem and isn't.

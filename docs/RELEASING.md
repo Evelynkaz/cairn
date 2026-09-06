@@ -86,32 +86,37 @@ to dry-run.
 
 ## 2. The CI gate, and why it is not optional
 
-CI has been failing since the GitHub Actions account's billing lapsed —
-every job dies in about two seconds with an account-payments message.
-Confirm the current state before assuming it's fixed:
+CI works: the repository is public, which restores free unlimited GitHub
+Actions minutes, and a full run — `build` and `smoke`, all three OSes
+(ubuntu/macos/windows) — is green as of commit `0d4e329`. That does not
+make this step skippable; it makes it checkable. Confirm the current state
+before publishing, not from memory:
 
 ```
-gh run list --limit 5
+gh run list --branch main --limit 5
 ```
-If every row still says `failure` in ~10s, billing is still broken; do not
-proceed to §3 until at least one full run — `build` and `smoke`, all three
-OSes (ubuntu/macos/windows) — is green. **Nothing landed since `114cd47`
-has been verified on Windows or macOS.**
+Do not proceed to §3 unless the latest run on the commit you're about to
+publish shows `success` for `build` and `smoke` on all three OSes. A green
+run from an earlier commit is not evidence about the one you're releasing.
 
-This is not a formality. A hand audit, standing in for CI because CI could
-not run, found that the same day's own security fix had broken
+This gate exists because a hand audit, standing in for CI on a day it
+could not run, found that the same day's own security fix had broken
 `export_memories` outright on macOS: the symlink containment guard compared
 a realpath'd directory against a home directory that was never realpath'd,
 and macOS's `/var` is itself a symlink — so every export on macOS was
 refused. Nothing about that bug was visible from a green Linux run; only a
 real macOS run (or, that day, a by-hand audit) caught it. A green run on
 this machine alone proves the package isn't broken outright — it does not
-prove it works on the two platforms nobody has actually run it on since.
+prove it works on platforms CI didn't just run on. The first real run after
+CI came back confirmed the pattern again in miniature: it found a macOS
+test scanning a `/proc` that doesn't exist there and a Windows timeout too
+tight for a slower runner — neither visible from Linux or from reading the
+code. A green run is evidence about the tree it ran on, not a permanent
+property; don't publish on anything less than a same-commit three-OS green.
 
-Do not publish on a Linux-only green run. When CI comes back, the ranked
-list of what to check first (found by the hand audit, never verified on
-real hardware) is in `docs/HANDOFF.md` §1c — read it there rather than
-re-deriving it here.
+Do not publish on a Linux-only green run. The ranked list of what to check
+first that the hand audit produced is now historical — CI covers that
+ground directly — see `docs/HANDOFF.md` §1c for the record.
 
 ## 3. Publishing
 
@@ -235,6 +240,8 @@ Say this plainly in the release notes so they stay honest:
   store and is reversible — but "reversible" is not "correct."
 - **There is no automated browser test for the dashboard.** It has been
   reviewed by hand in a real browser once; nothing in CI checks it.
-- **Windows and macOS depend entirely on CI being restored** (§2). Until a
-  full three-OS run goes green, treat both as unverified regardless of how
-  clean the Linux run looks.
+- **Windows and macOS are verified by CI, not by hand.** As of commit
+  `0d4e329`, CI's `build` and `smoke` jobs are green on both — but re-check
+  §2 against the exact commit you're publishing before relying on that;
+  a green run is evidence about the tree it ran on, not a standing
+  guarantee.

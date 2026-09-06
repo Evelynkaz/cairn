@@ -29,12 +29,12 @@ test artifacts or leaked `src/` tree).
 
 All of the above, plus `npm pack` installed into a scratch directory and
 run by path, and `npm publish --dry-run`, have been verified locally on
-Linux only. GitHub Actions has not actually run since 19:05 today — every
-job since fails in about two seconds with a billing error ("recent
-account payments have failed or your spending limit needs to be
-increased"), reproduced on three separate runs. That means nothing has
-been verified on macOS or Windows for the last several commits; do not
-treat CI's badge or history as current until this is fixed.
+Linux. CI is green on all three platforms as of commit `0d4e329` — the
+unit suite and a tarball-install-and-`/health` smoke test on
+ubuntu-latest, macos-latest and windows-latest — so treat that run as
+current evidence, not the historical billing outage that used to block it.
+A green run is still only evidence about the tree it ran on; re-check CI
+before relying on macOS or Windows behavior that changed since.
 
 ## Guidelines
 

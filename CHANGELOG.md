@@ -11,7 +11,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Date will be filled in when this version is actually published to npm.
 
 First release: a local-first, portable memory MCP server, shared across every
-MCP client, stored in a single file the user owns.
+MCP client, stored in a single file the user owns. Verified by CI on Linux,
+macOS and Windows (`build` and `smoke` jobs, all green as of `0d4e329`), not
+Linux alone.
 
 ### Added
 
@@ -113,8 +115,8 @@ has shell access to the machine.
   compared against, and `/var` (where `os.tmpdir()` lives) is a symlink to
   `/private/var` on macOS, so the two sides could never agree. Also affects
   any user with a symlinked `$HOME`. Both sides are now realpath'd
-  consistently; found by hand audit and reproduced on Linux via a symlinked
-  `TMPDIR`, since CI cannot currently confirm it on real macOS.
+  consistently; found by hand audit, reproduced on Linux via a symlinked
+  `TMPDIR`, and since confirmed fixed by a green CI run on real macOS.
 - The same guard did not refuse Windows reserved device names (`NUL`,
   `CON`, `COM1`, ...); a synchronous write to one of them (e.g. `COM1` on a
   machine with a serial port) can block the daemon's single thread
