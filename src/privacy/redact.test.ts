@@ -98,6 +98,26 @@ test("CRITICAL-1: realistic prose is stored byte-identical under redaction (the 
   }
 });
 
+// ---------------------------------------------------------------------------
+// Recovered real-secret shapes (independent review of the CRITICAL-1 fix):
+// all five must be fully redacted, with no raw value surviving.
+// ---------------------------------------------------------------------------
+
+test("recovered: all five real secret shapes are fully redacted, no raw value survives", () => {
+  const cases: Array<[string, string]> = [
+    ["export DB_PASSWORD=sup3rs3cretvalue!", "sup3rs3cretvalue!"],
+    ["password: SomeRealSecret123", "SomeRealSecret123"],
+    ["DB_PASSWORD: Tr0ub4dor3xyz", "Tr0ub4dor3xyz"],
+    ["DB_PASSWORD=Tr0ub4dor3", "Tr0ub4dor3"],
+    ["API_KEY=abcdefghijklmnop", "abcdefghijklmnop"],
+  ];
+  for (const [text, value] of cases) {
+    const result = redactText(text, "on");
+    assert.ok(!result.text.includes(value), `raw value must not survive redaction of: ${text}`);
+    assert.ok(result.text.includes("[redacted:env-secret]"), `must redact: ${text}`);
+  }
+});
+
 test("CRITICAL-1: 150 secrets in one input are all redacted, none survive raw in the output", () => {
   const keys = Array.from({ length: 150 }, (_, i) => `AKIA${String(i).padStart(16, "0")}`);
   const text = keys.join(" ");

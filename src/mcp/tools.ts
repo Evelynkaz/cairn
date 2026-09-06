@@ -239,7 +239,14 @@ function clampErrorMessage(message: string): string {
 // above (import_memories's ArchiveFormatError collapse, recall/get_context's
 // degradedReason scrub, export_memories's fixed messages) still run first
 // and produce whatever message they choose; this only clamps it further if
-// it is somehow still too long, it never replaces it.
+// it is somehow still too long, it never replaces it. A getter-only
+// `message` (e.g. zod's ZodError -- assigning to it silently no-ops rather
+// than throwing) would otherwise leave the message unclamped, defeating the
+// whole point of this net: after attempting the assignment, re-check the
+// message and, if it is STILL over the cap, throw a fresh Error carrying the
+// clamped text instead of the original. That loses the original error's
+// exact type/identity in that one narrow case, which is the trade-off for
+// never letting an unclamped message escape.
 export function withBoundedErrors<Args extends unknown[], Result>(
   handler: (...args: Args) => Result | Promise<Result>,
 ): (...args: Args) => Promise<Result> {
@@ -251,9 +258,11 @@ export function withBoundedErrors<Args extends unknown[], Result>(
         try {
           err.message = clampErrorMessage(err.message);
         } catch {
-          // A getter-only `message` (e.g. zod's ZodError) can't be
-          // reassigned -- degrade to leaving it unclamped rather than
-          // replacing the real error with a TypeError.
+          // Getter-only `message`: fall through to the re-check below,
+          // which throws a replacement carrying the clamped text.
+        }
+        if (err.message.length > CAUGHT_ERROR_MESSAGE_LIMIT) {
+          throw new Error(clampErrorMessage(err.message));
         }
       }
       throw err;
@@ -393,7 +402,7 @@ function refuseCairnOwnedPath(candidate: string): void {
   if (PROTECTED_HOME_FILENAMES.has(normalizedBase)) {
     throw new Error("export_memories: path must be inside the Cairn home directory");
   }
-  const stem = normalizedBase.replace(/\.[^.]*$/, "");
+  const stem = normalizedBase.split(".")[0] ?? normalizedBase;
   if (RESERVED_DEVICE_NAMES.has(stem)) {
     throw new Error("export_memories: path must be inside the Cairn home directory");
   }
@@ -593,6 +602,13 @@ export function registerTools(server: McpServer, deps: McpDeps, resourceEvents: 
         },
         callContext(server, args.scope),
       );
+      // block.text already labels non-user/unapproved hits (see
+      // src/retrieval/context.ts's formatEntry) -- excludeUnapproved: false
+      // above means this tool's hits weren't dropped before rendering, only
+      // marked. Pass block.text/block.tokensEstimated straight through
+      // rather than re-rendering, so tokensEstimated stays honest about the
+      // text this response actually contains instead of drifting from a
+      // second, independent rendering pass.
       return jsonResult({
         text: block.text,
         memories: block.memories.map(hitToJson),

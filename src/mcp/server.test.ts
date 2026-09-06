@@ -28,6 +28,8 @@ import { exportArchive } from "../portability/archive.js";
 import { readZip, writeZip } from "../portability/zip.js";
 import { ensureVectorSpace } from "../storage/repositories/vectors.js";
 import type { EmbeddingProvider } from "../embeddings/types.js";
+import { withBoundedErrors } from "./tools.js";
+import { estimateTokens } from "../retrieval/context.js";
 
 interface RememberResult {
   id: string;
@@ -421,6 +423,46 @@ test("get_context as a tool returns an imported, unapproved memory, labelled wit
     assert.ok(hit, "get_context (tool) must not exclude an imported, unapproved memory");
     assert.equal(hit?.origin, "import");
     assert.equal(hit?.approved, false);
+  });
+});
+
+// A label that never reaches the text a model actually reads is not a
+// label: `hitToJson` puts origin/approved on the parallel `memories` array,
+// but `block.text` used to format every entry identically -- an unapproved
+// import was indistinguishable from a memory the user typed, from the
+// model's point of view. Asserted from that point of view: the rendered
+// block.text itself, not the memories array.
+test("get_context's rendered text marks an imported, unapproved memory, distinguishable from a user one", async () => {
+  await withServer(async ({ client, store }) => {
+    const userText = "deployment pipeline user-typed fact, no provenance words here";
+    const importedText = "deployment pipeline notes carried over, no provenance words here";
+    const userMemory = await callJson<RememberResult>(client, "remember", { content: userText });
+    const imported = store.importMemory({ id: uuidv7(), text: importedText });
+    assert.equal(imported.skipped, false);
+
+    const block = await callJson<ContextResult>(client, "get_context", { query: "deployment pipeline" });
+    const userLine = block.text.split("\n").find((line) => line.includes(userMemory.id));
+    const importedLine = block.text.split("\n").find((line) => line.includes(imported.memory!.id));
+    assert.ok(userLine, "the user-typed memory must appear in the rendered text");
+    assert.ok(importedLine, "the imported memory must appear in the rendered text");
+    // Strip each entry's own memory text (neither fixture contains
+    // provenance-shaped words) before comparing, so a marker in the
+    // SURROUNDING rendering -- not a coincidental word inside the memory's
+    // own content -- is what's actually being asserted.
+    const importedPrefix = importedLine!.slice(0, importedLine!.indexOf(importedText));
+    const userPrefix = userLine!.slice(0, userLine!.indexOf(userText));
+    assert.ok(
+      /import/i.test(importedPrefix),
+      `the imported memory's rendered prefix must carry a provenance marker, got: ${importedPrefix}`,
+    );
+    assert.ok(
+      !/import/i.test(userPrefix),
+      `a user-typed memory's rendered prefix must not carry an import marker, got: ${userPrefix}`,
+    );
+    // tokensEstimated must describe block.text itself, not a second,
+    // independently re-rendered copy of it -- the exact drift risk a
+    // duplicate renderer (now removed) could silently introduce.
+    assert.equal(block.tokensEstimated, estimateTokens(block.text));
   });
 });
 
@@ -835,6 +877,38 @@ test("resources/read with a 200,000-character uri yields a bounded error message
   });
 });
 
+// The motivating case for withBoundedErrors's message clamp having a
+// fallback path: a getter-only `message` (e.g. zod's ZodError) can't be
+// reassigned -- `err.message = clampErrorMessage(...)` silently no-ops
+// rather than throwing, so a naive try/catch around the assignment used to
+// degrade to leaving the message UNCLAMPED, defeating the wrapper's whole
+// purpose. Constructed directly here rather than relying on a real ZodError
+// shape, since the only property that matters is that `message` is a
+// getter with no setter.
+function makeGetterOnlyMessageError(message: string): Error {
+  const err = new Error("placeholder");
+  Object.defineProperty(err, "message", { get: () => message, configurable: true });
+  return err;
+}
+
+test("withBoundedErrors clamps an over-cap message even when it is getter-only", async () => {
+  const oversized = "X".repeat(10_000);
+  const wrapped = withBoundedErrors(() => {
+    throw makeGetterOnlyMessageError(oversized);
+  });
+  await assert.rejects(
+    () => wrapped(),
+    (err: unknown) => {
+      assert.ok(err instanceof Error, "must still throw an Error");
+      assert.ok(
+        (err as Error).message.length < oversized.length,
+        `the escaped message must be clamped, got ${(err as Error).message.length} chars`,
+      );
+      return true;
+    },
+  );
+});
+
 // Enumerates every handler server.ts itself registers (the tools are
 // covered by tools.ts's own registerTools wrapping, asserted elsewhere) so
 // that a future handler added here without `withBoundedErrors` fails this
@@ -1153,13 +1227,22 @@ for (const target of ["CAIRN.DB", "Cairn.Db-Wal", "DAEMON.JSON"]) {
 // a symlink to somewhere outside it passes that check untouched -- `wx` on
 // the final write only defeats a symlink at the target FILE itself, not a
 // symlinked PARENT directory.
-test("export_memories refuses a path through a directory symlinked out of CAIRN_HOME", async () => {
+test("export_memories refuses a path through a directory symlinked out of CAIRN_HOME", async (t) => {
   const home = makeTempDir();
   const outside = makeTempDir();
   const originalHome = process.env.CAIRN_HOME;
   process.env.CAIRN_HOME = home;
   try {
-    symlinkSync(outside, join(home, "outdir"));
+    try {
+      symlinkSync(outside, join(home, "outdir"));
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "EPERM" || code === "ENOSYS") {
+        t.skip("creating a symlink requires privilege on this platform");
+        return;
+      }
+      throw error;
+    }
     await withServer(async ({ client }) => {
       const { isError, text } = await callTool(client, "export_memories", { path: "outdir/escaped.zip" });
       assert.equal(isError, true, "a path through a directory symlinked out of the Cairn home must be refused");
@@ -1185,10 +1268,20 @@ test("export_memories refuses a path through a directory symlinked out of CAIRN_
 // own `$TMPDIR` is exactly this shape (`/var` -> `private/var`), so this is
 // not a contrived edge case. A symlinked ancestor of a legitimate in-home
 // path must still allow the export to succeed.
-test("export_memories succeeds when an ancestor of CAIRN_HOME (not the requested path) is a symlink", async () => {
+test("export_memories succeeds when an ancestor of CAIRN_HOME (not the requested path) is a symlink", async (t) => {
   const realBase = makeTempDir();
   const linkedBase = `${realBase}-link`;
-  symlinkSync(realBase, linkedBase);
+  try {
+    symlinkSync(realBase, linkedBase);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EPERM" || code === "ENOSYS") {
+      t.skip("creating a symlink requires privilege on this platform");
+      rmSync(realBase, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      return;
+    }
+    throw error;
+  }
   const home = join(linkedBase, "home");
   const originalHome = process.env.CAIRN_HOME;
   process.env.CAIRN_HOME = home;
@@ -1239,6 +1332,58 @@ for (const suffix of [" ", ".", ":evil-stream"]) {
     }
   });
 }
+
+// The reserved-device guard used to take the stem before the LAST dot
+// (`normalizedBase.replace(/\.[^.]*$/, "")`), but Windows resolves a device
+// by the segment before the FIRST dot -- so "nul.tar.gz" stemmed to
+// "nul.tar" (not reserved) and "CON.backup.zip" stemmed to "CON.backup" (not
+// reserved), both passing the guard. MEASURED against a live MCP server
+// before this fix: both calls succeeded and reported a written archive. An
+// ordinary multi-dot filename with no reserved segment (e.g. "my.export.zip")
+// must still be accepted.
+for (const target of ["nul.tar.gz", "CON.backup.zip", "COM1.x.y", "LPT1.zip"]) {
+  test(`export_memories refuses "${target}" as a reserved device name regardless of extension count`, async () => {
+    const home = makeTempDir();
+    const originalHome = process.env.CAIRN_HOME;
+    process.env.CAIRN_HOME = home;
+    try {
+      await withServer(async ({ client }) => {
+        const path = join(home, target);
+        const { isError, text } = await callTool(client, "export_memories", { path });
+        assert.equal(isError, true, `export_memories(path: "${target}") must be refused`);
+        assert.ok(!text.includes(home), "the refusal must not echo the path");
+        assert.ok(!statSyncExists(path), `no file must be written at "${target}"`);
+      });
+    } finally {
+      if (originalHome === undefined) {
+        delete process.env.CAIRN_HOME;
+      } else {
+        process.env.CAIRN_HOME = originalHome;
+      }
+      rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    }
+  });
+}
+
+test("export_memories still accepts an ordinary multi-dot filename with no reserved segment", async () => {
+  const home = makeTempDir();
+  const originalHome = process.env.CAIRN_HOME;
+  process.env.CAIRN_HOME = home;
+  try {
+    await withServer(async ({ client }) => {
+      const { isError, text } = await callTool(client, "export_memories", { path: "my.export.zip" });
+      assert.equal(isError, false, `export_memories(path: "my.export.zip") must be accepted: ${text}`);
+      assert.ok(statSyncExists(join(home, "my.export.zip")), "the archive must be written");
+    });
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.CAIRN_HOME;
+    } else {
+      process.env.CAIRN_HOME = originalHome;
+    }
+    rmSync(home, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+});
 
 test("import_memories on a nonexistent path returns a clear error, not an unhandled throw", async () => {
   await withServer(async ({ client }) => {

@@ -100,6 +100,19 @@ export interface SearchOptions {
       default, NOT a tuned result (§14): needs tuning against real
       transcripts and a real embedding model, like every other floor here. */
   maxVectorDistance?: number;
+  /** BUILD_BRIEF §10/§14 provenance gate: when true, a candidate whose
+      `origin` is not 'user' and whose `approved` flag is not set is dropped
+      from the reranked candidate pool BEFORE MMR and before `limit` are
+      applied — see context.ts's ContextOptions.excludeUnapproved for the
+      full rationale and the reproduced defect (filtering only the final
+      page let ineligible candidates consume every result slot, starving
+      out eligible ones). Defaults to false: `recall` never sets this and
+      must keep returning imported/unapproved memories — labelled via
+      SearchHit.origin/approved, never silently excluded — since a caller
+      running `recall` made a deliberate, explicit request and can see each
+      hit's provenance itself. Only `get_context`'s automatic-injection
+      path (context.ts) opts in. */
+  excludeUnapproved?: boolean;
 }
 
 export interface RerankParts {
@@ -376,8 +389,9 @@ function tieBreak(aId: string, aScore: number, bId: string, bScore: number): num
 }
 
 // Looks up SearchHit.origin/approved for a bounded set of ids in one query
-// -- `ids` is always this call's own final (post-MMR, post-`limit`) hit
-// list, never an unbounded scan. Reads the `memories` table directly
+// -- `ids` is this call's own reranked candidate list (post-rerank/
+// minRelevance filter, PRE-MMR and pre-`limit`), bounded by candidateLimit
+// (<=200), never an unbounded scan. Reads the `memories` table directly
 // (not memories_live) purely for these two columns: a hit already resolved
 // through memories_live by this point, so this is a provenance lookup, not
 // a second liveness check.
@@ -390,6 +404,14 @@ function fetchProvenanceByIds(db: CairnDb, ids: string[]): Map<string, { origin:
     result.set(str(row, "id"), { origin: str(row, "origin") as MemoryOrigin, approved: bool(row, "approved") });
   }
   return result;
+}
+
+// Mirrors context.ts's isInjectionEligible (BUILD_BRIEF §10/§14): eligible
+// for automatic injection when 'user'-originated or explicitly approved.
+// Missing provenance (an id `fetchProvenanceByIds` found no row for) fails
+// CLOSED, never treated as eligible.
+function isInjectionEligible(provenance: { origin: MemoryOrigin; approved: boolean } | undefined): boolean {
+  return provenance?.origin === "user" || provenance?.approved === true;
 }
 
 /**
@@ -658,6 +680,27 @@ export async function search(
     return { hits: [], degraded, degradedReason };
   }
 
+  // --- provenance + eligibility gate (BUILD_BRIEF §10/§14) ---
+  // Looked up on the FULL reranked candidate pool -- bounded by
+  // candidateLimit, never an unbounded scan -- and applied BEFORE MMR and
+  // before `limit`, so an ineligible candidate can never consume a result
+  // slot an eligible one needed. This is the fix for the reproduced
+  // defect: filtering only the final page let ineligible candidates fill
+  // every slot, starving out eligible ones entirely. `excludeUnapproved`
+  // defaults to false -- `recall` never sets it, so it always reads every
+  // candidate's provenance for LABELLING (below) without excluding
+  // anything; only `get_context` (context.ts) opts in.
+  const provenanceById = fetchProvenanceByIds(
+    db,
+    reranked.map((r) => r.id),
+  );
+  const excludeUnapproved = options.excludeUnapproved === true;
+  const eligible = excludeUnapproved ? reranked.filter((r) => isInjectionEligible(provenanceById.get(r.id))) : reranked;
+
+  if (eligible.length === 0) {
+    return { hits: [], degraded, degradedReason };
+  }
+
   // --- MMR (diversity), using each candidate's stored vector where one
   // exists (regardless of which branch surfaced it) and null where it does
   // not; a not-yet-indexed memory therefore stays eligible. See mmr.ts. ---
@@ -666,19 +709,17 @@ export async function search(
     vectorsBySeq = getVectorsBySeq(
       db,
       space,
-      reranked.map((r) => rowsById.get(r.id)!.seq),
+      eligible.map((r) => rowsById.get(r.id)!.seq),
     );
   }
 
-  const mmrCandidates: MmrCandidate[] = reranked.map((r) => {
+  const mmrCandidates: MmrCandidate[] = eligible.map((r) => {
     const row = rowsById.get(r.id)!;
     return { id: r.id, relevance: r.score, vector: vectorsBySeq.get(row.seq) ?? null };
   });
   const selectedIds = mmr(mmrCandidates, limit, options.mmrLambda);
 
-  const provenanceById = fetchProvenanceByIds(db, selectedIds);
-
-  const rerankedById = new Map(reranked.map((r) => [r.id, r]));
+  const rerankedById = new Map(eligible.map((r) => [r.id, r]));
   const hits: SearchHit[] = selectedIds.map((id) => {
     const r = rerankedById.get(id)!;
     const row = rowsById.get(id)!;

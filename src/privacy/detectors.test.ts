@@ -487,12 +487,22 @@ test("HIGH-8: DB_PASSWORD=value is detected, only the value is redacted", () => 
   assert.equal(text.slice(finding.start, finding.end), "hunter2hunter2");
 });
 
-// CRITICAL-1 (see below) intentionally dropped ':' support: a colon is
-// overwhelmingly prose punctuation, not assignment, and matching it is what
-// let the detector mangle notes like "Password: use the one stored in
-// 1Password". The equals-sign form is still detected (next test).
-test("HIGH-8/CRITICAL-1: SECRET_KEY: value (colon form) is no longer detected", () => {
-  assert.deepEqual(detectSecrets("SECRET_KEY: 8f14e45fceea167a5a36dedd4bea2543"), []);
+// A first CRITICAL-1 fix dropped ':' support entirely: a colon is
+// overwhelmingly prose punctuation, not assignment, and matching it
+// unconditionally is what let the detector mangle notes like "Password: use
+// the one stored in 1Password". A later review found that over-corrected —
+// YAML/docker-compose/Kubernetes all use the colon form for real secrets —
+// so the colon form is back, gated by a length + digit/symbol requirement
+// prose does not meet (see the doc comment on ENV_KEY in detectors.ts).
+test("HIGH-8/CRITICAL-1: SECRET_KEY: value (colon form) is detected for a secret-shaped value", () => {
+  const text = "SECRET_KEY: 8f14e45fceea167a5a36dedd4bea2543";
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "env-secret");
+  assert.equal(text.slice(finding.start, finding.end), "8f14e45fceea167a5a36dedd4bea2543");
+});
+
+test("HIGH-8/CRITICAL-1: the colon form is NOT detected for prose", () => {
+  assert.deepEqual(detectSecrets("Password: use the one stored in 1Password"), []);
 });
 
 test("HIGH-8: SECRET_KEY=value (equals form) is detected", () => {
@@ -538,6 +548,64 @@ test("CRITICAL-1: genuine .env assignment shapes are still detected", () => {
     const [finding] = detectSecrets(text);
     assert.equal(finding?.kind, "env-secret", `must fire on: ${text}`);
     assert.equal(text.slice(finding.start, finding.end), value);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Recovered real-secret shapes an over-correction of CRITICAL-1 had stopped
+// catching (independent review): `export`-prefixed shell/.env snippets, the
+// YAML/docker-compose/Kubernetes colon form, and short-but-real or
+// all-alphabetic values.
+// ---------------------------------------------------------------------------
+
+test("recovered: export-prefixed assignment is detected", () => {
+  const text = "export DB_PASSWORD=sup3rs3cretvalue!";
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "env-secret");
+  assert.equal(text.slice(finding.start, finding.end), "sup3rs3cretvalue!");
+});
+
+test("recovered: lowercase colon form with a secret-shaped value is detected", () => {
+  const text = "password: SomeRealSecret123";
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "env-secret");
+  assert.equal(text.slice(finding.start, finding.end), "SomeRealSecret123");
+});
+
+test("recovered: colon form with trailing garbage-suffix value is detected", () => {
+  const text = "DB_PASSWORD: Tr0ub4dor3xyz";
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "env-secret");
+  assert.equal(text.slice(finding.start, finding.end), "Tr0ub4dor3xyz");
+});
+
+test("recovered: a short-but-real equals-form password (10 chars) is detected", () => {
+  const text = "DB_PASSWORD=Tr0ub4dor3";
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "env-secret");
+  assert.equal(text.slice(finding.start, finding.end), "Tr0ub4dor3");
+});
+
+test("recovered: an all-alphabetic equals-form value (no digit/symbol) is detected", () => {
+  const text = "API_KEY=abcdefghijklmnop";
+  const [finding] = detectSecrets(text);
+  assert.equal(finding?.kind, "env-secret");
+  assert.equal(text.slice(finding.start, finding.end), "abcdefghijklmnop");
+});
+
+test("recovered: none of the five real shapes leak the raw value in their preview", () => {
+  const samples = [
+    "export DB_PASSWORD=sup3rs3cretvalue!",
+    "password: SomeRealSecret123",
+    "DB_PASSWORD: Tr0ub4dor3xyz",
+    "DB_PASSWORD=Tr0ub4dor3",
+    "API_KEY=abcdefghijklmnop",
+  ];
+  for (const text of samples) {
+    for (const finding of detectSecrets(text)) {
+      const value = text.slice(finding.start, finding.end);
+      assert.ok(!finding.preview.includes(value), `preview must not contain value for: ${text}`);
+    }
   }
 });
 
@@ -606,7 +674,9 @@ test("adversarial input near every new/widened regex boundary completes quickly"
     "-----BEGIN RSA PRIVATE KEY-----" + "\n".repeat(2000) + "x".repeat(20000), // PRIVATE_KEY header fallback
     "PuTTY-User-Key-File-2:" + "y".repeat(50000), // PUTTY header fallback
     "postgres://" + "a".repeat(5000) + ":" + "b".repeat(5000) + "@host/db", // URL_PASSWORD
-    "TOKEN=" + "z".repeat(50000), // ENV_KEY
+    "TOKEN=" + "z".repeat(50000), // ENV_KEY (equals form)
+    "export TOKEN=" + "z".repeat(50000), // ENV_KEY (export prefix)
+    "TOKEN: " + "z".repeat(50000) + "1", // ENV_KEY (colon form, digit signal)
     '"aws_secret_access_key": "' + "w".repeat(50000) + '"', // AWS_SECRET_ACCESS_KEY
   ];
   const text = parts.join("\n\n");

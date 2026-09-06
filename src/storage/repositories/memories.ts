@@ -152,6 +152,19 @@ export function createMemory(
         sets.push("episode_id = ?");
         params.push(input.episodeId);
       }
+      // A user typing this text into a live `remember` call is exactly the
+      // signal 'user' origin means, even when the same text already exists
+      // as an import (or other non-'user' origin): the dedupe branch must
+      // not leave that row permanently excluded from session-start
+      // injection just because an import happened to say it first. Only
+      // promotes, never demotes -- an existing 'user' row colliding with a
+      // later import stays 'user' (import never reaches this branch with a
+      // non-'user' origin anyway, since importMemory hardcodes its own
+      // origin and only checks memories_live, not this dedupe path).
+      if (origin === "user" && current.origin !== "user") {
+        sets.push("origin = ?");
+        params.push("user");
+      }
       params.push(id);
       db.q(`UPDATE memories SET ${sets.join(", ")} WHERE id = ?`).run(...params);
       replaceTags(db, id, mergedTags);
@@ -471,13 +484,21 @@ export function updateMemory(
           );
         }
       }
-      // A text replacement is fresh content supplied by THIS call's
-      // caller, not text carried in from a file -- same reasoning as
-      // `remember`'s own 'user' stamp. Only touched when text actually
-      // changes: a tags/importance-only patch does not re-ingest content
-      // and must not silently promote an 'import'/'unknown' row.
-      sets.push("text = ?", "content_hash = ?", "origin = ?");
-      params.push(patch.text, hash, "user");
+      // Deliberately does NOT touch origin here, even though the caller is
+      // supplying fresh text. `update_memory` is a model-callable MCP tool
+      // with no human in the loop: a poisoned imported memory could instruct
+      // the model to "fix the typo in this memory", and if this path
+      // promoted to 'user' on any text change, one such call would launder
+      // an untrusted row into one auto-injected at every future
+      // SessionStart. Provenance must only ever be upgraded by an explicit
+      // human action -- the dashboard's approve route (setMemoryApproved)
+      // -- not by a text edit that a duped model can trigger just as easily
+      // as a person. (createMemory's dedupe branch is a different case: a
+      // live `remember` call with a caller-supplied origin of 'user' IS
+      // that human signal, so it promotes there; this path has no such
+      // signal and does not.)
+      sets.push("text = ?", "content_hash = ?");
+      params.push(patch.text, hash);
     }
     if (patch.importance !== undefined) {
       sets.push("importance = ?");

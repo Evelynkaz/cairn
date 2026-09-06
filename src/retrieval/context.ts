@@ -207,9 +207,28 @@ function sanitizeEntryText(text: string): string {
 // Compact, greppable provenance per BUILD_BRIEF §6: id, scope, and creation
 // date. A context block the model cannot attribute is a block the user
 // cannot audit.
+//
+// The `unreviewed import` tag below is the ONE renderer both getContext
+// callers share (BUILD_BRIEF §10/§14): a hit that is not `origin: 'user'`
+// and not `approved` gets it, whether or not this hit could have reached
+// here at all under the caller's own trust rules. In practice that means
+// the tag never appears on the automatic-injection (hook) path: hook calls
+// never pass `excludeUnapproved: false` (confirmed by reading every caller
+// of Store.context()/getContext() in the repo -- src/dashboard/api.ts's
+// GET /api/context handler, which is what `cairn hook session-start`
+// calls, and every test driving that route, all omit the option and so
+// get the safe default), so `eligibleHits` above has already dropped every
+// such hit before this function ever sees one. `get_context` called as an
+// MCP tool (src/mcp/tools.ts) is the one caller that passes
+// `excludeUnapproved: false` -- a model-initiated read, not an
+// unrequested injection -- so ineligible hits reach this function there,
+// and this is where they get labelled instead of silently trusted.
 function formatEntry(hit: SearchHit): string {
   const date = new Date(hit.createdAt).toISOString().slice(0, 10);
-  return `- [${hit.id} | ${hit.scope} | ${date}] ${sanitizeEntryText(hit.text)}`;
+  const provenance = isInjectionEligible(hit)
+    ? `${hit.id} | ${hit.scope} | ${date}`
+    : `${hit.id} | ${hit.scope} | ${date} | unreviewed import`;
+  return `- [${provenance}] ${sanitizeEntryText(hit.text)}`;
 }
 
 function tieBreak(aId: string, aScore: number, bId: string, bScore: number): number {
@@ -249,12 +268,28 @@ interface PoolMemory {
 // supporting index — `(scope, importance DESC, created_at DESC)` filtered
 // to live rows — added by whoever owns the storage/migrations layer; this
 // function cannot add one itself (out of scope for this file).
-function loadImportancePool(db: CairnDb, scope: string | undefined, limit: number): PoolMemory[] {
+function loadImportancePool(
+  db: CairnDb,
+  scope: string | undefined,
+  limit: number,
+  excludeUnapproved: boolean,
+): PoolMemory[] {
   const conditions: string[] = [];
   const params: SqlValue[] = [];
   if (scope !== undefined) {
     conditions.push("scope = ?");
     params.push(scope);
+  }
+  // Pushed into SQL (not filtered in JS afterward) so the bounded LIMIT
+  // above is spent on eligible rows in the first place -- the other half
+  // of the starve-out fix, for the half of this pool this file owns.
+  // listMemories (the recency half, below) has no equivalent predicate:
+  // it is a shared query path many other callers use unfiltered, and is
+  // out of scope here (src/storage/repositories/memories.ts) -- its half
+  // of the pool is still filtered in JS via `filtered` above, which is
+  // correct, just not pushed to SQL.
+  if (excludeUnapproved) {
+    conditions.push("(origin = 'user' OR approved = 1)");
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = db
@@ -306,8 +341,9 @@ function loadImportancePool(db: CairnDb, scope: string | undefined, limit: numbe
 // keeping both queries bounded — this is still a "what matters right now"
 // index, not an exhaustive scan of the store.
 function emptyQueryFallback(db: CairnDb, options: ContextOptions & { limit: number }, now: number): SearchResult {
+  const excludeUnapproved = options.excludeUnapproved ?? DEFAULT_EXCLUDE_UNAPPROVED;
   const recencyPool = listMemories(db, { scope: options.scope, limit: EMPTY_QUERY_POOL_LIMIT }).items;
-  const importancePool = loadImportancePool(db, options.scope, EMPTY_QUERY_POOL_LIMIT);
+  const importancePool = loadImportancePool(db, options.scope, EMPTY_QUERY_POOL_LIMIT, excludeUnapproved);
   const mergedById = new Map<string, PoolMemory>();
   for (const memory of recencyPool) mergedById.set(memory.id, memory);
   for (const memory of importancePool) {
@@ -315,7 +351,18 @@ function emptyQueryFallback(db: CairnDb, options: ContextOptions & { limit: numb
   }
   const pool = Array.from(mergedById.values());
   const tags = options.tags ?? [];
-  const filtered = tags.length > 0 ? pool.filter((memory) => tags.every((tag) => memory.tags.includes(tag))) : pool;
+  // BUILD_BRIEF §10/§14 gate, applied HERE -- before rerank() and before
+  // `slice(0, options.limit)` below -- not as a post-hoc filter over the
+  // final page. The pool is already bounded (two bounded queries, deduped),
+  // so filtering it before the limit is the fix: an ineligible candidate
+  // must never consume a result slot an eligible one needed (the exact
+  // reproduced defect -- 60 ineligible imports filling every slot before a
+  // single eligible user memory ever got a chance).
+  const filtered = pool.filter((memory) => {
+    if (tags.length > 0 && !tags.every((tag) => memory.tags.includes(tag))) return false;
+    if (excludeUnapproved && !isInjectionEligible(memory)) return false;
+    return true;
+  });
 
   const items: RerankItem[] = filtered.map((memory) => ({
     id: memory.id,
@@ -367,8 +414,12 @@ const DEFAULT_EXCLUDE_UNAPPROVED = true;
 // produce (emptyQueryFallback above, and search()'s own
 // fetchProvenanceByIds), so this reads those fields directly instead of
 // re-querying the memories table by id a second time.
-function isInjectionEligible(hit: SearchHit): boolean {
-  return hit.origin === "user" || hit.approved === true;
+//
+// Narrowed to a structural { origin?, approved? } shape (not SearchHit)
+// so emptyQueryFallback can apply it directly to a PoolMemory -- BEFORE a
+// PoolMemory is ever turned into a SearchHit -- rather than only after.
+function isInjectionEligible(entry: { origin?: MemoryOrigin; approved?: boolean }): boolean {
+  return entry.origin === "user" || entry.approved === true;
 }
 
 /**
@@ -407,10 +458,16 @@ export async function getContext(
   const tokenBudget = clampTokenBudget(options.tokenBudget);
   const trimmed = query.trim();
   const searchLimit = options.limit ?? MAX_CONTEXT_CANDIDATES;
+  // Resolved ONCE, here, and passed explicitly into both branches below
+  // (rather than left to `...options` spread) so the default (exclude)
+  // applies even when the caller never set the option — search()'s own
+  // default for this flag is false (recall's), which would silently
+  // disable get_context's default gate if left to fall through unresolved.
+  const excludeUnapproved = options.excludeUnapproved ?? DEFAULT_EXCLUDE_UNAPPROVED;
 
   const result: SearchResult =
     trimmed.length === 0
-      ? emptyQueryFallback(db, { ...options, limit: searchLimit }, now)
+      ? emptyQueryFallback(db, { ...options, limit: searchLimit, excludeUnapproved }, now)
       : await search(
           db,
           query,
@@ -420,7 +477,10 @@ export async function getContext(
           // DEFAULT_CONTEXT_MIN_COVERAGE and DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE
           // above for why all three floors are stricter than search()'s own
           // defaults, and why coverage/maxVectorDistance are the ones that
-          // can actually empty a result set (one per branch).
+          // can actually empty a result set (one per branch). excludeUnapproved
+          // (BUILD_BRIEF §10/§14) is applied INSIDE search(), before MMR and
+          // before its own `limit`, for the same starve-out reason as
+          // emptyQueryFallback above.
           {
             ...options,
             limit: searchLimit,
@@ -428,15 +488,17 @@ export async function getContext(
             minRelevance: options.minRelevance ?? DEFAULT_CONTEXT_MIN_RELEVANCE,
             minCoverage: options.minCoverage ?? DEFAULT_CONTEXT_MIN_COVERAGE,
             maxVectorDistance: options.maxVectorDistance ?? DEFAULT_CONTEXT_MAX_VECTOR_DISTANCE,
+            excludeUnapproved,
           },
           deps,
         );
 
   // BUILD_BRIEF §10/§14 gate -- see ContextOptions.excludeUnapproved's doc
-  // comment. Filtered BEFORE the budget loop below, not after: an excluded
-  // memory must never occupy a budget slot another candidate could have
-  // used, and must never appear in `memories`/`text` at all.
-  const excludeUnapproved = options.excludeUnapproved ?? DEFAULT_EXCLUDE_UNAPPROVED;
+  // comment. Both branches above now apply this gate themselves, before
+  // their own limit/MMR stage, so this second pass is a defense-in-depth
+  // no-op on already-eligible hits, never the primary enforcement point —
+  // it stays here so `result.hits` can never leak an ineligible entry past
+  // this function under any future change to either branch.
   const eligibleHits = excludeUnapproved ? result.hits.filter(isInjectionEligible) : result.hits;
 
   let text = "";

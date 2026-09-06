@@ -401,29 +401,69 @@ const URL_PASSWORD =
 // caller believes the secret was fully handled while its tail survives).
 const GENERIC_BEARER = /bearer\s+([A-Za-z0-9\-_.+/=~]{10,})(?![A-Za-z0-9_\-.+/=~])/gid;
 
-// .env-style assignment: KEY=value, where KEY's name contains one of a
-// fixed list of secret-signalling substrings. Only the VALUE is redacted.
-// A pasted .env file is the single most likely way a secret reaches this
-// store (BUILD_BRIEF §10), but an earlier version of this detector also
-// mangled ordinary prose (a "Password:" or "secret:" mid-sentence is
-// overwhelmingly a person talking, not an assignment — see the module's own
-// precision-over-recall doctrine above). It now requires ALL of:
+// .env-style assignment: KEY=value or KEY: value, where KEY's name contains
+// one of a fixed list of secret-signalling substrings. Only the VALUE is
+// redacted. A pasted .env/shell/YAML/compose/k8s snippet is the single most
+// likely way a secret reaches this store (BUILD_BRIEF §10), but an earlier
+// version of this detector mangled ordinary prose (a "Password:" or
+// "secret:" mid-sentence is overwhelmingly a person talking, not an
+// assignment — see the module's own precision-over-recall doctrine above).
+// A second pass over-corrected the other way and stopped matching real
+// secrets (`export FOO=...`, the colon form entirely, short-but-real
+// passwords, all-alphabetic keys). This version requires:
 //   (a) line-anchored: the key must start the line (only leading
-//       whitespace before it), so a key name mid-sentence never qualifies;
-//   (b) '=' only, never ':' — a colon is overwhelmingly prose punctuation
-//       ("Password: use the one stored in 1Password"), an equals sign is
-//       assignment;
-//   (c) a value of at least 12 characters containing a digit or a
-//       non-alphanumeric character, so a plain-English reply ("TOKEN=see
-//       the runbook") is not mistaken for a value.
-// Measured: this kills all of "Password: use the one stored in 1Password",
-// "The staging secret: rotate it every 90 days", "API_KEY: ask Dana for
-// it", "my_secret: tell nobody", "GitHub PAT credentials: stored in the
-// team vault", "auth_token: TODO" and "TOKEN=see the runbook" — see
-// detectors.test.ts — while still catching genuine .env shapes.
-const ENV_KEY = /^[ \t]*([A-Za-z][A-Za-z0-9_]{0,63})[ \t]*=[ \t]*["']?([^\s"'#]+)["']?/gmd;
+//       whitespace and an optional `export ` before it — the single most
+//       common shape a secret is pasted in from a shell/.env snippet — so a
+//       key name mid-sentence never qualifies);
+//   (b) ':' OR '=' as the separator, but they are NOT treated as equally
+//       strong evidence of assignment (see below);
+//   (c) a value-shape gate whose strictness depends on the separator.
+//
+// Why the separator changes the gate: '=' as a line-anchored suffix of an
+// identifier-shaped key is essentially never how English prose is punctuated
+// ("Password=use the one..." does not occur; "Password: use the one..."
+// does). '=' therefore already IS the assignment signal, so demanding a
+// digit/symbol in the value on top of it only costs real secrets — that is
+// exactly how `API_KEY=abcdefghijklmnop` (all-alphabetic HuggingFace/API-key
+// shapes are common) and `DB_PASSWORD=Tr0ub4dor3` (a short-but-real
+// password) were being stored verbatim. ':' is the opposite: it is
+// overwhelmingly prose punctuation on its own, so it still needs the
+// digit/symbol signal to tell "Password: use the one stored in 1Password"
+// (a sentence) apart from "DB_PASSWORD: Tr0ub4dor3xyz" (an assignment) —
+// both are line-anchored key-name-then-colon-then-word shapes, and length
+// alone does not distinguish them ("GitHub PAT credentials: stored in the
+// team vault" has an 7-letter first word, "rotate it every 90 days" trails
+// off into more words the value pattern does not capture, but nothing stops
+// a determined sentence from putting one long word after the colon).
+//
+// The trade-off, stated explicitly rather than picked by feel: a MISSED
+// secret here is a silent privacy failure (the value sits in the store,
+// unredacted, until something else notices) while a false positive is a
+// visible, immediately-noticed one — except that on this module's write
+// path a false positive is also unrecoverable, because redaction overwrites
+// the episode (CRITICAL-1). That asymmetry is why the colon form keeps the
+// extra gate even though it costs some recall, while the equals form drops
+// it: '=' does not carry the same prose risk, so there is no precision to
+// trade away by relaxing it.
+//
+// Measured against the seven prose strings that must never fire — "Password:
+// use the one stored in 1Password", "The staging secret: rotate it every 90
+// days", "API_KEY: ask Dana for it", "my_secret: tell nobody", "GitHub PAT
+// credentials: stored in the team vault", "auth_token: TODO" and
+// "TOKEN=see the runbook" — every one is still rejected: each first word
+// after the separator ("use", "rotate", "ask", "tell", "stored", "TODO",
+// "see") is short enough to fail the length floor on its own separator
+// before the digit/symbol gate is even relevant. See detectors.test.ts.
+const ENV_KEY = /^[ \t]*(?:export[ \t]+)?([A-Za-z][A-Za-z0-9_]{0,63})[ \t]*([:=])[ \t]*["']?([^\s"'#]+)["']?/gmd;
 const ENV_SECRET_NAME = /PASSWORD|PASSWD|SECRET|TOKEN|APIKEY|API_KEY|PRIVATE_KEY|CREDENTIALS/i;
-const ENV_VALUE_MIN_LENGTH = 12;
+// Colon form: prose-prone, so it keeps both a higher length floor and the
+// digit/symbol requirement.
+const ENV_VALUE_MIN_LENGTH_COLON = 12;
+// Equals form: '=' already signals assignment on its own (see above), so
+// the floor only needs to rule out a stray short word ("TOKEN=see") — 8
+// catches "Tr0ub4dor3"-shaped real passwords without requiring a
+// digit/symbol.
+const ENV_VALUE_MIN_LENGTH_EQUALS = 8;
 const ENV_VALUE_HAS_SIGNAL = /[0-9]|[^A-Za-z0-9]/;
 
 function collectEnvAssignments(text: string): Candidate[] {
@@ -431,13 +471,18 @@ function collectEnvAssignments(text: string): Candidate[] {
   for (const match of text.matchAll(ENV_KEY)) {
     const key = match[1];
     if (key === undefined || !ENV_SECRET_NAME.test(key)) continue;
-    const span = groupSpan(match, 2);
+    const separator = match[2];
+    const span = groupSpan(match, 3);
     if (span === null) continue;
     const [start, end] = span;
     if (end <= start) continue;
     const value = text.slice(start, end);
-    if (value.length < ENV_VALUE_MIN_LENGTH) continue;
-    if (!ENV_VALUE_HAS_SIGNAL.test(value)) continue;
+    if (separator === ":") {
+      if (value.length < ENV_VALUE_MIN_LENGTH_COLON) continue;
+      if (!ENV_VALUE_HAS_SIGNAL.test(value)) continue;
+    } else {
+      if (value.length < ENV_VALUE_MIN_LENGTH_EQUALS) continue;
+    }
     out.push({ kind: "env-secret", start, end, priority: 20 });
   }
   return out;

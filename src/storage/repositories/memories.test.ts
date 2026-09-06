@@ -254,6 +254,22 @@ test("soft delete hides a memory from listMemories; restore brings it back; the 
   });
 });
 
+test("soft delete and restore of an imported memory leaves its origin 'import' and unapproved throughout", () => {
+  withDb((db) => {
+    const imported = importMemory(db, { id: uuidv7(), text: "to be forgotten and restored" }).memory!;
+    assert.equal(imported.origin, "import");
+    assert.equal(imported.approved, false);
+
+    assert.equal(softDeleteMemory(db, imported.id), true);
+    assert.equal(getMemory(db, imported.id)?.origin, "import");
+    assert.equal(getMemory(db, imported.id)?.approved, false);
+
+    assert.equal(restoreMemory(db, imported.id), true);
+    assert.equal(getMemory(db, imported.id)?.origin, "import");
+    assert.equal(getMemory(db, imported.id)?.approved, false);
+  });
+});
+
 test("restoreMemory throws a typed LiveTextCollisionError, naming both ids, when the text was re-remembered as a new row while deleted", () => {
   withDb((db) => {
     const { memory: original } = createMemory(db, { text: "I use vim" });
@@ -950,12 +966,44 @@ test("importMemory always stamps origin 'import' and approved false, regardless 
   });
 });
 
-// updateMemory: a text replacement is fresh content supplied by THIS
-// call's caller, so it is stamped 'user' -- promoting even a previously
-// 'import'/'unknown' row, since the caller is now vouching for the new
-// text directly. A tags/importance-only patch (no text change) must NOT
-// touch origin at all.
-test("updateMemory: replacing text stamps origin 'user'; a tags-only patch leaves origin untouched", () => {
+// createMemory's dedupe branch: a user typing the same text a `remember`
+// call already saw imported must end up trusted -- an import happening to
+// say the same thing first must not permanently exclude the user's own
+// words from session-start injection.
+test("createMemory dedupe: a live 'remember' of text that already exists as an import promotes the row to origin 'user'", () => {
+  withDb((db) => {
+    const imported = importMemory(db, { id: uuidv7(), text: "shared text" }).memory!;
+    assert.equal(imported.origin, "import");
+
+    const { memory, deduped } = createMemory(db, { text: "shared text" });
+    assert.equal(deduped, true);
+    assert.equal(memory.id, imported.id);
+    assert.equal(memory.origin, "user");
+    assert.equal(getMemory(db, imported.id)?.origin, "user");
+  });
+});
+
+// The dedupe promotion must not fire when the colliding write itself is not
+// 'user' origin (i.e. it never demotes, and only promotes on the specific
+// signal defect 1 targets).
+test("createMemory dedupe: a non-'user' origin write does not demote an already-'user' row", () => {
+  withDb((db) => {
+    const { memory: original } = createMemory(db, { text: "already trusted" });
+    assert.equal(original.origin, "user");
+
+    const { memory, deduped } = createMemory(db, { text: "already trusted", origin: "import" });
+    assert.equal(deduped, true);
+    assert.equal(memory.origin, "user", "must not demote an existing 'user' row");
+  });
+});
+
+// updateMemory: `update_memory` is a model-callable MCP tool with no human
+// in the loop, so a text replacement must NOT promote origin -- otherwise a
+// poisoned imported memory could instruct the model to "fix the typo" and
+// launder itself into 'user' (auto-injected at every SessionStart). Trust
+// only ever comes from the explicit approve action (setMemoryApproved). A
+// tags/importance-only patch also must not touch origin.
+test("updateMemory: neither a text replacement nor a tags-only patch promotes origin", () => {
   withDb((db) => {
     const imported = importMemory(db, { id: uuidv7(), text: "from an import" }).memory!;
     assert.equal(imported.origin, "import");
@@ -964,7 +1012,7 @@ test("updateMemory: replacing text stamps origin 'user'; a tags-only patch leave
     assert.equal(tagged.origin, "import", "a tags-only patch must not touch origin");
 
     const edited = updateMemory(db, imported.id, { text: "rewritten by the caller" });
-    assert.equal(edited.origin, "user", "a text replacement must stamp 'user'");
+    assert.equal(edited.origin, "import", "update_memory must not launder import origin to 'user'");
   });
 });
 
