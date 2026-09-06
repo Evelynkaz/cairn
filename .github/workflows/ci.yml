@@ -37,14 +37,23 @@ jobs:
   # just that its file list looks right (the `build` job's verify-package
   # step) or that the working tree's unit tests pass. It installs the
   # packed tarball into a scratch directory outside the repo, then invokes
-  # the CLI by its resolved path inside that install
-  # (`node <tmp>/node_modules/<package name>/dist/cli/index.js`) rather than via the
-  # `bin` shim on PATH -- a shim depends on how npm wires executables on
-  # each platform (a symlink on POSIX, a generated .cmd/.ps1 shim on
-  # Windows), which is exactly the kind of platform difference this job
-  # exists to route around, not depend on. It never runs `cairn setup`:
-  # that command writes into real client config files outside CAIRN_HOME
-  # (see CONTRIBUTING.md) and is out of scope here.
+  # the CLI THROUGH THE INSTALLED `bin` SHIM (`npx --no-install cairn-mem
+  # ...`) for the --version/status smoke, because that shim is the one and
+  # only code path every real user hits (`npx cairn-mem`, a global install's
+  # `cairn` on PATH, etc). `cairn-mem@0.1.0` shipped with an entrypoint guard
+  # that compared `import.meta.url` (the real module path) against
+  # `process.argv[1]` (the symlink/shim path invoked); those differ ONLY
+  # when run through the `.bin` shim, so a smoke test that instead ran the
+  # resolved `dist/cli/index.js` path directly passed while the shipped
+  # `npx cairn-mem` printed nothing and exited 0. Never invoke the CLI by
+  # its resolved `dist/...` path for the entrypoint smoke again -- it
+  # bypasses the exact thing that broke. The daemon start/health/stop
+  # portion below still uses the resolved path, since a `node -e` child
+  # there reads `status --json` and can't shell out to `npx` from inside
+  # itself; that part doesn't touch the entrypoint guard so it's not the
+  # code path in question. It never runs `cairn setup`: that command writes
+  # into real client config files outside CAIRN_HOME (see CONTRIBUTING.md)
+  # and is out of scope here.
   smoke:
     strategy:
       fail-fast: false
@@ -72,7 +81,7 @@ jobs:
           npm init -y
           TARBALL=$(node -e "const fs=require('node:fs');const path=require('node:path');const dir=process.argv[1];const file=fs.readdirSync(dir).find(f=>f.endsWith('.tgz'));console.log(path.join(dir,file));" "$RUNNER_TEMP/pack")
           npm install "$TARBALL"
-      - name: Run --version and status through the installed CLI's real path
+      - name: Run --version and status through the installed CLI's bin shim
         shell: bash
         env:
           CAIRN_PORT: "0"
@@ -89,12 +98,25 @@ jobs:
           # install directory from package.json's `name` at run time instead of
           # hardcoding it, so a future rename can't silently break this job -- that
           # also does the right thing for a scoped name like `@scope/pkg`. Export it
-          # so the next step, which can't call node from an `env:` value, can reuse it.
+          # so the daemon step below, which can't call node from an `env:` value, can
+          # reuse it (that step reads `status --json` and stays on the resolved path;
+          # see the job's header comment for why that's fine there).
           PKG_DIR=$(node -p "require('./package.json').name")
           CLI="$RUNNER_TEMP/install/node_modules/$PKG_DIR/dist/cli/index.js"
           echo "CLI_PATH=$CLI" >> "$GITHUB_ENV"
           EXPECTED_VERSION=$(node -e "console.log(require('./package.json').version)")
-          ACTUAL_VERSION=$(node "$CLI" --version)
+          # From here on, go THROUGH the installed `bin` shim (`npx --no-install
+          # cairn-mem`), not the resolved dist/ path above: `npx --no-install` resolves
+          # and runs the very bin entry a real `npx cairn-mem` invocation would -- a
+          # POSIX symlink at node_modules/.bin/cairn, or the generated .cmd/.ps1 shim on
+          # Windows -- without this job having to locate that platform-specific shim
+          # itself, and it works from `shell: bash` on all three runners. This is the
+          # one code path a real user always hits, and the one the 0.1.0 entrypoint bug
+          # (import.meta.url vs. process.argv[1] disagreeing only through the shim) hid
+          # from the smoke job precisely because it used to invoke the resolved path
+          # instead.
+          cd "$RUNNER_TEMP/install"
+          ACTUAL_VERSION=$(npx --no-install cairn-mem --version)
           node -e "
             const [expected, actual] = process.argv.slice(1);
             if (actual.trim() !== expected.trim()) {
@@ -102,7 +124,7 @@ jobs:
             }
             console.log('version ok:', actual.trim());
           " "$EXPECTED_VERSION" "$ACTUAL_VERSION"
-          node "$CLI" status
+          npx --no-install cairn-mem status
       - name: Start the installed daemon, poll /health, then stop it
         shell: bash
         env:

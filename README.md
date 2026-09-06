@@ -11,7 +11,7 @@
 
 > Status: pre-release. The daemon, dashboard API, all MCP tools, the
 > SessionStart recall hook, and export/import are implemented and covered
-> by tests (1006 tests, 1000 passing, 0 failing, 6 skipped). CI is green on
+> by tests (1009 tests, 1003 passing, 0 failing, 6 skipped). CI is green on
 > all three platforms as of commit `0d4e329` — the unit suite on
 > ubuntu-latest/macos-latest/windows-latest, and a smoke test on each that
 > packs the tarball, installs it outside the repo, and confirms the daemon

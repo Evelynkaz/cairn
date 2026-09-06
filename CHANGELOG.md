@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-06
+
+### Fixed
+
+- The CLI did nothing when run through the `node_modules/.bin/cairn`
+  symlink — which is how `npx cairn-mem` and every install invoke it. The
+  entrypoint guard compared the module's real path against the symlink
+  path `argv[1]` gave it; they differed, so `main()` never ran and the
+  process exited silently. `npx cairn-mem`, the zero-config front door
+  §2 promises, was broken in 0.1.0 for exactly that reason. The guard now
+  resolves symlinks on both sides. The CI smoke test invoked the CLI by
+  its resolved `dist/...` path, which bypassed the symlink and hid this;
+  it now runs through the shim the way a user does.
+
 ## [0.1.0] - unreleased
 
 Date will be filled in when this version is actually published to npm.

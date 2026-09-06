@@ -21,7 +21,8 @@
 // module does nothing: this project has already shipped a bug where
 // importing an entrypoint spawned a daemon against the user's real home.
 
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "./args.js";
 import type { CommandContext } from "./commands.js";
 
@@ -101,8 +102,36 @@ async function runProcessOwningCommand(argv: string[]): Promise<boolean> {
   return false;
 }
 
-const isEntrypoint =
-  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+// npm/npx wire every installed bin through a SYMLINK
+// (node_modules/.bin/cairn -> node_modules/cairn-mem/dist/cli/index.js). When
+// run that way, process.argv[1] is the symlink path while import.meta.url is
+// this module's real, resolved path -- a raw string/URL comparison between
+// them is always false, so isEntrypoint was false and main() never ran under
+// `npx cairn-mem` or the .bin shim (the actual zero-config front door,
+// BUILD_BRIEF §2). Resolving both sides with realpathSync before comparing
+// makes a symlinked bin count as "run directly" while a genuine `import()` of
+// this module (whose argv[1] is whatever *other* entrypoint is running, e.g.
+// a test runner) still doesn't. Never let this throw: if argv[1] is missing
+// or doesn't resolve (e.g. it's not a real path at all), fall back to the old
+// strict comparison rather than crash every invocation.
+// Windows caveat: realpathSync normalizes case/8.3 short names on that
+// platform too, so this comparison should hold there, but it hasn't been
+// exercised on Windows CI.
+function resolveIsEntrypoint(): boolean {
+  const argv1 = process.argv[1];
+  if (argv1 === undefined) {
+    return false;
+  }
+  try {
+    const realArgv1 = realpathSync(argv1);
+    const realModulePath = realpathSync(fileURLToPath(import.meta.url));
+    return realArgv1 === realModulePath;
+  } catch {
+    return import.meta.url === pathToFileURL(argv1).href;
+  }
+}
+
+const isEntrypoint = resolveIsEntrypoint();
 
 if (isEntrypoint) {
   suppressExperimentalSqliteWarning();
