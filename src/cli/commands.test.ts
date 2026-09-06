@@ -1,6 +1,9 @@
 // Exercises the CLI command layer with injected out/err and isolated temp
 // homes -- no test here may touch the developer's real ~/.cairn or a real
-// MCP client config file, and every process this file spawns is killed.
+// MCP client config file, and every process this file spawns -- including
+// hook.ts's own fire-and-forget background daemon spawn, which this file
+// does not control the seam for (see the hook-session-start test below) --
+// is confirmed gone, and killed if it is not, before the file's tests finish.
 
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
@@ -392,6 +395,48 @@ async function killPid(pid: number | undefined): Promise<void> {
   }
 }
 
+// Finds a real cairn daemon process (dist/daemon/main.js) whose CAIRN_HOME
+// is exactly the given temp home, by reading /proc directly -- the only way
+// to observe hook.ts's fire-and-forget spawn (see below) at all, since
+// nothing in the public CLI surface returns its pid. Linux-only by
+// construction (there is no /proc on macOS/Windows); every caller below
+// checks process.platform itself and t.skip()s just the part that needs
+// this, never the whole test.
+function findMatchingDaemonPids(home: string): number[] {
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch {
+    return [];
+  }
+  const marker = `CAIRN_HOME=${home}`;
+  const pids: number[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    try {
+      const environVars = readFileSync(`/proc/${entry}/environ`, "utf8").split("\0");
+      if (!environVars.includes(marker)) continue;
+      const cmdline = readFileSync(`/proc/${entry}/cmdline`, "utf8");
+      if (!cmdline.includes("daemon/main.js")) continue;
+      pids.push(Number(entry));
+    } catch {
+      // The process exited mid-scan, or its /proc entry is unreadable --
+      // either way, not a match this scan can act on.
+    }
+  }
+  return pids;
+}
+
+async function waitForNoMatchingDaemonPid(home: string, deadline: number): Promise<number[]> {
+  for (;;) {
+    const pids = findMatchingDaemonPids(home);
+    if (pids.length === 0 || Date.now() >= deadline) {
+      return pids;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 test("journalMode surfaces through /health into daemonStatus (normally 'wal')", async () => {
   await withTempDirAsync(async (home) => {
     const result = await ensureDaemon({ home, env: { ...process.env, CAIRN_PORT: "0" } });
@@ -417,11 +462,18 @@ test("journalMode surfaces through /health into daemonStatus (normally 'wal')", 
 // process.env whenever no env is threaded through, which is exactly this
 // path -- so this pins process.env.CAIRN_PORT to a port this test already
 // holds open itself before calling runCommand, and restores it afterward.
-// The daemon process still gets spawned, but startDaemon (server.ts) claims
-// its port before touching the database (see its own comment on why), so it
-// hits EADDRINUSE and exits immediately: it never becomes healthy, never
-// writes a runtime file, and never outlives this test -- deterministically,
-// regardless of what else on the machine holds the real default port 8787.
+// The daemon process still gets spawned, and startDaemon (server.ts) does
+// claim its port before touching the database -- but that process takes
+// longer to spawn and reach listen() than this test used to wait before
+// releasing the port (a fixed short delay, then `blocker.close()` in
+// `finally`): measured, the daemon can still be mid-startup at that point,
+// so the port is free again by the time it actually calls listen(), and it
+// binds it for real instead of hitting EADDRINUSE -- a genuine leaked daemon
+// outliving this file, not a hypothetical one. So this cannot just assume
+// the spawn died; it polls /proc (see findMatchingDaemonPids above) for that
+// exact spawn to actually be gone before letting `finally` release the port,
+// and kills-and-fails if it is not, rather than trusting the race to resolve
+// in this test's favour.
 //
 // runHookSessionStart also always passes the process's own real
 // process.stdin into the hook (see hook.ts's drainStdin, which calls
@@ -432,7 +484,7 @@ test("journalMode surfaces through /health into daemonStatus (normally 'wal')", 
 // daemon spawn. Swapping in an already-ended stream for the duration of
 // this test removes that dependency on whatever the ambient stdin happens
 // to be, and is restored immediately after.
-test("runCommand('hook-session-start') over a fresh temp home returns 0 with ctx.out never called", async () => {
+test("runCommand('hook-session-start') over a fresh temp home returns 0 with ctx.out never called", async (t) => {
   await withTempDirAsync(async (home) => {
     const blocker = createServer();
     await new Promise<void>((resolve) => blocker.listen(0, "127.0.0.1", resolve));
@@ -456,6 +508,26 @@ test("runCommand('hook-session-start') over a fresh temp home returns 0 with ctx
       await new Promise((resolve) => setTimeout(resolve, 300));
       assert.equal(readRuntimeFile(home), null);
     } finally {
+      // Hold the port until the fire-and-forget spawn is actually confirmed
+      // gone (see the comment above this test): releasing it on a fixed
+      // delay let a still-starting daemon bind the now-free port for real
+      // after this test had already moved on, which is the leak this guards
+      // against. /proc is Linux-only, so this can only prove the absence
+      // there -- t.skip() narrows that gap to just this assertion rather
+      // than the whole test, per CONTRIBUTING.md.
+      if (process.platform === "linux") {
+        const stillRunning = await waitForNoMatchingDaemonPid(home, Date.now() + 5000);
+        for (const pid of stillRunning) {
+          await killPid(pid);
+        }
+        assert.deepEqual(
+          stillRunning,
+          [],
+          "hook-session-start's background daemon spawn must exit (EADDRINUSE) before this test releases the port that forces that",
+        );
+      } else {
+        t.skip("confirming the fire-and-forget daemon spawn exited uses /proc, which is Linux-only");
+      }
       if (previousPort === undefined) {
         delete process.env.CAIRN_PORT;
       } else {

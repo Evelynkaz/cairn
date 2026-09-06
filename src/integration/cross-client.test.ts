@@ -27,7 +27,7 @@
 
 import { after, before, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { makeTempDir } from "../testing/tmp.js";
@@ -377,3 +377,136 @@ test("9. the generated config is the config that works: cairnServerEntry names t
     "the entrypoint this suite spawns (harness.ts's cliEntrypoint()) must be the same file package.json's bin.cairn names",
   );
 });
+
+// Every other test above proves the shared-store claim across ONE stdio
+// client and ONE HTTP client -- the shape src/shim/shim.test.ts already
+// covers too. §13's demo names two stdio hosts (Claude Desktop, Cursor), so
+// the shim<->daemon transport itself needs proving twice, from two
+// independent OS processes, neither of which spawned the other's daemon.
+// This test owns its own temp CAIRN_HOME and its own daemon (never the
+// shared `home`/`stdio`/`http` fixtures above) so a failure or a leak here
+// can never be confused with theirs, and so it can kill its daemon itself
+// in its own `finally` rather than relying on the file-level `after()`.
+//
+// Note on coverage: like every other test in this file, this one goes
+// through harness.ts's `startStdioClient`, which pins `CAIRN_PORT=0` --
+// so this proves two stdio shims sharing a daemon on an OS-assigned
+// ephemeral port, not the fixed-port-already-in-use branch.
+function findLinuxDaemonPidsForHome(home: string): number[] {
+  const pids: number[] = [];
+  for (const entry of readdirSync("/proc")) {
+    if (!/^\d+$/.test(entry)) {
+      continue;
+    }
+    try {
+      const cmdline = readFileSync(`/proc/${entry}/cmdline`, "utf8");
+      if (!cmdline.includes("daemon/main.js")) {
+        continue;
+      }
+      const environ = readFileSync(`/proc/${entry}/environ`, "utf8");
+      if (environ.split("\0").includes(`CAIRN_HOME=${home}`)) {
+        pids.push(Number(entry));
+      }
+    } catch {
+      // The process exited between readdir and read, or /proc/<pid>/environ
+      // is unreadable (not this user's process) -- either way, skip it.
+    }
+  }
+  return pids;
+}
+
+test(
+  "10. two independent stdio shim PROCESSES share one daemon, in both directions, with correct per-client attribution",
+  { timeout: 30_000 },
+  async (t) => {
+    if (process.platform === "win32") {
+      t.skip("this test's daemon-count proof reads /proc, which does not exist on Windows");
+      return;
+    }
+
+    const TWO_STDIO_SCOPE = "two-stdio-demo";
+    const CLIENT_A_NAME = "claude-desktop-two-stdio";
+    const CLIENT_B_NAME = "cursor-two-stdio";
+
+    const twoStdioHome = makeTempDir();
+    let clientA: StdioClientHandle | undefined;
+    let clientB: StdioClientHandle | undefined;
+    let twoStdioDaemonPid: number | undefined;
+
+    try {
+      // Nothing has started a daemon under this home yet, so this first
+      // process must be the one that auto-starts it (BUILD_BRIEF §4).
+      clientA = await startStdioClient(CLIENT_A_NAME, twoStdioHome);
+
+      const infoAfterA = readRuntimeFile(twoStdioHome);
+      assert.ok(infoAfterA, "the first stdio process must have auto-started a daemon and written its runtime file");
+      twoStdioDaemonPid = infoAfterA?.pid;
+      trackPid(twoStdioDaemonPid);
+
+      // The second stdio process must find that daemon already alive
+      // (ensureDaemon's existing+isDaemonAlive branch) and attach to it
+      // rather than spawning its own.
+      clientB = await startStdioClient(CLIENT_B_NAME, twoStdioHome);
+
+      const infoAfterB = readRuntimeFile(twoStdioHome);
+      assert.ok(infoAfterB);
+      assert.equal(infoAfterB?.pid, infoAfterA?.pid, "both stdio processes must resolve to the same daemon pid");
+      assert.equal(infoAfterB?.port, infoAfterA?.port, "both stdio processes must resolve to the same daemon port");
+      assert.notEqual(clientA.pid, clientB.pid, "the two stdio (shim) processes themselves must be distinct processes");
+
+      const daemonPids = findLinuxDaemonPidsForHome(twoStdioHome);
+      assert.deepEqual(daemonPids, [twoStdioDaemonPid], "exactly one daemon process must exist for this CAIRN_HOME");
+
+      // 2. write through A, read through B.
+      const toldViaA = await callJson<RememberResult>(clientA.client, "remember", {
+        content: "Two-stdio demo: written by client A, must be readable by client B.",
+        tags: ["two-stdio"],
+        scope: TWO_STDIO_SCOPE,
+      });
+      const seenByB = await callJson<RecallResult>(clientB.client, "recall", {
+        query: "written by client A must be readable by client B",
+        scope: TWO_STDIO_SCOPE,
+      });
+      assert.ok(
+        seenByB.hits.some((h) => h.id === toldViaA.id),
+        "client B (a second, independent stdio process) must see what client A wrote",
+      );
+
+      // 3. write back through B, read through A -- so the direction is not
+      // accidentally one-way.
+      const toldViaB = await callJson<RememberResult>(clientB.client, "remember", {
+        content: "Two-stdio demo: written by client B, must be readable by client A.",
+        tags: ["two-stdio"],
+        scope: TWO_STDIO_SCOPE,
+      });
+      const seenByA = await callJson<RecallResult>(clientA.client, "recall", {
+        query: "written by client B must be readable by client A",
+        scope: TWO_STDIO_SCOPE,
+      });
+      assert.ok(
+        seenByA.hits.some((h) => h.id === toldViaB.id),
+        "client A must see what client B wrote back, so the shared store is proven in both directions",
+      );
+
+      // 4. cross-client attribution: each memory belongs to the stdio
+      // process that actually wrote it (BUILD_BRIEF §9's "Connected apps"
+      // and per-client pause both depend on this).
+      const stats = readClientStats(twoStdioHome);
+      const statsA = stats.find((s) => s.sourceClient === CLIENT_A_NAME);
+      const statsB = stats.find((s) => s.sourceClient === CLIENT_B_NAME);
+      assert.ok(statsA && statsA.writes > 0, "clientStats must attribute client A's write to client A's own identity");
+      assert.ok(statsB && statsB.writes > 0, "clientStats must attribute client B's write to client B's own identity");
+
+      const sourceClients = readAuditSourceClients(twoStdioHome);
+      assert.ok(sourceClients.includes(CLIENT_A_NAME), "the access log must show client A's own stdio identity");
+      assert.ok(sourceClients.includes(CLIENT_B_NAME), "the access log must show client B's own stdio identity");
+    } finally {
+      await clientA?.close().catch(() => {});
+      await clientB?.close().catch(() => {});
+      await killPid(clientA?.pid);
+      await killPid(clientB?.pid);
+      await killPid(twoStdioDaemonPid);
+      cleanupDir(twoStdioHome);
+    }
+  },
+);

@@ -45,14 +45,14 @@ to work around with a force-exit flag.
 
 Expect a summary line block like:
 ```
-# tests 1005
+# tests 1006
 # suites 0
-# pass 999
+# pass 1000
 # fail 0
 # cancelled 0
 # skipped 6
 ```
-**The exact numbers above (1005/999/0/6) are a snapshot from 2026-09-06, not
+**The exact numbers above (1006/1000/0/6) are a snapshot from 2026-09-06, not
 a target to match.** They will drift as the tree changes. What actually
 gates a release is: `# fail 0` and `# cancelled 0`, always; then read *why*
 the skipped count is whatever it is (CONTRIBUTING.md documents one

@@ -11,7 +11,7 @@
 
 > Status: pre-release. The daemon, dashboard API, all MCP tools, the
 > SessionStart recall hook, and export/import are implemented and covered
-> by tests (1005 tests, 999 passing, 0 failing, 6 skipped). Verified locally
+> by tests (1006 tests, 1000 passing, 0 failing, 6 skipped). Verified locally
 > on Linux only: the full suite, `npm run typecheck`, `npm run
 > verify-package`, `npm pack` installed and run from a scratch directory,
 > and `npm publish --dry-run`. NOT verified on macOS or Windows: GitHub
