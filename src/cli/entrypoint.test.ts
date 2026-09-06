@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { symlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { withTempDirAsync } from "../testing/tmp.js";
 
@@ -57,8 +57,11 @@ test("status through a .bin-style symlink prints status, not silence", async () 
 });
 
 test("importing the module does not run main() (no stdout, guard still holds)", async () => {
+  // Dynamic import() requires a file:// URL for a drive-letter path on
+  // Windows -- a raw path throws ERR_UNSUPPORTED_ESM_URL_SCHEME there.
+  const cliEntryUrl = pathToFileURL(cliEntry).href;
   const { stdout, stderr, code } = await runNode(
-    ["--input-type=module", "-e", `import(${JSON.stringify(cliEntry)});`],
+    ["--input-type=module", "-e", `import(${JSON.stringify(cliEntryUrl)});`],
     process.env,
   );
   assert.equal(code, 0);
