@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Lets a maintainer re-run the matrix without pushing a commit -- useful
+  # after a CI outage, when what you need is the same tree re-tested rather
+  # than a new one.
+  workflow_dispatch:
 
 jobs:
   build:
