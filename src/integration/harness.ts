@@ -21,6 +21,7 @@
 import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -33,6 +34,14 @@ export interface StdioClientHandle {
   transport: StdioClientTransport;
   /** The pid of the spawned CLI (shim) process, once started. */
   pid: number | null;
+  /**
+   * Lines the shim wrote to its own stderr, accumulated live -- in
+   * particular src/shim/index.ts's `using daemon at ... (started here:
+   * true|false)` line, which is the platform-independent way to prove
+   * whether THIS process started the daemon or attached to an existing one
+   * (see waitForStderrLine below). Never scanned for anything else.
+   */
+  stderr: string[];
   close(): Promise<void>;
 }
 
@@ -135,19 +144,52 @@ export async function startStdioClient(name: string, home: string): Promise<Stdi
     // means this suite never silently starts downloading a model if a
     // future default or a stray settings row changes that).
     env: { ...process.env, CAIRN_HOME: home, CAIRN_PORT: "0", CAIRN_EMBEDDINGS: "off" },
+    // Piped (not the default "inherit") so this harness can read the
+    // shim's own diagnostics -- see StdioClientHandle.stderr's doc comment.
+    stderr: "pipe",
   });
   const client = new Client({ name, version: "1.0.0" });
   await client.connect(transport);
   const pid = transport.pid;
   trackPid(pid);
+  const stderr: string[] = [];
+  const stderrStream = transport.stderr as Readable | null;
+  stderrStream?.setEncoding("utf8");
+  stderrStream?.on("data", (chunk: string) => {
+    for (const line of chunk.split("\n")) {
+      if (line.trim().length > 0) {
+        stderr.push(line);
+      }
+    }
+  });
   return {
     client,
     transport,
     pid,
+    stderr,
     async close() {
       await client.close().catch(() => {});
     },
   };
+}
+
+// Polls an accumulating stderr line buffer (StdioClientHandle.stderr) until
+// a line matching `pattern` shows up, or throws once `timeoutMs` elapses --
+// the platform-independent replacement for scanning /proc to learn what a
+// shim process decided (see src/shim/index.ts's "using daemon at ... started
+// here: true|false" line).
+export async function waitForStderrLine(lines: string[], pattern: RegExp, timeoutMs: number): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const match = lines.find((line) => pattern.test(line));
+    if (match) {
+      return match;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out after ${timeoutMs}ms waiting for a stderr line matching ${pattern} (seen: ${JSON.stringify(lines)})`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
 
 // Connects a real MCP client over Streamable HTTP directly to the daemon --

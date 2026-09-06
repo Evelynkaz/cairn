@@ -81,7 +81,12 @@ test("with a running daemon and seeded memories, stdout is exactly the envelope 
     const pid = result.spawnedPid;
     assert.ok(typeof pid === "number", "ensureDaemon must have spawned a daemon for a fresh temp home");
     try {
-      const hookResult = await runSessionStartHook({ home: dir });
+      // A freshly spawned real daemon's very first /api/context response can
+      // outlast the hook's ~2s production deadline on a slow CI runner
+      // (Windows above all) -- this fixture is about the envelope's shape,
+      // not the deadline, so it uses the test-only seam to give a cold
+      // daemon room to answer instead of racing the production constant.
+      const hookResult = await runSessionStartHook({ home: dir, deadlineMs: 15_000 });
       assertEnvelopeOrEmpty(hookResult.stdout);
       assert.notEqual(hookResult.stdout, "", "expected non-empty context for a seeded store");
       const parsed = JSON.parse(hookResult.stdout) as {
@@ -114,7 +119,10 @@ test("end-to-end: an imported imperative payload is not injected, while a user m
     const pid = result.spawnedPid;
     assert.ok(typeof pid === "number", "ensureDaemon must have spawned a daemon for a fresh temp home");
     try {
-      const hookResult = await runSessionStartHook({ home: dir });
+      // See the same comment on the first test in this file: a cold real
+      // daemon's first response can outlast the 2s production deadline on a
+      // slow CI runner, and that is not what this fixture is exercising.
+      const hookResult = await runSessionStartHook({ home: dir, deadlineMs: 15_000 });
       assertEnvelopeOrEmpty(hookResult.stdout);
       assert.notEqual(hookResult.stdout, "");
       const parsed = JSON.parse(hookResult.stdout) as {
@@ -139,8 +147,15 @@ test("the injected envelope frames the memory block as data, not an instruction,
     const result = await ensureDaemon({ home: dir, env: { ...process.env, CAIRN_PORT: "0" } });
     const pid = result.spawnedPid;
     try {
-      const hookResult = await runSessionStartHook({ home: dir });
+      // See the comment on the first test in this file: a cold real daemon's
+      // first response can outlast the 2s production deadline on a slow CI
+      // runner (this is exactly what failed on Windows CI -- the hook
+      // correctly returned "" and this test's unguarded JSON.parse("") threw
+      // "Unexpected end of JSON input"), so this asserts non-empty first with
+      // a real message instead of racing the production constant.
+      const hookResult = await runSessionStartHook({ home: dir, deadlineMs: 15_000 });
       assertEnvelopeOrEmpty(hookResult.stdout);
+      assert.notEqual(hookResult.stdout, "", "expected non-empty context for a seeded store");
       const parsed = JSON.parse(hookResult.stdout) as {
         hookSpecificOutput: { additionalContext: string };
       };

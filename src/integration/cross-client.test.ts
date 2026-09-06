@@ -53,6 +53,7 @@ import {
   startStdioClient,
   trackPid,
   assertRealCairnHomeUntouched,
+  waitForStderrLine,
 } from "./harness.js";
 import type { HttpClientHandle, StdioClientHandle } from "./harness.js";
 
@@ -392,7 +393,13 @@ test("9. the generated config is the config that works: cairnServerEntry names t
 // through harness.ts's `startStdioClient`, which pins `CAIRN_PORT=0` --
 // so this proves two stdio shims sharing a daemon on an OS-assigned
 // ephemeral port, not the fixed-port-already-in-use branch.
-function findLinuxDaemonPidsForHome(home: string): number[] {
+//
+// The primary proof below (client A's and B's own "started here: true/false"
+// stderr lines, via harness.ts's waitForStderrLine) needs no /proc and runs
+// on every platform. This process scan is kept only as extra corroboration
+// where the OS happens to expose it, gated on /proc actually being readable
+// -- never on `process.platform` as a proxy for that (CONTRIBUTING.md).
+function findDaemonPidsViaProcForHome(home: string): number[] {
   const pids: number[] = [];
   for (const entry of readdirSync("/proc")) {
     if (!/^\d+$/.test(entry)) {
@@ -419,11 +426,6 @@ test(
   "10. two independent stdio shim PROCESSES share one daemon, in both directions, with correct per-client attribution",
   { timeout: 30_000 },
   async (t) => {
-    if (process.platform === "win32") {
-      t.skip("this test's daemon-count proof reads /proc, which does not exist on Windows");
-      return;
-    }
-
     const TWO_STDIO_SCOPE = "two-stdio-demo";
     const CLIENT_A_NAME = "claude-desktop-two-stdio";
     const CLIENT_B_NAME = "cursor-two-stdio";
@@ -443,10 +445,21 @@ test(
       twoStdioDaemonPid = infoAfterA?.pid;
       trackPid(twoStdioDaemonPid);
 
+      // Client A's own shim, in its own words: it started the daemon itself
+      // (BUILD_BRIEF §4's auto-start path, nothing else could have raced it
+      // here since twoStdioHome is brand new).
+      await waitForStderrLine(clientA.stderr, /using daemon at .*\(started here: true\)/, 10_000);
+
       // The second stdio process must find that daemon already alive
       // (ensureDaemon's existing+isDaemonAlive branch) and attach to it
       // rather than spawning its own.
       clientB = await startStdioClient(CLIENT_B_NAME, twoStdioHome);
+
+      // Client B's own shim, in its own words: it did NOT start a daemon --
+      // this is the platform-independent replacement for scanning /proc to
+      // count daemon processes, since it comes straight from the process
+      // that made the decision rather than being inferred after the fact.
+      await waitForStderrLine(clientB.stderr, /using daemon at .*\(started here: false\)/, 10_000);
 
       const infoAfterB = readRuntimeFile(twoStdioHome);
       assert.ok(infoAfterB);
@@ -454,8 +467,23 @@ test(
       assert.equal(infoAfterB?.port, infoAfterA?.port, "both stdio processes must resolve to the same daemon port");
       assert.notEqual(clientA.pid, clientB.pid, "the two stdio (shim) processes themselves must be distinct processes");
 
-      const daemonPids = findLinuxDaemonPidsForHome(twoStdioHome);
-      assert.deepEqual(daemonPids, [twoStdioDaemonPid], "exactly one daemon process must exist for this CAIRN_HOME");
+      // Extra corroboration where the OS happens to expose it (see the
+      // comment on findDaemonPidsViaProcForHome above): gated on /proc
+      // actually being readable, not on process.platform. Where it is not
+      // (macOS, Windows), this is simply not asserted -- the "started
+      // here: true/false" proof above already carries the claim on its own.
+      let daemonPids: number[] | null = null;
+      try {
+        daemonPids = findDaemonPidsViaProcForHome(twoStdioHome);
+      } catch (err) {
+        t.diagnostic(
+          `/proc is not readable on this platform (${err instanceof Error ? err.message : String(err)}); ` +
+            "skipping the process-count corroboration, already proven above via the shims' own stderr",
+        );
+      }
+      if (daemonPids !== null) {
+        assert.deepEqual(daemonPids, [twoStdioDaemonPid], "exactly one daemon process must exist for this CAIRN_HOME");
+      }
 
       // 2. write through A, read through B.
       const toldViaA = await callJson<RememberResult>(clientA.client, "remember", {
