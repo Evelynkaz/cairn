@@ -582,3 +582,52 @@ test("getContext: excludeUnapproved: false disables the gate (the explicit opt-o
     assert.ok(block.memories.some((m) => m.id === imported.id));
   });
 });
+
+// The provenance-labelling gap: get_context's empty-query ("what matters
+// right now") path built its own SearchHits from a recency/importance pool
+// that never carried origin/approved, so every hit rendered as
+// origin: "unknown", approved: false regardless of the memory's real
+// provenance -- a label that is always the same value is worse than none.
+// Each hit must report its OWN true value, not a fixed placeholder.
+test("getContext (empty query): each hit reports its own true origin, not a fixed placeholder", async () => {
+  await withDbAsync(async (db) => {
+    const userMemory = createMemory(db, { text: "the user's own note about the release schedule" }).memory;
+    const id = uuidv7();
+    const now = Date.now();
+    db.exec(
+      `INSERT INTO memories (id, text, scope, created_at, updated_at, valid_from, content_hash, origin)
+       VALUES ('${id}', 'a row that predates provenance', 'default', ${now}, ${now}, ${now}, 'legacy-hash-${id}', 'unknown')`,
+    );
+    const importResult = importMemory(db, { id: uuidv7(), text: "a note that arrived via import, now approved" });
+    const imported = importResult.memory!;
+    setMemoryApproved(db, imported.id, true);
+
+    const block = await getContext(db, "", { excludeUnapproved: false }, {});
+    const byId = new Map(block.memories.map((m) => [m.id, m]));
+
+    const user = byId.get(userMemory.id);
+    assert.ok(user, "the user memory must be present");
+    assert.equal(user!.origin, "user");
+    assert.equal(user!.approved, false);
+
+    const unknown = byId.get(id);
+    assert.ok(unknown, "the pre-migration row must be present");
+    assert.equal(unknown!.origin, "unknown");
+    assert.equal(unknown!.approved, false);
+
+    const approvedImport = byId.get(imported.id);
+    assert.ok(approvedImport, "the approved import must be present");
+    assert.equal(approvedImport!.origin, "import");
+    assert.equal(approvedImport!.approved, true);
+  });
+});
+
+test("getContext (empty query): eligibility filtering is unchanged -- an unapproved import is still absent by default", async () => {
+  await withDbAsync(async (db) => {
+    const importResult = importMemory(db, { id: uuidv7(), text: "still unapproved" });
+    const imported = importResult.memory!;
+
+    const block = await getContext(db, "", {}, {});
+    assert.ok(!block.memories.some((m) => m.id === imported.id));
+  });
+});

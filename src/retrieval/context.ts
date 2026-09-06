@@ -9,6 +9,7 @@ import type { CairnDb } from "../storage/db.js";
 import type { SqlValue } from "../storage/driver/index.js";
 import { bool, num, numOrNull, str } from "../storage/repositories/row.js";
 import { listMemories } from "../storage/repositories/memories.js";
+import type { MemoryOrigin } from "../storage/types.js";
 import { rerank } from "./rerank.js";
 import type { RerankItem } from "./rerank.js";
 import { search, fetchTagsByIds } from "./search.js";
@@ -230,6 +231,8 @@ interface PoolMemory {
   createdAt: number;
   lastAccessed: number | null;
   accessCount: number;
+  origin: MemoryOrigin;
+  approved: boolean;
 }
 
 // The importance-ordered half of the empty-query pool (see
@@ -256,7 +259,7 @@ function loadImportancePool(db: CairnDb, scope: string | undefined, limit: numbe
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = db
     .q(
-      `SELECT seq, id, text, scope, importance, created_at, last_accessed, access_count
+      `SELECT seq, id, text, scope, importance, created_at, last_accessed, access_count, origin, approved
        FROM memories_live
        ${where}
        ORDER BY importance DESC, created_at DESC
@@ -277,6 +280,8 @@ function loadImportancePool(db: CairnDb, scope: string | undefined, limit: numbe
       createdAt: num(row, "created_at"),
       lastAccessed: numOrNull(row, "last_accessed"),
       accessCount: num(row, "access_count"),
+      origin: str(row, "origin") as MemoryOrigin,
+      approved: bool(row, "approved"),
     };
   });
 }
@@ -341,6 +346,8 @@ function emptyQueryFallback(db: CairnDb, options: ContextOptions & { limit: numb
       sources: { fts: null, vector: null },
       coverage: null,
       vectorDistance: null,
+      origin: memory.origin,
+      approved: memory.approved,
     };
   });
 
@@ -349,25 +356,19 @@ function emptyQueryFallback(db: CairnDb, options: ContextOptions & { limit: numb
 
 const DEFAULT_EXCLUDE_UNAPPROVED = true;
 
-// Looks up injection eligibility for a bounded set of ids in one query --
-// `ids` is always the current result set's own hit list (bounded by
-// candidateLimit, at most CONTEXT_CANDIDATE_LIMIT/MAX_CONTEXT_CANDIDATES),
-// never an unbounded scan. A hit is eligible when its origin is 'user' (a
+// A hit is eligible for automatic injection when its origin is 'user' (a
 // direct remember/update/supersede -- the caller supplied this text
 // themselves) or when a human has explicitly approved it via
 // Store.setMemoryApproved. Everything else -- 'import' and the honest
-// 'unknown' default for pre-migration rows -- is excluded until reviewed.
-function loadInjectionEligibility(db: CairnDb, ids: string[]): Map<string, boolean> {
-  const eligible = new Map<string, boolean>();
-  if (ids.length === 0) return eligible;
-  const placeholders = ids.map(() => "?").join(", ");
-  const rows = db.q(`SELECT id, origin, approved FROM memories WHERE id IN (${placeholders})`).all(...ids);
-  for (const row of rows) {
-    const id = str(row, "id");
-    const origin = str(row, "origin");
-    eligible.set(id, origin === "user" || bool(row, "approved"));
-  }
-  return eligible;
+// 'unknown' default for pre-migration rows, and a hit whose provenance
+// could not be determined at all -- is excluded until reviewed (fail
+// closed, never treat "unknown" as "eligible"). Both getContext's
+// branches now stamp real origin/approved onto every SearchHit they
+// produce (emptyQueryFallback above, and search()'s own
+// fetchProvenanceByIds), so this reads those fields directly instead of
+// re-querying the memories table by id a second time.
+function isInjectionEligible(hit: SearchHit): boolean {
+  return hit.origin === "user" || hit.approved === true;
 }
 
 /**
@@ -436,14 +437,7 @@ export async function getContext(
   // memory must never occupy a budget slot another candidate could have
   // used, and must never appear in `memories`/`text` at all.
   const excludeUnapproved = options.excludeUnapproved ?? DEFAULT_EXCLUDE_UNAPPROVED;
-  let eligibleHits = result.hits;
-  if (excludeUnapproved) {
-    const eligibility = loadInjectionEligibility(
-      db,
-      result.hits.map((hit) => hit.id),
-    );
-    eligibleHits = result.hits.filter((hit) => eligibility.get(hit.id) === true);
-  }
+  const eligibleHits = excludeUnapproved ? result.hits.filter(isInjectionEligible) : result.hits;
 
   let text = "";
   const memories: SearchHit[] = [];
